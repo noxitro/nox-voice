@@ -8,7 +8,7 @@ Windows 11向けAI音声入力常駐アプリ。Aqua Voice / Typeless の実体�
 |---|---|
 | スタック | Tauri v2 + Rust(vanilla-ts UI)。参考: [Handy](https://github.com/cjpais/Handy)(MIT) |
 | STT | Groq API `whisper-large-v3`(無料枠、日本語)。発話単位バッチ |
-| 整形LLM | **Gemini 2.5 Flash 無料枠**。⚠️ 規約リスク受容済み(下記R1) |
+| 整形LLM | Gemini 無料枠、既定 `gemini-flash-lite-latest`(当初決定の 2.5 Flash は利用不可、下記M2実測)。⚠️ 規約リスク受容済み(下記R1) |
 | 言語 | 日本語メイン |
 | スコープ | 個人利用MVP。deep context(画面認識)・カスタム辞書拡充・アプリ別スタイルは後続 |
 | UIデザイン | MVPでは最小限(impeccable不適用) |
@@ -47,3 +47,23 @@ Gemini API無料枠(Unpaid Services)では送信コンテンツがGoogleの製�
 - **既知の制限: 合成入力(`LLKHF_INJECTED`)由来の右Ctrlは無視する**。自前の注入(SendInputによるCtrl+V)や外部自動化ツールのキーで録音が誤発火するのを防ぐため。副作用として、**RDP/リモートデスクトップ・PowerToys Keyboard Manager等のリマップ・AutoHotkey経由で右Ctrlが届く環境ではホットキーが無反応になる**。将来は「注入元プロセスを問わず一律除外」から「自プロセス由来のみ除外(`dwExtraInfo`にマーカーを載せて判別)」へ絞り込み、設定でopt-outできるようにする
 - **ホットキーイベントは発生時刻を必ず伴わせる**。長押し/短押しの判定を処理側のデキュー時刻で行うと、STT呼び出し等でコントローラが詰まった間に滞留したイベントの保持時間が水増しされ、短押し(トグル)が長押しに誤分類される。あわせて秒単位になりうる処理(リサンプル・STT・整形・注入)はホットキー処理スレッドから外し、専用ワーカーで実行する
 - 到達確認の運用則(wiki): 送信成功≠到達。E2Eは受け手側証跡(メモ帳の内容)で確認
+
+## M2実測: Gemini整形モデルの選定(2026-08-17)
+
+**当初決定の `gemini-2.5-flash` は新規APIキーでは 404**("no longer available to new users")。ListModelsには列挙されるが `generateContent` は通らない。**モデル一覧に出ることは利用可能の証明にならない**。
+
+同一文(「えーとですね、あのー、明日、いや明後日の会議なんですけど、資料の準備をお願いします」)を整形した実測:
+
+| モデル | 所要 | 結果 |
+|---|---|---|
+| `gemini-2.5-flash` | — | 404(利用不可) |
+| **`gemini-flash-lite-latest`** | **772ms** | 良好(既定に採用) |
+| `gemini-3.5-flash-lite` | 872ms | 良好 |
+| `gemini-flash-latest` | 2.9s | 良好だが遅い |
+| `gemini-3.1-flash-lite` | 15.6s | 語尾を書き換えた |
+| `gemini-3.5-flash` | 27.2s | 音声入力には論外 |
+
+- **既定は `-latest` エイリアス**を採る。固定版はいつか退役して404になる(2.5-flashで実際に起きた)。エイリアスの弱点は出力の癖が予告なく変わることだが、無言で壊れるよりR2の劣化モードで拾える形の方が本アプリには合う。設定で差し替え可能
+- **`thinkingConfig.thinkingBudget: 0` は新世代flash系(3.5-flash-lite等)が 400 Invalid argument で拒否する**(同じリクエストからthinkingConfigだけ外すと通ることを切り分け済み)。モデル差し替えを前提にする以上、全モデルで通る最小構成にし、思考量の制御はモデル選択で行う(待たせたくないなら`-flash-lite`系)
+- 整形の遅さは体感に直結する。thinking系モデルは10秒超になりうるので、モデル変更時は必ず所要時間を実測すること
+- curl経由の日本語プロンプト検証はWindowsの文字コードで壊れる(wiki「WindowsとPowerShellの文字コード地雷」)。APIの日本語挙動はRust側のテストから確認すること

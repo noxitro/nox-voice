@@ -8,6 +8,8 @@
   --recording: #e5484d;
   --processing: #f5a524;
   --error: #c62828;
+  --ok: #2e7d32;
+  --accent: #3b82f6;
 
   font-family: "Segoe UI", "Yu Gothic UI", system-ui, sans-serif;
   font-size: 15px;
@@ -24,6 +26,7 @@
     --panel: #262629;
     --border: #38383c;
     --error: #ff8a80;
+    --ok: #81c784;
   }
 }
 
@@ -131,7 +134,193 @@ h2 {
 }
 
 .error {
-  margin-top: 16px;
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--error);
+  border-radius: 8px;
   color: var(--error);
   font-size: 0.9rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.panel + .panel,
+.panel + .settings {
+  margin-top: 16px;
+}
+
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.panel-head h2 {
+  margin-bottom: 0;
+}
+
+.badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  background: var(--border);
+  color: var(--muted);
+}
+
+.badge[data-kind="formatted"] {
+  background: color-mix(in srgb, var(--ok) 18%, transparent);
+  color: var(--ok);
+}
+
+.badge[data-kind="degraded"] {
+  background: color-mix(in srgb, var(--processing) 20%, transparent);
+  color: var(--processing);
+}
+
+.empty {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.degraded-note {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--processing);
+  background: color-mix(in srgb, var(--processing) 10%, transparent);
+  color: var(--fg);
+  font-size: 0.85rem;
+}
+
+.text-block {
+  margin-top: 14px;
+}
+
+.text-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.text-head h3 {
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+}
+
+.text {
+  margin: 6px 0 0;
+  padding: 10px 12px;
+  min-height: 2.6em;
+  max-height: 12em;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  font-family: inherit;
+  font-size: 0.92rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.timings {
+  margin: 14px 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+}
+
+button {
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: var(--muted);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.settings summary {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+}
+
+.settings form {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.settings label {
+  display: grid;
+  gap: 4px;
+  font-size: 0.85rem;
+}
+
+.settings label span {
+  color: var(--muted);
+}
+
+.settings label em {
+  font-style: normal;
+  color: var(--fg);
+}
+
+.settings input[type="text"],
+.settings input[type="password"] {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.9rem;
+}
+
+.settings label.checkbox {
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings label.checkbox span {
+  color: var(--fg);
+}
+
+.form-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.form-note {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.warn {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.5;
 }

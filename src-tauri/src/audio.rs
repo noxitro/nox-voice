@@ -100,6 +100,22 @@ impl Recorder {
     pub fn limit_reached(&self) -> bool {
         self.limit_hit.load(Ordering::SeqCst)
     }
+
+    /// テスト用: 実デバイスなしで [`finish`] にかけられる Recorder を作る。
+    ///
+    /// ストリームを持たないので `finish` はバッファをそのまま変換する。
+    /// 終了時の退避経路など、Recorder を必要とする配線のテストに使う。
+    #[cfg(test)]
+    pub fn for_test(samples: Vec<f32>, source_sample_rate: u32) -> Self {
+        Self {
+            stream: None,
+            buffer: Arc::new(Mutex::new(samples)),
+            source_sample_rate,
+            device_name: "<test device>".to_string(),
+            started_at: SystemTime::now(),
+            limit_hit: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 /// 音声コールバックが書き込む先一式。
@@ -295,6 +311,12 @@ fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, AudioError> 
             .map_err(|e| AudioError::Encode(e.to_string()))?;
     }
     Ok(cursor.into_inner())
+}
+
+/// テスト用: 任意のサンプル列から WAV を作る (stt の実 API 疎通テストで使う)。
+#[cfg(test)]
+pub fn encode_wav_for_test(samples: &[f32], sample_rate: u32) -> Vec<u8> {
+    encode_wav(samples, sample_rate).expect("テスト用 WAV の生成に失敗")
 }
 
 // --- リサンプラ (ポリフェーズ) -----------------------------------------------

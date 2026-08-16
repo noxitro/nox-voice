@@ -22,15 +22,93 @@
         右 Ctrl を<strong>短押し</strong>すると録音が継続し、もう一度押すと停止。
       </p>
 
+      <p class="error" id="error" hidden></p>
+
       <section class="panel">
-        <h2>直近の録音</h2>
+        <div class="panel-head">
+          <h2>直近の結果</h2>
+          <span class="badge" id="outcome-badge" hidden></span>
+        </div>
+
+        <p class="empty" id="result-empty">まだ結果がありません</p>
+
+        <div id="result" hidden>
+          <p class="degraded-note" id="degraded-note" hidden></p>
+
+          <div class="text-block">
+            <div class="text-head">
+              <h3>整形後</h3>
+              <button type="button" class="copy" data-copy="formatted">
+                コピー
+              </button>
+            </div>
+            <pre class="text" id="text-formatted"></pre>
+          </div>
+
+          <div class="text-block">
+            <div class="text-head">
+              <h3>生転写</h3>
+              <button type="button" class="copy" data-copy="raw">
+                コピー
+              </button>
+            </div>
+            <pre class="text" id="text-raw"></pre>
+          </div>
+
+          <p class="timings" id="timings"></p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>録音</h2>
+        </div>
         <dl class="kv" id="session">
           <dt>状態</dt>
-          <dd id="session-empty">まだ録音していません</dd>
+          <dd>まだ録音していません</dd>
         </dl>
       </section>
 
-      <p class="error" id="error" hidden></p>
+      <details class="panel settings">
+        <summary>設定</summary>
+        <form id="settings-form">
+          <label>
+            <span>Groq API キー<em id="groq-state"></em></span>
+            <input
+              type="password"
+              id="groq-key"
+              autocomplete="off"
+              placeholder="変更するときだけ入力"
+            />
+          </label>
+          <label>
+            <span>Gemini API キー<em id="gemini-state"></em></span>
+            <input
+              type="password"
+              id="gemini-key"
+              autocomplete="off"
+              placeholder="変更するときだけ入力"
+            />
+          </label>
+          <label>
+            <span>言語 (空欄で自動判定)</span>
+            <input type="text" id="language" autocomplete="off" />
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" id="formatting-enabled" />
+            <span>LLM で整形する(オフなら生転写をそのまま使う)</span>
+          </label>
+          <div class="form-actions">
+            <button type="submit">保存</button>
+            <span class="form-note" id="settings-note"></span>
+          </div>
+          <p class="warn">
+            ⚠️ 整形は Gemini 無料枠では送信内容が Google の製品改善・モデル訓練に
+            利用されます。機密を扱う場合は整形をオフにするか有料ティアの
+            キーを使ってください。
+          </p>
+        </form>
+      </details>
     </main>
   </body>
 </html>
