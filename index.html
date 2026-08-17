@@ -70,6 +70,24 @@
         </dl>
       </section>
 
+      <section class="panel">
+        <div class="panel-head">
+          <h2>履歴</h2>
+          <button type="button" id="history-clear" class="danger">
+            すべて削除
+          </button>
+        </div>
+
+        <p class="empty" id="history-empty">履歴はまだありません</p>
+        <p class="error" id="history-error" hidden></p>
+
+        <ul class="history" id="history-list"></ul>
+
+        <div class="history-actions">
+          <button type="button" id="history-more" hidden>もっと読む</button>
+        </div>
+      </section>
+
       <details class="panel settings">
         <summary>設定</summary>
         <form id="settings-form">
@@ -112,6 +130,23 @@
               max="5000"
               step="50"
             />
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" id="history-enabled" />
+            <span>履歴を保存する(発話の全文が保存されます)</span>
+          </label>
+          <label>
+            <span>履歴の保持日数(0 で無制限)</span>
+            <input type="number" id="history-retention" min="0" max="3650" />
+          </label>
+          <label>
+            <span>辞書(1 行に 1 語。整形時の表記ゆれ対策)</span>
+            <textarea
+              id="dictionary"
+              rows="5"
+              autocomplete="off"
+              placeholder="nox-voice&#10;Tauri"
+            ></textarea>
           </label>
           <div class="form-actions">
             <button type="submit">保存</button>

@@ -29,6 +29,7 @@ mod audio;
 mod config;
 mod foreground;
 mod format;
+mod history;
 mod hotkey;
 mod inject;
 mod pipeline;
@@ -53,6 +54,7 @@ use audio::Recorder;
 use config::{ConfigPatch, ConfigStore, ConfigView};
 use format::GeminiFormatter;
 use hotkey::{HookHandle, HotkeyAction, PttInterpreter, TAP_THRESHOLD};
+use history::{HistoryStore, SessionDraft, SessionRow};
 use inject::{ClipboardState, InjectOutcome, InjectTarget};
 use pipeline::FormatOutcome;
 use session::{RecordingSession, SessionSummary, Status, StatusPayload, TargetWindow};
@@ -66,6 +68,8 @@ const EVENT_SESSION: &str = "nox://session";
 const EVENT_RESULT: &str = "nox://result";
 /// ユーザーに見せるべきエラーの通知イベント。
 const EVENT_ERROR: &str = "nox://error";
+/// 履歴が更新されたことの通知イベント (UI が再読込する)。
+const EVENT_HISTORY: &str = "nox://history";
 
 /// 転写・整形の結果。フロントと (M4 の) 履歴が使う。
 #[derive(Debug, Clone, Serialize)]
@@ -106,6 +110,18 @@ struct FinalizeJob {
     started_at: SystemTime,
 }
 
+/// ワーカーが処理する仕事。
+///
+/// 再転写も同じワーカーに載せるのは、STT / 整形の呼び出しを 1 本に
+/// 直列化しておきたいから (レート制限を踏みにくく、状態遷移も単純になる)。
+enum WorkerJob {
+    /// 録音の確定 → 転写 → 整形 → 注入。
+    /// Box にしてあるのは Retranscribe との大きさの差を潰すため。
+    Finalize(Box<FinalizeJob>),
+    /// 履歴にある未転写行を、退避 WAV から転写し直す。
+    Retranscribe { id: i64 },
+}
+
 /// アプリ全体の共有状態。
 ///
 /// 各フィールドを個別の `Mutex` にしてあるのは、ある操作の最中も
@@ -124,9 +140,13 @@ struct AppState {
     /// 送受信端の両方を持つのは、どちらも切断させないため。
     limit_tx: Sender<()>,
     limit_rx: Receiver<()>,
-    /// ファイナライズワーカーへの仕事キュー。
-    finalize_tx: Sender<FinalizeJob>,
-    finalize_rx: Receiver<FinalizeJob>,
+    /// ワーカーへの仕事キュー。
+    finalize_tx: Sender<WorkerJob>,
+    finalize_rx: Receiver<WorkerJob>,
+    /// 履歴 DB (R4)。
+    history: HistoryStore,
+    /// 再転写が進行中の履歴 ID。多重発火を弾く。
+    retranscribing: Mutex<std::collections::HashSet<i64>>,
     /// 設定 (API キー・言語・辞書など)。
     config: ConfigStore,
     /// STT / 整形で共用する HTTP クライアント。接続プールを使い回すため
@@ -139,7 +159,7 @@ struct AppState {
 }
 
 impl AppState {
-    fn new(config_path: PathBuf, failed_dir: PathBuf) -> Self {
+    fn new(config_path: PathBuf, failed_dir: PathBuf, db_path: PathBuf) -> Self {
         // 上限到達は 1 録音につき高々 1 回。
         let (limit_tx, limit_rx) = crossbeam_channel::bounded(1);
         let (finalize_tx, finalize_rx) = crossbeam_channel::unbounded();
@@ -162,6 +182,8 @@ impl AppState {
             finalize_tx,
             finalize_rx,
             config: ConfigStore::load(config_path),
+            history: HistoryStore::new(db_path),
+            retranscribing: Mutex::new(std::collections::HashSet::new()),
             http,
             last_result: Mutex::new(None),
             failed_dir,
@@ -208,12 +230,148 @@ fn get_config(state: tauri::State<'_, AppState>) -> ConfigView {
 /// 設定を部分更新して保存する。返すのは更新後のビュー (キーは含まない)。
 #[tauri::command]
 fn set_config(
+    app: AppHandle,
     state: tauri::State<'_, AppState>,
     patch: ConfigPatch,
 ) -> Result<ConfigView, String> {
     // patch は API キーを含みうる。ログには出さない。
+    let previous_retention = state.config.snapshot().history_retention_days;
     let updated = state.config.update(patch)?;
+    // 保持日数を縮めたなら、次の録音を待たずに今すぐ効かせる。
+    if updated.history_retention_days != previous_retention {
+        enforce_retention(&app, updated.history_retention_days);
+    }
     Ok(ConfigView::from(&updated))
+}
+
+/// 履歴を新しい順に返す。`before_id` を渡すと続きを取る。
+///
+/// **読めなかった場合は `Err`。** 空リストで返してはいけない
+/// (UI が「履歴 0 件」と表示し、ユーザーは消えたと信じてしまう)。
+#[tauri::command]
+fn get_history(
+    state: tauri::State<'_, AppState>,
+    limit: Option<u32>,
+    before_id: Option<i64>,
+) -> Result<Vec<SessionRow>, String> {
+    state
+        .history
+        .recent(limit.unwrap_or(50), before_id)
+        .map_err(|e| e.to_string())
+}
+
+/// 履歴 1 件を返す。
+#[tauri::command]
+fn get_history_entry(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+) -> Result<Option<SessionRow>, String> {
+    state.history.get(id).map_err(|e| e.to_string())
+}
+
+/// 履歴 1 件を削除する (退避 WAV も一緒に消える)。
+#[tauri::command]
+fn delete_history_entry(app: AppHandle, id: i64) -> Result<(), String> {
+    let removal = app
+        .state::<AppState>()
+        .history
+        .delete(id)
+        .map_err(|e| e.to_string())?;
+    emit_history_changed(&app);
+    report_removal(&app, &removal, "履歴を削除しました")
+}
+
+/// 履歴を全消去する。呼び出し側で確認を取ってから使うこと。
+#[tauri::command]
+fn clear_history(app: AppHandle) -> Result<u64, String> {
+    let removal = app
+        .state::<AppState>()
+        .history
+        .clear()
+        .map_err(|e| e.to_string())?;
+    log::info!(
+        "履歴を全消去しました ({} 件 / WAV {} 個)",
+        removal.rows,
+        removal.wavs_removed
+    );
+    emit_history_changed(&app);
+    report_removal(&app, &removal, "履歴を全消去しました")?;
+    Ok(removal.rows)
+}
+
+/// 削除の消し残しをユーザーへ伝える。
+///
+/// 「消したつもりでファイルが残っている」を無言にしない。残ったファイルを
+/// 持つ行はあえて残してあるので、UI にもその行が見えたままになる。
+fn report_removal(
+    app: &AppHandle,
+    removal: &history::Removal,
+    _context: &str,
+) -> Result<(), String> {
+    if removal.is_complete() {
+        return Ok(());
+    }
+    let message = format!(
+        "退避した録音 {} 個を削除できませんでした。該当の履歴は残してあります (ファイルが使用中の可能性)",
+        removal.wav_failures.len()
+    );
+    log::error!("{message}: {:?}", removal.wav_failures);
+    notify(app, Notice::ActionRequired, &message);
+    Err(message)
+}
+
+/// 履歴のテキストをクリップボードへ入れる (再貼付)。
+///
+/// **注入はしない。** どのウィンドウへ貼るかはこの時点では決められず、
+/// 勝手に前景へ送ると意図しないアプリを壊す (R7 の考え方)。
+/// クリップボードに置いてユーザーの Ctrl+V に委ねる。
+#[tauri::command]
+fn copy_history_entry(app: AppHandle, id: i64) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let row = state
+        .history
+        .get(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "履歴が見つかりません".to_string())?;
+    let text = row
+        .text()
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| "この履歴にはテキストがありません".to_string())?;
+
+    inject::set_clipboard_text(text).map_err(|e| format!("{e:?}"))?;
+    notify(
+        &app,
+        Notice::ActionRequired,
+        "クリップボードに入れました。Ctrl+V で貼り付けてください",
+    );
+    Ok(())
+}
+
+/// 未転写の履歴を再転写する (ワーカーで直列に実行)。
+///
+/// 同じ行への二重要求は拒否する。連打するとワーカーのキューに積み上がり、
+/// STT を無駄に何度も叩いたうえ、後から来た結果で上書きし合う。
+#[tauri::command]
+fn retranscribe_history_entry(state: tauri::State<'_, AppState>, id: i64) -> Result<(), String> {
+    {
+        let mut running = state
+            .retranscribing
+            .lock()
+            .map_err(|_| "再転写の状態が壊れています".to_string())?;
+        if !running.insert(id) {
+            return Err("この履歴は再転写中です".to_string());
+        }
+    }
+
+    if let Err(e) = state.finalize_tx.send(WorkerJob::Retranscribe { id }) {
+        // キューに載せられなかったので進行中の印を戻す。
+        if let Ok(mut running) = state.retranscribing.lock() {
+            running.remove(&id);
+        }
+        let _ = e;
+        return Err("後処理ワーカーが停止しています".to_string());
+    }
+    Ok(())
 }
 
 /// 設定ウィンドウ (現状はメインウィンドウ) を表示する。
@@ -249,6 +407,12 @@ pub fn run() {
             get_last_result,
             get_config,
             set_config,
+            get_history,
+            get_history_entry,
+            delete_history_entry,
+            clear_history,
+            copy_history_entry,
+            retranscribe_history_entry,
             show_window
         ])
         .setup(|app| {
@@ -257,7 +421,9 @@ pub fn run() {
             // 設定と退避先のパスは AppHandle が無いと決まらないので、
             // 状態の登録は builder ではなく setup で行う。
             let (config_path, failed_dir) = resolve_paths(&handle);
-            app.manage(AppState::new(config_path, failed_dir));
+            let db_path = resolve_db_path(&handle);
+            app.manage(AppState::new(config_path, failed_dir, db_path));
+            initialize_history(&handle);
 
             match tray::build(&handle) {
                 Ok(item) => {
@@ -322,11 +488,15 @@ pub fn run() {
 /// それはワーカー側の [`process_job`] が最後まで走るのに任せる。
 ///
 /// 戻り値は退避できた件数。
-fn drain_pending_finalizations(rx: &Receiver<FinalizeJob>, dir: &std::path::Path) -> usize {
+fn drain_pending_finalizations(rx: &Receiver<WorkerJob>, dir: &std::path::Path) -> usize {
     let mut recovered = 0;
     // try_recv なのでキューが空になれば即抜ける (終了処理を止めない)。
     while let Ok(job) = rx.try_recv() {
-        let Some(Ok(recording)) = guard_panic("終了時の WAV 化", || finalize_one(job)) else {
+        // 再転写待ちは WAV がディスク上にあるので失うものが無い。
+        let WorkerJob::Finalize(job) = job else {
+            continue;
+        };
+        let Some(Ok(recording)) = guard_panic("終了時の WAV 化", || finalize_one(*job)) else {
             log::error!("終了時に後処理待ちの録音を WAV 化できませんでした");
             continue;
         };
@@ -353,6 +523,15 @@ fn resolve_paths(app: &AppHandle) -> (PathBuf, PathBuf) {
                 .join("nox-voice-data")
         });
     (base.join("config.json"), base.join("failed"))
+}
+
+/// 履歴 DB のパス。
+fn resolve_db_path(app: &AppHandle) -> PathBuf {
+    let (config_path, _) = resolve_paths(app);
+    config_path
+        .parent()
+        .map(|dir| dir.join("nox-voice.db"))
+        .unwrap_or_else(|| PathBuf::from("nox-voice.db"))
 }
 
 /// ファイナライズワーカースレッドを起動する。
@@ -532,11 +711,11 @@ fn request_finalize(app: &AppHandle) -> Result<(), String> {
 
     state
         .finalize_tx
-        .send(FinalizeJob {
+        .send(WorkerJob::Finalize(Box::new(FinalizeJob {
             recorder,
             target,
             started_at,
-        })
+        })))
         .map_err(|_| "後処理ワーカーが停止しています".to_string())
 }
 
@@ -572,9 +751,24 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-fn finalize_worker(app: AppHandle, rx: Receiver<FinalizeJob>) {
+fn finalize_worker(app: AppHandle, rx: Receiver<WorkerJob>) {
     while let Ok(job) = rx.recv() {
-        process_job(&app, job);
+        match job {
+            WorkerJob::Finalize(job) => process_job(&app, *job),
+            WorkerJob::Retranscribe { id } => {
+                // 録音中なら「録音中」表示を奪わない (再転写は裏方の作業)。
+                if !app.state::<AppState>().is_recording() {
+                    set_status(&app, Status::Processing, None);
+                }
+                if guard_panic("再転写", || retranscribe(&app, id)).is_none() {
+                    emit_error(&app, "再転写中に内部エラーが発生しました");
+                }
+                // panic しても進行中の印は必ず外す (二度と再転写できなくなる)。
+                if let Ok(mut running) = app.state::<AppState>().retranscribing.lock() {
+                    running.remove(&id);
+                }
+            }
+        }
 
         // 次の録音が既に始まっているなら Idle へ戻さない。
         // 無条件に戻すと、録音 B の最中に録音 A の後処理が終わった瞬間、
@@ -747,16 +941,34 @@ fn transcribe_and_format(app: &AppHandle, recording: &RecordingSession) {
                 log::warn!("整形をスキップしました: {reason}");
             }
 
-            // R4 の趣旨: 注入より先に結果を保全する。
-            // 注入は数百 ms かかるうえ失敗もしうるので、その前に
-            // `get_last_result` で取り出せる状態にしておく。
-            // (M4 の履歴 DB が入るまでのメモリ上の暫定保全)
             if let Ok(mut slot) = state.last_result.lock() {
                 *slot = Some(payload.clone());
             }
 
+            // --- R4: 注入より先に永続化する ---
+            //
+            // 注入は最も壊れやすい工程 (フォーカスが変わる・クリップボードを
+            // 奪われる・昇格アプリに弾かれる)。そこで落ちたときに発話が
+            // 消えるのが最悪なので、書いてから注入する。
+            // DB が書けなくてもパイプラインは止めず、WAV 退避に落とす。
+            let history_id = record_history(app, &cfg, recording, &payload);
+
             apply_injection(app, &cfg, recording, &mut payload);
             payload.total_ms = started.elapsed().as_millis() as u64;
+
+            // 注入の結果を後から書き足す。
+            if let Some(id) = history_id {
+                let history = &app.state::<AppState>().history;
+                if let Err(e) = history.update_injection(
+                    id,
+                    &format!("{:?}", payload.inject_outcome),
+                    &format!("{:?}", payload.clipboard_state),
+                ) {
+                    // 貼付が不達だった行を後から探せなくなるので黙らない。
+                    log::warn!("履歴へ注入結果を書けません: {e}");
+                    emit_error(app, &format!("履歴へ貼り付け結果を記録できませんでした: {e}"));
+                }
+            }
 
             if let Ok(mut slot) = state.last_result.lock() {
                 *slot = Some(payload.clone());
@@ -764,16 +976,35 @@ fn transcribe_and_format(app: &AppHandle, recording: &RecordingSession) {
             if let Err(e) = app.emit(EVENT_RESULT, &payload) {
                 log::warn!("結果イベントの送出に失敗: {e}");
             }
+            emit_history_changed(app);
+            // 常駐したままでも保持期限が守られるよう、録音のたびに執行する。
+            enforce_retention(app, cfg.history_retention_days);
         }
         Err(e) => {
             let msg = e.to_string();
             log::error!("転写に失敗しました: {msg}");
             let saved = save_failed_recording(&state.failed_dir, recording, &msg);
-            let notice = match saved {
-                Some(path) => format!("{msg}\n録音は {} に保存しました", path.display()),
-                None => format!("{msg}\n※録音の退避にも失敗しました"),
+
+            // 失敗した「その場で」履歴に未転写行を作る。起動時の取り込み任せに
+            // すると、再転写の導線が次回起動まで出てこない — 常駐運用では
+            // それが一番必要な瞬間に一番見えない、という状態になる。
+            let listed = match &saved {
+                Some(path) if cfg.history_enabled => {
+                    record_untranscribed(app, recording, path, &msg)
+                }
+                _ => false,
             };
-            emit_error(app, &notice);
+
+            let notice = match (&saved, listed) {
+                (Some(_), true) => {
+                    format!("{msg}\n録音は履歴に残しました。履歴から再転写できます")
+                }
+                (Some(path), false) => {
+                    format!("{msg}\n録音は {} に保存しました", path.display())
+                }
+                (None, _) => format!("{msg}\n※録音の退避にも失敗しました"),
+            };
+            notify(app, Notice::ActionRequired, &notice);
         }
     }
 }
@@ -861,7 +1092,338 @@ fn notify(app: &AppHandle, level: Notice, message: &str) {
     }
 }
 
-/// STT に失敗した WAV を退避する。/// STT に失敗した WAV を退避する。
+/// 履歴へ 1 件書く (R4: 注入前)。
+///
+/// 書けなければ `None` を返し、呼び出し側は注入を続ける。
+/// **ただし黙って落とさない**: WAV を退避してユーザーへ知らせる。
+/// 履歴に残らないうえ音声も無い、という全損経路を作らないため。
+fn record_history(
+    app: &AppHandle,
+    cfg: &config::Config,
+    recording: &RecordingSession,
+    payload: &ResultPayload,
+) -> Option<i64> {
+    if !cfg.history_enabled {
+        log::info!("設定により履歴は保存しません");
+        return None;
+    }
+
+    let (outcome, reason) = match &payload.outcome {
+        FormatOutcome::Formatted => (history::OUTCOME_FORMATTED, None),
+        FormatOutcome::RawFallback { reason } => {
+            (history::OUTCOME_RAW_FALLBACK, Some(reason.clone()))
+        }
+        FormatOutcome::Disabled => (history::OUTCOME_DISABLED, None),
+    };
+
+    let draft = SessionDraft {
+        started_at_ms: recording
+            .started_at
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        duration_ms: payload.duration_ms,
+        target_process: payload.target_process.clone(),
+        target_hwnd: payload.target_hwnd,
+        raw_text: Some(payload.raw_text.clone()),
+        formatted_text: Some(payload.text.clone()),
+        outcome: outcome.to_string(),
+        outcome_reason: reason,
+        stt_ms: Some(payload.stt_ms),
+        format_ms: Some(payload.format_ms),
+        wav_path: None,
+    };
+
+    match app.state::<AppState>().history.insert(&draft) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            // 履歴に残せなかった以上、せめて音声は残す。
+            log::error!("履歴に保存できません: {e}");
+            let dir = app.state::<AppState>().failed_dir.clone();
+            let saved = save_failed_recording(&dir, recording, &format!("履歴に保存できず: {e}"));
+            let notice = match saved {
+                Some(path) => format!(
+                    "履歴に保存できませんでした。録音は {} に退避しました",
+                    path.display()
+                ),
+                None => "履歴に保存できず、録音の退避にも失敗しました".to_string(),
+            };
+            notify(app, Notice::ActionRequired, &notice);
+            None
+        }
+    }
+}
+
+/// STT に失敗した録音を、その場で未転写行として履歴へ載せる。
+///
+/// 起動時の取り込みと同じ形の行を作るので、次回起動の取り込みは
+/// `wav_path` の重複で弾かれ、二重登録にならない。
+fn record_untranscribed(
+    app: &AppHandle,
+    recording: &RecordingSession,
+    wav_path: &std::path::Path,
+    error: &str,
+) -> bool {
+    let Some(path_str) = wav_path.to_str() else {
+        log::warn!("退避 WAV のパスを文字列にできません: {}", wav_path.display());
+        return false;
+    };
+
+    let draft = SessionDraft {
+        started_at_ms: recording
+            .started_at
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        duration_ms: recording.duration.as_millis() as u64,
+        target_process: recording.target_process().to_string(),
+        target_hwnd: recording.target_hwnd(),
+        raw_text: None,
+        formatted_text: None,
+        outcome: history::OUTCOME_UNTRANSCRIBED.to_string(),
+        outcome_reason: Some(error.to_string()),
+        stt_ms: None,
+        format_ms: None,
+        wav_path: Some(path_str.to_string()),
+    };
+
+    match app.state::<AppState>().history.insert_untranscribed(&draft) {
+        Ok(Some(_)) => {
+            emit_history_changed(app);
+            true
+        }
+        // 既に同じ WAV の行がある (稀: 退避名が衝突した等)。
+        Ok(None) => {
+            emit_history_changed(app);
+            true
+        }
+        Err(e) => {
+            log::error!("未転写の履歴を作れません: {e}");
+            false
+        }
+    }
+}
+
+/// 保持期限を執行する。起動時だけでなく録音のたびにも通す。
+///
+/// 常駐アプリは何日も起動しっぱなしになる。起動時だけの執行では
+/// 「30 日保持」の約束が守られない期間が延々と続く。
+fn enforce_retention(app: &AppHandle, days: u32) {
+    match app.state::<AppState>().history.purge_older_than(days) {
+        Ok(0) => {}
+        Ok(n) => {
+            log::info!("保持期限を過ぎた履歴 {n} 件を削除しました");
+            emit_history_changed(app);
+        }
+        Err(e) => log::warn!("履歴の保持期限処理に失敗: {e}"),
+    }
+}
+
+/// 履歴が変わったことをフロントへ知らせる。
+fn emit_history_changed(app: &AppHandle) {
+    if let Err(e) = app.emit(EVENT_HISTORY, ()) {
+        log::warn!("履歴更新イベントの送出に失敗: {e}");
+    }
+}
+
+/// 起動時の履歴セットアップ: スキーマ作成 → 期限切れ削除 → 失敗 WAV 取り込み。
+///
+/// どれが失敗してもアプリは起動する (履歴は補助機能で、録音と注入が本体)。
+fn initialize_history(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if let Err(e) = state.history.initialize() {
+        log::error!("{e}");
+        emit_error(app, &e.to_string());
+        return;
+    }
+
+    let cfg = state.config.snapshot();
+    enforce_retention(app, cfg.history_retention_days);
+
+    if cfg.history_enabled {
+        match import_failed_recordings(&state.history, &state.failed_dir) {
+            Ok(0) => {}
+            Ok(n) => log::info!("未転写の録音 {n} 件を履歴に取り込みました"),
+            Err(e) => log::warn!("失敗録音の取り込みに失敗: {e}"),
+        }
+    }
+
+    match state.history.count() {
+        Ok(n) => log::info!("履歴 {n} 件を保持しています"),
+        Err(e) => log::warn!("履歴の件数を取得できません: {e}"),
+    }
+}
+
+/// `failed/` に残っている WAV を「未転写」行として履歴へ取り込む。
+///
+/// 既に登録済みのものは飛ばすので、起動のたびに走っても増えない。
+/// 戻り値は新規に取り込んだ件数。
+fn import_failed_recordings(
+    history: &HistoryStore,
+    dir: &std::path::Path,
+) -> Result<usize, String> {
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("{} を読めません: {e}", dir.display()))?;
+
+    let mut imported = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("wav") {
+            continue;
+        }
+        let Some(path_str) = path.to_str() else {
+            log::warn!("退避 WAV のパスを文字列にできません: {}", path.display());
+            continue;
+        };
+
+        // 退避時に書いたメタ情報 (無ければ既定値で登録する)。
+        let meta = std::fs::read_to_string(path.with_extension("json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        let get_u64 = |key: &str| -> u64 {
+            meta.as_ref()
+                .and_then(|m| m.get(key))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+
+        let draft = SessionDraft {
+            started_at_ms: get_u64("started_at_ms"),
+            duration_ms: get_u64("duration_ms"),
+            target_process: meta
+                .as_ref()
+                .and_then(|m| m.get("target_process"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<unknown>")
+                .to_string(),
+            target_hwnd: meta
+                .as_ref()
+                .and_then(|m| m.get("target_hwnd"))
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0) as isize,
+            raw_text: None,
+            formatted_text: None,
+            outcome: history::OUTCOME_UNTRANSCRIBED.to_string(),
+            outcome_reason: meta
+                .as_ref()
+                .and_then(|m| m.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            stt_ms: None,
+            format_ms: None,
+            wav_path: Some(path_str.to_string()),
+        };
+
+        match history.insert_untranscribed(&draft) {
+            Ok(Some(_)) => imported += 1,
+            Ok(None) => {}
+            Err(e) => log::warn!("{} を取り込めません: {e}", path.display()),
+        }
+    }
+    Ok(imported)
+}
+
+/// 履歴の未転写行を、退避 WAV から転写し直す。
+fn retranscribe(app: &AppHandle, id: i64) {
+    let state = app.state::<AppState>();
+
+    let wav_path = match state.history.wav_path(id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            emit_error(app, "この履歴には再転写できる音声がありません");
+            return;
+        }
+        Err(e) => {
+            emit_error(app, &format!("履歴を読めません: {e}"));
+            return;
+        }
+    };
+
+    let wav = match std::fs::read(&wav_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            emit_error(app, &format!("退避した音声を読めません ({wav_path}): {e}"));
+            return;
+        }
+    };
+
+    let Some(http) = state.http.clone() else {
+        emit_error(app, "HTTP クライアントを構築できなかったため再転写できません");
+        return;
+    };
+    let cfg = state.config.snapshot();
+    let stt_client = GroqStt::new(
+        http.clone(),
+        &cfg.groq_endpoint,
+        &cfg.stt_model,
+        cfg.groq_key().secret.unwrap_or_default(),
+    );
+    let formatter = cfg.formatting_enabled.then(|| {
+        GeminiFormatter::new(
+            http,
+            cfg.gemini_url(),
+            cfg.gemini_key().secret.unwrap_or_default(),
+        )
+        .with_timeout(format::FORMAT_TIMEOUT)
+    });
+
+    match pipeline::run(
+        &wav,
+        &cfg.language,
+        &cfg.dictionary,
+        &stt_client,
+        formatter.as_ref().map(|f| f as &dyn format::TextFormatter),
+    ) {
+        Ok(result) => {
+            let (outcome, reason) = match &result.outcome {
+                FormatOutcome::Formatted => (history::OUTCOME_FORMATTED, None),
+                FormatOutcome::RawFallback { reason } => {
+                    (history::OUTCOME_RAW_FALLBACK, Some(reason.clone()))
+                }
+                FormatOutcome::Disabled => (history::OUTCOME_DISABLED, None),
+            };
+            log::info!(
+                "再転写完了 (履歴 #{id}): 生 {} 文字 / 採用 {} 文字",
+                result.raw_text.chars().count(),
+                result.text.chars().count()
+            );
+            match state.history.update_transcription(
+                id,
+                &history::TranscriptionUpdate {
+                    raw_text: &result.raw_text,
+                    formatted_text: &result.text,
+                    outcome,
+                    outcome_reason: reason.as_deref(),
+                    stt_ms: result.stt_ms,
+                    format_ms: result.format_ms,
+                },
+            ) {
+                Ok(0) => {
+                    // 再転写中に行が削除された。結果を黙って捨てない。
+                    let msg = "再転写した履歴が処理中に削除されたため、結果を保存できませんでした";
+                    log::warn!("{msg} (履歴 #{id})");
+                    notify(app, Notice::ActionRequired, msg);
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    emit_error(app, &format!("再転写の結果を保存できません: {e}"));
+                    return;
+                }
+            }
+            emit_history_changed(app);
+        }
+        Err(e) => {
+            // 音声は退避先に残ったままなので、もう一度試せる。
+            emit_error(app, &format!("再転写に失敗しました: {e}"));
+        }
+    }
+}
+
+/// STT に失敗した WAV を退避する。
 ///
 /// M4 の履歴 DB (R4: 注入前の永続化) が入るまでの暫定措置。
 /// 「転写に失敗したから録音も消える」という最悪の失敗モードを避ける。
@@ -1164,9 +1726,11 @@ mod tests {
     #[test]
     fn pending_jobs_are_recovered_on_exit() {
         let dir = temp_dir("drain");
-        let (tx, rx) = crossbeam_channel::unbounded::<FinalizeJob>();
-        tx.send(test_job(0.1)).expect("送れる");
-        tx.send(test_job(0.2)).expect("送れる");
+        let (tx, rx) = crossbeam_channel::unbounded::<WorkerJob>();
+        tx.send(WorkerJob::Finalize(Box::new(test_job(0.1)))).expect("送れる");
+        tx.send(WorkerJob::Finalize(Box::new(test_job(0.2)))).expect("送れる");
+        // 再転写待ちは WAV がディスク上にあるので退避対象外。
+        tx.send(WorkerJob::Retranscribe { id: 99 }).expect("送れる");
 
         let recovered = drain_pending_finalizations(&rx, &dir);
 
@@ -1190,7 +1754,7 @@ mod tests {
     #[test]
     fn draining_an_empty_queue_is_a_no_op() {
         let dir = temp_dir("drain-empty");
-        let (_tx, rx) = crossbeam_channel::unbounded::<FinalizeJob>();
+        let (_tx, rx) = crossbeam_channel::unbounded::<WorkerJob>();
         assert_eq!(drain_pending_finalizations(&rx, &dir), 0);
         // 空振りで無駄なディレクトリを作らない。
         assert!(!dir.exists());
@@ -1252,6 +1816,279 @@ mod tests {
         assert_eq!(std::fs::read(&saved).expect("読める"), recording.wav_bytes);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M4: 失敗 WAV の履歴取り込みと、DB 失敗時の劣化 ---
+
+    fn temp_store(tag: &str) -> (PathBuf, HistoryStore) {
+        let dir = temp_dir(tag);
+        let store = HistoryStore::new(dir.join("nox-voice.db"));
+        store.initialize().expect("初期化できる");
+        (dir, store)
+    }
+
+    #[test]
+    fn failed_recordings_are_imported_as_untranscribed_rows() {
+        let (db_dir, store) = temp_store("import-db");
+        let failed_dir = temp_dir("import-wav");
+        let recording = sample_recording();
+        let wav = save_failed_recording(&failed_dir, &recording, "Groq のレート制限")
+            .expect("退避できる");
+
+        let imported = import_failed_recordings(&store, &failed_dir).expect("取り込める");
+        assert_eq!(imported, 1);
+
+        let rows = store.recent(10, None).expect("読める");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.outcome, history::OUTCOME_UNTRANSCRIBED);
+        assert!(row.has_audio, "再転写できる行になっていない");
+        assert_eq!(row.raw_text, None, "未転写なのに本文が入っている");
+        // 退避時のメタ情報が引き継がれている。
+        assert_eq!(row.target_process, "notepad.exe");
+        assert_eq!(row.duration_ms, 2_500);
+        assert!(
+            row.outcome_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("レート制限")),
+            "失敗理由が失われている"
+        );
+        assert_eq!(
+            store.wav_path(row.id).expect("読める").as_deref(),
+            wav.to_str()
+        );
+
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&failed_dir);
+    }
+
+    #[test]
+    fn importing_twice_does_not_duplicate_rows() {
+        // 起動のたびに走るので、冪等でないと履歴が水増しされる。
+        let (db_dir, store) = temp_store("import-idem-db");
+        let failed_dir = temp_dir("import-idem-wav");
+        save_failed_recording(&failed_dir, &sample_recording(), "失敗").expect("退避できる");
+
+        assert_eq!(import_failed_recordings(&store, &failed_dir).expect("1 回目"), 1);
+        assert_eq!(import_failed_recordings(&store, &failed_dir).expect("2 回目"), 0);
+        assert_eq!(store.count().expect("読める"), 1);
+
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&failed_dir);
+    }
+
+    #[test]
+    fn importing_from_a_missing_directory_is_not_an_error() {
+        let (db_dir, store) = temp_store("import-nodir");
+        let missing = temp_dir("import-nodir-wav");
+        assert_eq!(import_failed_recordings(&store, &missing).expect("エラーにしない"), 0);
+        let _ = std::fs::remove_dir_all(&db_dir);
+    }
+
+    #[test]
+    fn import_ignores_non_wav_files() {
+        let (db_dir, store) = temp_store("import-filter-db");
+        let failed_dir = temp_dir("import-filter-wav");
+        std::fs::create_dir_all(&failed_dir).expect("作れる");
+        // 退避のメタ情報 (.json) や書きかけ (.part) を行にしない。
+        std::fs::write(failed_dir.join("123.json"), "{}").expect("書ける");
+        std::fs::write(failed_dir.join("123.wav.part"), "x").expect("書ける");
+
+        assert_eq!(import_failed_recordings(&store, &failed_dir).expect("取り込める"), 0);
+        assert_eq!(store.count().expect("読める"), 0);
+
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&failed_dir);
+    }
+
+    /// M-3 回帰: STT 失敗の「その場で」履歴に未転写行ができる。
+    ///
+    /// 起動時の取り込み任せだと、再転写の導線が次回起動まで出てこない。
+    /// 常駐運用では、一番必要な瞬間に一番見えない状態になる。
+    /// (本番は AppHandle 越しなので、同じ組み合わせをここで検証する)
+    #[test]
+    fn an_stt_failure_lands_in_history_immediately() {
+        let (db_dir, store) = temp_store("stt-fail-db");
+        let failed_dir = temp_dir("stt-fail-wav");
+        let recording = sample_recording();
+
+        // 本番と同じ順序: WAV を退避 → その場で未転写行を作る。
+        let wav = save_failed_recording(&failed_dir, &recording, "Groq のレート制限")
+            .expect("退避できる");
+        let draft = SessionDraft {
+            started_at_ms: 1,
+            duration_ms: recording.duration.as_millis() as u64,
+            target_process: recording.target_process().to_string(),
+            target_hwnd: recording.target_hwnd(),
+            raw_text: None,
+            formatted_text: None,
+            outcome: history::OUTCOME_UNTRANSCRIBED.to_string(),
+            outcome_reason: Some("Groq のレート制限".to_string()),
+            stt_ms: None,
+            format_ms: None,
+            wav_path: Some(wav.to_string_lossy().to_string()),
+        };
+        assert!(store.insert_untranscribed(&draft).expect("書ける").is_some());
+
+        // 再起動を待たずに、再転写できる行として見えている。
+        let rows = store.recent(10, None).expect("読める");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].has_audio, "再転写の導線が出ない");
+        assert_eq!(rows[0].outcome, history::OUTCOME_UNTRANSCRIBED);
+
+        // 次回起動の取り込みは重複を作らない。
+        assert_eq!(
+            import_failed_recordings(&store, &failed_dir).expect("取り込める"),
+            0,
+            "起動時の取り込みが二重登録した"
+        );
+        assert_eq!(store.count().expect("読める"), 1);
+
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&failed_dir);
+    }
+
+    /// M-1 回帰: 削除した行は、起動時の取り込みで復活しない。
+    #[test]
+    fn a_deleted_row_does_not_come_back_on_the_next_startup() {
+        let (db_dir, store) = temp_store("revive-db");
+        let failed_dir = temp_dir("revive-wav");
+        save_failed_recording(&failed_dir, &sample_recording(), "失敗").expect("退避できる");
+
+        assert_eq!(import_failed_recordings(&store, &failed_dir).expect("取り込める"), 1);
+        let id = store.recent(10, None).expect("読める")[0].id;
+
+        // ユーザーが履歴から削除する。
+        let removal = store.delete(id).expect("消せる");
+        assert_eq!(removal.rows, 1);
+        assert_eq!(removal.wavs_removed, 1, "WAV を残すと復活する");
+
+        // 起動をやり直しても戻ってこない。
+        assert_eq!(import_failed_recordings(&store, &failed_dir).expect("取り込める"), 0);
+        assert_eq!(store.count().expect("読める"), 0, "削除した履歴が復活した");
+
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&failed_dir);
+    }
+
+    /// M-1 回帰: 全消去のあと `failed/` に WAV が残らない (R1 / 無限成長の防止)。
+    #[test]
+    fn clearing_history_empties_the_failed_directory() {
+        let (db_dir, store) = temp_store("clear-revive-db");
+        let failed_dir = temp_dir("clear-revive-wav");
+        for _ in 0..2 {
+            let mut r = sample_recording();
+            r.started_at += std::time::Duration::from_secs(1);
+            save_failed_recording(&failed_dir, &r, "失敗").expect("退避できる");
+        }
+        assert_eq!(import_failed_recordings(&store, &failed_dir).expect("取り込める"), 2);
+
+        let removal = store.clear().expect("消せる");
+        assert_eq!(removal.rows, 2);
+        assert_eq!(removal.wavs_removed, 2);
+
+        let leftover: Vec<_> = std::fs::read_dir(&failed_dir)
+            .expect("読める")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(leftover.is_empty(), "全消去後に残骸がある: {leftover:?}");
+        assert_eq!(import_failed_recordings(&store, &failed_dir).expect("取り込める"), 0);
+
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&failed_dir);
+    }
+
+    /// M-2 回帰: 再転写 → 保持期限 → 再取り込み でテキストが失われない。
+    #[test]
+    fn a_retranscribed_row_is_not_resurrected_as_untranscribed() {
+        let (db_dir, store) = temp_store("ghost-db");
+        let failed_dir = temp_dir("ghost-wav");
+        // 保持期限で正当に消える年代だと、幽霊行の有無を切り分けられない。
+        // 「まだ期限内の録音」で試す。
+        let mut recording = sample_recording();
+        recording.started_at = SystemTime::now();
+        save_failed_recording(&failed_dir, &recording, "失敗").expect("退避できる");
+        import_failed_recordings(&store, &failed_dir).expect("取り込める");
+        let id = store.recent(10, None).expect("読める")[0].id;
+
+        // 再転写に成功する。
+        store
+            .update_transcription(
+                id,
+                &history::TranscriptionUpdate {
+                    raw_text: "回収した生転写",
+                    formatted_text: "回収したテキスト。",
+                    outcome: history::OUTCOME_FORMATTED,
+                    outcome_reason: None,
+                    stt_ms: 1,
+                    format_ms: 1,
+                },
+            )
+            .expect("更新できる");
+
+        // 保持期限 → 起動時の取り込み、という次回起動の流れをなぞる。
+        store.purge_older_than(30).expect("消せる");
+        assert_eq!(
+            import_failed_recordings(&store, &failed_dir).expect("取り込める"),
+            0,
+            "幽霊の未転写行が湧いた"
+        );
+
+        let rows = store.recent(10, None).expect("読める");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].formatted_text.as_deref(),
+            Some("回収したテキスト。"),
+            "回収したテキストが失われた"
+        );
+        assert!(!rows[0].has_audio);
+
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&failed_dir);
+    }
+
+    /// DB が壊れていても音声は失わない (R4 の最後の砦)。
+    ///
+    /// 本番の `record_history` は AppHandle を要るので、
+    /// 同じ組み合わせ (履歴書き込み失敗 → WAV 退避) をここで検証する。
+    #[test]
+    fn a_broken_database_still_leaves_the_audio_on_disk() {
+        let db_dir = temp_dir("broken-db");
+        std::fs::create_dir_all(&db_dir).expect("作れる");
+        let db_path = db_dir.join("nox-voice.db");
+        std::fs::write(&db_path, b"not a sqlite file at all").expect("書ける");
+        let store = HistoryStore::new(db_path);
+
+        let recording = sample_recording();
+        let draft = SessionDraft {
+            started_at_ms: 1,
+            duration_ms: 2_500,
+            target_process: "notepad.exe".to_string(),
+            target_hwnd: 0x1234,
+            raw_text: Some("生転写".to_string()),
+            formatted_text: Some("整形後。".to_string()),
+            outcome: history::OUTCOME_FORMATTED.to_string(),
+            outcome_reason: None,
+            stt_ms: Some(1),
+            format_ms: Some(1),
+            wav_path: None,
+        };
+
+        // 履歴には書けない。
+        let err = store.insert(&draft).expect_err("壊れた DB では失敗する");
+        // ...が、音声は退避できる。
+        let failed_dir = temp_dir("broken-db-wav");
+        let saved = save_failed_recording(&failed_dir, &recording, &err.to_string())
+            .expect("退避できる");
+        assert_eq!(
+            std::fs::read(&saved).expect("読める"),
+            recording.wav_bytes,
+            "履歴が書けないうえ音声も失う全損経路になっている"
+        );
+
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&failed_dir);
     }
 
     #[test]

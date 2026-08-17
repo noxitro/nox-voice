@@ -545,6 +545,18 @@ fn restore_text(text: &str) -> Result<(), InjectOutcome> {
     set_unicode_text(text).map_err(|_| InjectOutcome::ClipboardFailed)
 }
 
+/// テキストをクリップボードへ入れる (履歴からの再貼付用)。
+///
+/// 注入はしないので、履歴除外フォーマットも付ける。発話内容が
+/// Win+V 履歴やクラウドへ流れるのは通常の貼付時と同じく避けたい。
+pub fn set_clipboard_text(text: &str) -> Result<(), InjectOutcome> {
+    let _guard = ClipboardGuard::open()?;
+    write_payload(text).map_err(|e| {
+        log::error!("クリップボードへの書き込みに失敗: {e}");
+        InjectOutcome::ClipboardFailed
+    })
+}
+
 /// クリップボードを開いている間だけ生きる RAII ガード。
 struct ClipboardGuard;
 

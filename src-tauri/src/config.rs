@@ -51,6 +51,11 @@ pub const DEFAULT_STT_MODEL: &str = "whisper-large-v3";
 pub const DEFAULT_FORMAT_MODEL: &str = "gemini-flash-lite-latest";
 pub const DEFAULT_LANGUAGE: &str = "ja";
 
+/// 履歴の既定保持日数。
+pub const DEFAULT_HISTORY_RETENTION_DAYS: u32 = 30;
+/// 保持日数の上限 (約 10 年)。0 は「無制限」を意味するので別扱い。
+pub const MAX_HISTORY_RETENTION_DAYS: u32 = 3_650;
+
 /// 復元待ちの下限。0 だと貼付が消費される前に戻してしまう。
 pub const MIN_RESTORE_DELAY_MS: u64 = 50;
 /// 復元待ちの上限。長いほどユーザーの次のコピーを壊す窓が広がる。
@@ -142,6 +147,13 @@ pub struct Config {
     /// 結果を前景アプリへ自動で貼り付けるか。
     /// false なら画面に表示するだけ (手動コピー)。
     pub injection_enabled: bool,
+    /// 履歴を保存するか。
+    ///
+    /// 履歴には発話の全文が入る。R1 の観点で「残さない」選択肢を用意する。
+    /// OFF でも失敗 WAV の退避は続ける (音声を失わせないため)。
+    pub history_enabled: bool,
+    /// 履歴の保持日数。0 は無制限。
+    pub history_retention_days: u32,
     /// 貼付から元クリップボードの復元までの待ち時間 (ms)。
     ///
     /// 短すぎると貼付が消費される前に戻して旧内容が貼られ、
@@ -162,6 +174,8 @@ impl Default for Config {
             dictionary: Vec::new(),
             formatting_enabled: true,
             injection_enabled: true,
+            history_enabled: true,
+            history_retention_days: DEFAULT_HISTORY_RETENTION_DAYS,
             restore_delay_ms: crate::inject::DEFAULT_RESTORE_DELAY_MS,
             groq_endpoint: DEFAULT_GROQ_ENDPOINT.to_string(),
             gemini_endpoint: DEFAULT_GEMINI_ENDPOINT.to_string(),
@@ -254,6 +268,8 @@ pub struct ConfigView {
     pub dictionary: Vec<String>,
     pub formatting_enabled: bool,
     pub injection_enabled: bool,
+    pub history_enabled: bool,
+    pub history_retention_days: u32,
     pub restore_delay_ms: u64,
     pub stt_model: String,
     pub format_model: String,
@@ -285,6 +301,8 @@ impl ConfigView {
             dictionary: c.dictionary.clone(),
             formatting_enabled: c.formatting_enabled,
             injection_enabled: c.injection_enabled,
+            history_enabled: c.history_enabled,
+            history_retention_days: c.history_retention_days,
             restore_delay_ms: c.restore_delay_ms,
             stt_model: c.stt_model.clone(),
             format_model: c.format_model.clone(),
@@ -313,6 +331,8 @@ pub struct ConfigPatch {
     pub dictionary: Option<Vec<String>>,
     pub formatting_enabled: Option<bool>,
     pub injection_enabled: Option<bool>,
+    pub history_enabled: Option<bool>,
+    pub history_retention_days: Option<u32>,
     pub restore_delay_ms: Option<u64>,
     pub stt_model: Option<String>,
     pub format_model: Option<String>,
@@ -340,6 +360,8 @@ impl fmt::Debug for ConfigPatch {
             .field("dictionary", &self.dictionary)
             .field("formatting_enabled", &self.formatting_enabled)
             .field("injection_enabled", &self.injection_enabled)
+            .field("history_enabled", &self.history_enabled)
+            .field("history_retention_days", &self.history_retention_days)
             .field("restore_delay_ms", &self.restore_delay_ms)
             .field("stt_model", &self.stt_model)
             .field("format_model", &self.format_model)
@@ -358,6 +380,11 @@ impl Config {
         self.restore_delay_ms = self
             .restore_delay_ms
             .clamp(MIN_RESTORE_DELAY_MS, MAX_RESTORE_DELAY_MS);
+        // 0 は「無制限」という意味を持つので潰さない。
+        if self.history_retention_days != 0 {
+            self.history_retention_days =
+                self.history_retention_days.min(MAX_HISTORY_RETENTION_DAYS);
+        }
     }
 
     /// パッチを適用する。空文字が来たフィールドは既定値へ戻す。
@@ -383,6 +410,12 @@ impl Config {
         }
         if let Some(v) = patch.injection_enabled {
             self.injection_enabled = v;
+        }
+        if let Some(v) = patch.history_enabled {
+            self.history_enabled = v;
+        }
+        if let Some(v) = patch.history_retention_days {
+            self.history_retention_days = v;
         }
         if let Some(v) = patch.restore_delay_ms {
             // 極端な値は事故のもと。0 は即復元 = 旧内容が貼られる、

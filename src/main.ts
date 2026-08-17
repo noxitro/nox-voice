@@ -68,6 +68,25 @@ interface ResultPayload {
   lost_clipboard_formats: string[];
 }
 
+/** Rust 側 `history::SessionRow` と対応。 */
+interface SessionRow {
+  id: number;
+  started_at_ms: number;
+  duration_ms: number;
+  target_process: string;
+  target_hwnd: number;
+  raw_text: string | null;
+  formatted_text: string | null;
+  outcome: string;
+  outcome_reason: string | null;
+  stt_ms: number | null;
+  format_ms: number | null;
+  inject_outcome: string | null;
+  clipboard_state: string | null;
+  has_audio: boolean;
+  created_at_ms: number;
+}
+
 /** Rust 側 `config::ConfigView` と対応。**キーの実体は含まれない。** */
 interface ConfigView {
   groq_key_set: boolean;
@@ -80,6 +99,8 @@ interface ConfigView {
   dictionary: string[];
   formatting_enabled: boolean;
   injection_enabled: boolean;
+  history_enabled: boolean;
+  history_retention_days: number;
   restore_delay_ms: number;
   stt_model: string;
   format_model: string;
@@ -274,6 +295,12 @@ function renderConfig(view: ConfigView) {
   if (injection) injection.checked = view.injection_enabled;
   const restoreDelay = el<HTMLInputElement>("restore-delay");
   if (restoreDelay) restoreDelay.value = String(view.restore_delay_ms);
+  const historyEnabled = el<HTMLInputElement>("history-enabled");
+  if (historyEnabled) historyEnabled.checked = view.history_enabled;
+  const retention = el<HTMLInputElement>("history-retention");
+  if (retention) retention.value = String(view.history_retention_days);
+  const dictionary = el<HTMLTextAreaElement>("dictionary");
+  if (dictionary) dictionary.value = view.dictionary.join("\n");
   const groqState = el("groq-state");
   if (groqState) groqState.textContent = keyStateLabel(view, "groq");
   const geminiState = el("gemini-state");
@@ -289,13 +316,21 @@ async function saveSettings(event: Event) {
   const formatting = el<HTMLInputElement>("formatting-enabled");
   const injection = el<HTMLInputElement>("injection-enabled");
   const restoreDelay = el<HTMLInputElement>("restore-delay");
+  const historyEnabled = el<HTMLInputElement>("history-enabled");
+  const retention = el<HTMLInputElement>("history-retention");
+  const dictionary = el<HTMLTextAreaElement>("dictionary");
 
   // 入力欄が空 = 「変更しない」。誤って既存キーを消さないため未指定で送る。
   const patch: Record<string, unknown> = {
     language: language?.value ?? "",
     formatting_enabled: formatting?.checked ?? true,
     injection_enabled: injection?.checked ?? true,
+    history_enabled: historyEnabled?.checked ?? true,
+    // 空行は Rust 側で落とされる。
+    dictionary: (dictionary?.value ?? "").split(/\r?\n/),
   };
+  const days = Number(retention?.value);
+  if (Number.isFinite(days) && days >= 0) patch.history_retention_days = days;
   // 数値として読めないときは送らない (Rust 側の範囲でクランプされる)。
   const delay = Number(restoreDelay?.value);
   if (Number.isFinite(delay) && delay > 0) patch.restore_delay_ms = delay;
@@ -317,6 +352,217 @@ async function saveSettings(event: Event) {
   }, 2500);
 }
 
+/** 履歴の結末バッジ。 */
+const OUTCOME_BADGE: Record<string, string> = {
+  formatted: "整形済",
+  raw_fallback: "劣化",
+  disabled: "整形オフ",
+  untranscribed: "未転写",
+};
+
+/** 現在表示している履歴。追記読み込みで伸びる。 */
+let historyRows: SessionRow[] = [];
+/** 展開中の行 ID。 */
+let expandedId: number | null = null;
+
+function showHistoryError(message: string | null) {
+  const node = el("history-error");
+  if (!node) return;
+  if (message === null) {
+    node.textContent = "";
+    node.hidden = true;
+    return;
+  }
+  node.textContent = message;
+  node.hidden = false;
+}
+
+function historyPreview(row: SessionRow): string {
+  const text = row.formatted_text || row.raw_text || "";
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  if (!oneLine) return row.has_audio ? "(未転写の録音)" : "(テキストなし)";
+  return oneLine.length > 60 ? `${oneLine.slice(0, 60)}…` : oneLine;
+}
+
+function buildHistoryItem(row: SessionRow): HTMLLIElement {
+  const li = document.createElement("li");
+  li.className = "history-item";
+  li.dataset.id = String(row.id);
+
+  const head = document.createElement("button");
+  head.type = "button";
+  head.className = "history-head";
+  head.setAttribute("aria-expanded", String(expandedId === row.id));
+
+  const meta = document.createElement("span");
+  meta.className = "history-meta";
+  meta.textContent = `${new Date(row.started_at_ms).toLocaleString()} · ${
+    row.target_process
+  }`;
+
+  const badge = document.createElement("span");
+  badge.className = "badge";
+  badge.dataset.kind =
+    row.outcome === "formatted"
+      ? "formatted"
+      : row.outcome === "untranscribed"
+        ? "untranscribed"
+        : "degraded";
+  badge.textContent = OUTCOME_BADGE[row.outcome] ?? row.outcome;
+
+  const preview = document.createElement("span");
+  preview.className = "history-preview";
+  preview.textContent = historyPreview(row);
+
+  const topLine = document.createElement("span");
+  topLine.className = "history-topline";
+  topLine.append(meta, badge);
+  head.append(topLine, preview);
+  head.addEventListener("click", () => {
+    expandedId = expandedId === row.id ? null : row.id;
+    renderHistory();
+  });
+  li.append(head);
+
+  if (expandedId === row.id) {
+    li.append(buildHistoryDetail(row));
+  }
+  return li;
+}
+
+function buildHistoryDetail(row: SessionRow): HTMLElement {
+  const detail = document.createElement("div");
+  detail.className = "history-detail";
+
+  if (row.outcome_reason) {
+    const reason = document.createElement("p");
+    reason.className = "degraded-note";
+    reason.textContent = row.outcome_reason;
+    detail.append(reason);
+  }
+
+  // R5: 生転写と整形結果を並置して、欠落やハルシネーションを照合できるようにする。
+  const addBlock = (title: string, text: string | null) => {
+    if (text === null) return;
+    const block = document.createElement("div");
+    block.className = "text-block";
+    const h = document.createElement("h3");
+    h.textContent = title;
+    const pre = document.createElement("pre");
+    pre.className = "text";
+    pre.textContent = text;
+    block.append(h, pre);
+    detail.append(block);
+  };
+  addBlock("整形後", row.formatted_text);
+  addBlock("生転写", row.raw_text);
+
+  // 貼付の結末を出す。不達だった行を見つけて再貼付するのに要る。
+  if (row.inject_outcome) {
+    const inject = document.createElement("p");
+    inject.className = "inject-note";
+    const label = INJECT_LABEL[row.inject_outcome as InjectOutcome] ?? row.inject_outcome;
+    const clipboard = row.clipboard_state
+      ? CLIPBOARD_LABEL[row.clipboard_state as ClipboardState]
+      : "";
+    inject.textContent = clipboard ? `${label} / ${clipboard}` : label;
+    inject.dataset.kind = row.inject_outcome === "injected" ? "ok" : "warn";
+    detail.append(inject);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "history-actions";
+
+  const hasText = Boolean(row.formatted_text || row.raw_text);
+  if (hasText) {
+    // コピーも再貼付も同じ経路 (Rust 側の copy_history_entry) に通す。
+    // navigator.clipboard だと履歴除外フォーマットが付かず、発話が
+    // Win+V 履歴やクラウドクリップボードへ流れてしまう。
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.textContent = "コピー";
+    copy.title = "クリップボードに入れます (Win+V 履歴には残しません)";
+    copy.addEventListener("click", () => {
+      void invoke("copy_history_entry", { id: row.id }).catch((e) => {
+        showHistoryError(`コピーに失敗しました: ${e}`);
+      });
+    });
+    actions.append(copy);
+  }
+
+  if (row.has_audio && row.outcome === "untranscribed") {
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.textContent = "再転写";
+    retry.addEventListener("click", () => {
+      retry.disabled = true;
+      retry.textContent = "再転写中…";
+      // バックエンドにも進行中ガードがあるので、連打しても二重には走らない。
+      void invoke("retranscribe_history_entry", { id: row.id }).catch((e) => {
+        showHistoryError(`再転写を開始できません: ${e}`);
+        retry.disabled = false;
+        retry.textContent = "再転写";
+      });
+    });
+    actions.append(retry);
+  }
+
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "danger";
+  remove.textContent = "削除";
+  remove.addEventListener("click", () => {
+    if (!window.confirm("この履歴を削除しますか?")) return;
+    void invoke("delete_history_entry", { id: row.id }).catch((e) => {
+      showHistoryError(`削除に失敗しました: ${e}`);
+    });
+  });
+  actions.append(remove);
+
+  detail.append(actions);
+  return detail;
+}
+
+/** 履歴の読み込みに失敗しているか。0 件と区別する。 */
+let historyLoadFailed = false;
+
+function renderHistory() {
+  const list = el("history-list");
+  const empty = el("history-empty");
+  if (!list) return;
+  list.replaceChildren(...historyRows.map(buildHistoryItem));
+  // 「読めなかった」を「0 件」と表示しない。消えたと誤解させる。
+  if (empty) empty.hidden = historyRows.length > 0 || historyLoadFailed;
+}
+
+const HISTORY_PAGE = 50;
+
+async function loadHistory(append = false) {
+  const more = el<HTMLButtonElement>("history-more");
+  try {
+    const beforeId =
+      append && historyRows.length > 0
+        ? historyRows[historyRows.length - 1].id
+        : null;
+    const rows = await invoke<SessionRow[]>("get_history", {
+      limit: HISTORY_PAGE,
+      beforeId,
+    });
+    historyRows = append ? [...historyRows, ...rows] : rows;
+    historyLoadFailed = false;
+    showHistoryError(null);
+    renderHistory();
+    if (more) more.hidden = rows.length < HISTORY_PAGE;
+  } catch (e) {
+    // 「読めなかった」を「0 件」と表示しない。消えたと誤解させる。
+    historyLoadFailed = true;
+    if (!append) historyRows = [];
+    renderHistory();
+    showHistoryError(`履歴を読み込めませんでした: ${e}`);
+    if (more) more.hidden = true;
+  }
+}
+
 window.addEventListener("DOMContentLoaded", async () => {
   document.querySelectorAll<HTMLButtonElement>("button.copy").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -325,6 +571,15 @@ window.addEventListener("DOMContentLoaded", async () => {
     });
   });
   el("settings-form")?.addEventListener("submit", (e) => void saveSettings(e));
+  el("history-more")?.addEventListener("click", () => void loadHistory(true));
+  el("history-clear")?.addEventListener("click", () => {
+    if (!window.confirm("履歴をすべて削除しますか? この操作は取り消せません。")) {
+      return;
+    }
+    void invoke("clear_history").catch((e) => {
+      showHistoryError(`削除に失敗しました: ${e}`);
+    });
+  });
 
   await listen<StatusPayload>("nox://status", (event) => {
     if (event.payload.status === "recording") clearError();
@@ -337,6 +592,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     renderResult(event.payload),
   );
   await listen<string>("nox://error", (event) => showError(event.payload));
+  await listen("nox://history", () => void loadHistory());
 
   // 初期表示は Rust 側の現在値に合わせる (イベントを取り逃していても正しく出る)。
   try {
@@ -346,6 +602,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     const result = await invoke<ResultPayload | null>("get_last_result");
     if (result) renderResult(result);
     renderConfig(await invoke<ConfigView>("get_config"));
+    await loadHistory();
   } catch (e) {
     showError(`状態の取得に失敗しました: ${e}`);
   }

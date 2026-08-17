@@ -283,6 +283,94 @@ button:focus-visible {
   outline-offset: 2px;
 }
 
+/* --- 履歴 --- */
+
+.history {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+}
+
+.history-item + .history-item {
+  border-top: 1px solid var(--border);
+}
+
+.history-head {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  padding: 10px 4px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+
+.history-head:hover {
+  background: color-mix(in srgb, var(--border) 35%, transparent);
+}
+
+.history-topline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.history-meta {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.history-preview {
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.badge[data-kind="untranscribed"] {
+  background: color-mix(in srgb, var(--muted) 22%, transparent);
+  color: var(--muted);
+}
+
+.history-detail {
+  padding: 4px 4px 14px;
+}
+
+.history-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+button.danger {
+  color: var(--error);
+  border-color: color-mix(in srgb, var(--error) 45%, var(--border));
+}
+
+button.danger:hover {
+  border-color: var(--error);
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.settings textarea {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.9rem;
+  resize: vertical;
+}
+
 .settings summary {
   font-size: 0.85rem;
   font-weight: 600;
