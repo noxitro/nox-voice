@@ -195,6 +195,33 @@ h2 {
   font-size: 0.85rem;
 }
 
+.inject-note {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--border);
+  background: var(--bg);
+  font-size: 0.85rem;
+}
+
+.inject-note[data-kind="ok"] {
+  border-left-color: var(--ok);
+}
+
+.inject-note[data-kind="warn"] {
+  border-left-color: var(--processing);
+}
+
+.settings input[type="number"] {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.9rem;
+  max-width: 10rem;
+}
+
 .text-block {
   margin-top: 14px;
 }

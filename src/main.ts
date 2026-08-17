@@ -26,6 +26,30 @@ type FormatOutcome =
   | { kind: "raw_fallback"; reason: string }
   | { kind: "disabled" };
 
+/** Rust 側 `inject::InjectOutcome` と対応。 */
+type InjectOutcome =
+  | "injected"
+  | "disabled"
+  | "empty_text"
+  | "aborted_focus_changed"
+  | "aborted_target_unknown"
+  | "aborted_modifier_stuck"
+  | "clipboard_busy"
+  | "clipboard_failed"
+  | "send_failed";
+
+/**
+ * Rust 側 `inject::ClipboardState` と対応。
+ * 「復元した」と「ユーザーが別のものをコピーした」を区別する
+ * (後者で「Ctrl+V で貼れます」と案内すると嘘になる)。
+ */
+type ClipboardState =
+  | "untouched"
+  | "holds_injected_text"
+  | "restored_original"
+  | "replaced_by_user"
+  | "lost";
+
 /** Rust 側 `ResultPayload` と対応。 */
 interface ResultPayload {
   raw_text: string;
@@ -38,6 +62,10 @@ interface ResultPayload {
   target_process: string;
   target_hwnd: number;
   duration_ms: number;
+  injected: boolean;
+  inject_outcome: InjectOutcome;
+  clipboard_state: ClipboardState;
+  lost_clipboard_formats: string[];
 }
 
 /** Rust 側 `config::ConfigView` と対応。**キーの実体は含まれない。** */
@@ -51,9 +79,36 @@ interface ConfigView {
   language: string;
   dictionary: string[];
   formatting_enabled: boolean;
+  injection_enabled: boolean;
+  restore_delay_ms: number;
   stt_model: string;
   format_model: string;
 }
+
+/**
+ * 注入結果の説明。`injected` は「Ctrl+V を送出した」という意味で、
+ * 相手アプリに貼られた保証ではない (Rust 側 inject.rs のモジュール doc)。
+ */
+const INJECT_LABEL: Record<InjectOutcome, string> = {
+  injected: "貼り付けを送出しました",
+  disabled: "自動貼り付けは無効です",
+  empty_text: "貼り付けるテキストがありません",
+  aborted_focus_changed: "挿入先が変わったため中止(Ctrl+V で貼り付け可)",
+  aborted_target_unknown: "挿入先を特定できず中止(Ctrl+V で貼り付け可)",
+  aborted_modifier_stuck: "修飾キー押下中のため中止(Ctrl+V で貼り付け可)",
+  clipboard_busy: "クリップボードが使用中で貼り付けできませんでした",
+  clipboard_failed: "クリップボードへの書き込みに失敗しました",
+  send_failed: "キー入力の送出に失敗(Ctrl+V で貼り付け可)",
+};
+
+/** クリップボードの終状態の説明。触っていない場合は何も出さない。 */
+const CLIPBOARD_LABEL: Record<ClipboardState, string> = {
+  untouched: "",
+  holds_injected_text: "クリップボードに入っています (Ctrl+V で貼り付け可)",
+  restored_original: "クリップボードは元に戻しました",
+  replaced_by_user: "クリップボードは新しくコピーされた内容のままです",
+  lost: "元のクリップボード内容を復元できませんでした",
+};
 
 const STATUS_LABEL: Record<Status, string> = {
   idle: "待機中",
@@ -161,6 +216,21 @@ function renderResult(r: ResultPayload) {
     }
   }
 
+  // 注入の結末。成功時は静かに、中止・失敗時は理由を出す。
+  const injectNote = el<HTMLElement>("inject-note");
+  if (injectNote) {
+    const label = INJECT_LABEL[r.inject_outcome] ?? r.inject_outcome;
+    const clipboard = CLIPBOARD_LABEL[r.clipboard_state];
+    injectNote.textContent = clipboard ? `${label} / ${clipboard}` : label;
+    // 手を動かす必要がある状態なら目立たせる。
+    const needsAction =
+      r.clipboard_state === "holds_injected_text" ||
+      r.clipboard_state === "lost" ||
+      r.lost_clipboard_formats.length > 0;
+    injectNote.dataset.kind = needsAction ? "warn" : r.injected ? "ok" : "warn";
+    injectNote.hidden = r.inject_outcome === "disabled";
+  }
+
   const timings = el("timings");
   if (timings) {
     timings.textContent =
@@ -200,6 +270,10 @@ function renderConfig(view: ConfigView) {
   if (language) language.value = view.language;
   const formatting = el<HTMLInputElement>("formatting-enabled");
   if (formatting) formatting.checked = view.formatting_enabled;
+  const injection = el<HTMLInputElement>("injection-enabled");
+  if (injection) injection.checked = view.injection_enabled;
+  const restoreDelay = el<HTMLInputElement>("restore-delay");
+  if (restoreDelay) restoreDelay.value = String(view.restore_delay_ms);
   const groqState = el("groq-state");
   if (groqState) groqState.textContent = keyStateLabel(view, "groq");
   const geminiState = el("gemini-state");
@@ -213,12 +287,18 @@ async function saveSettings(event: Event) {
   const gemini = el<HTMLInputElement>("gemini-key");
   const language = el<HTMLInputElement>("language");
   const formatting = el<HTMLInputElement>("formatting-enabled");
+  const injection = el<HTMLInputElement>("injection-enabled");
+  const restoreDelay = el<HTMLInputElement>("restore-delay");
 
   // 入力欄が空 = 「変更しない」。誤って既存キーを消さないため未指定で送る。
   const patch: Record<string, unknown> = {
     language: language?.value ?? "",
     formatting_enabled: formatting?.checked ?? true,
+    injection_enabled: injection?.checked ?? true,
   };
+  // 数値として読めないときは送らない (Rust 側の範囲でクランプされる)。
+  const delay = Number(restoreDelay?.value);
+  if (Number.isFinite(delay) && delay > 0) patch.restore_delay_ms = delay;
   if (groq?.value) patch.groq_api_key = groq.value;
   if (gemini?.value) patch.gemini_api_key = gemini.value;
 

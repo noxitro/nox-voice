@@ -51,6 +51,11 @@ pub const DEFAULT_STT_MODEL: &str = "whisper-large-v3";
 pub const DEFAULT_FORMAT_MODEL: &str = "gemini-flash-lite-latest";
 pub const DEFAULT_LANGUAGE: &str = "ja";
 
+/// 復元待ちの下限。0 だと貼付が消費される前に戻してしまう。
+pub const MIN_RESTORE_DELAY_MS: u64 = 50;
+/// 復元待ちの上限。長いほどユーザーの次のコピーを壊す窓が広がる。
+pub const MAX_RESTORE_DELAY_MS: u64 = 5_000;
+
 const ENV_GROQ_KEY: &str = "GROQ_API_KEY";
 const ENV_GEMINI_KEY: &str = "GEMINI_API_KEY";
 
@@ -134,6 +139,14 @@ pub struct Config {
     pub dictionary: Vec<String>,
     /// LLM 整形を行うか。false なら生転写をそのまま採用する。
     pub formatting_enabled: bool,
+    /// 結果を前景アプリへ自動で貼り付けるか。
+    /// false なら画面に表示するだけ (手動コピー)。
+    pub injection_enabled: bool,
+    /// 貼付から元クリップボードの復元までの待ち時間 (ms)。
+    ///
+    /// 短すぎると貼付が消費される前に戻して旧内容が貼られ、
+    /// 長すぎるとユーザーの次のコピーを壊しうる (design.md R3-b)。
+    pub restore_delay_ms: u64,
     pub groq_endpoint: String,
     pub gemini_endpoint: String,
     pub stt_model: String,
@@ -148,6 +161,8 @@ impl Default for Config {
             language: DEFAULT_LANGUAGE.to_string(),
             dictionary: Vec::new(),
             formatting_enabled: true,
+            injection_enabled: true,
+            restore_delay_ms: crate::inject::DEFAULT_RESTORE_DELAY_MS,
             groq_endpoint: DEFAULT_GROQ_ENDPOINT.to_string(),
             gemini_endpoint: DEFAULT_GEMINI_ENDPOINT.to_string(),
             stt_model: DEFAULT_STT_MODEL.to_string(),
@@ -238,6 +253,8 @@ pub struct ConfigView {
     pub language: String,
     pub dictionary: Vec<String>,
     pub formatting_enabled: bool,
+    pub injection_enabled: bool,
+    pub restore_delay_ms: u64,
     pub stt_model: String,
     pub format_model: String,
 }
@@ -267,6 +284,8 @@ impl ConfigView {
             language: c.language.clone(),
             dictionary: c.dictionary.clone(),
             formatting_enabled: c.formatting_enabled,
+            injection_enabled: c.injection_enabled,
+            restore_delay_ms: c.restore_delay_ms,
             stt_model: c.stt_model.clone(),
             format_model: c.format_model.clone(),
         }
@@ -293,6 +312,8 @@ pub struct ConfigPatch {
     pub language: Option<String>,
     pub dictionary: Option<Vec<String>>,
     pub formatting_enabled: Option<bool>,
+    pub injection_enabled: Option<bool>,
+    pub restore_delay_ms: Option<u64>,
     pub stt_model: Option<String>,
     pub format_model: Option<String>,
     pub groq_endpoint: Option<String>,
@@ -318,6 +339,8 @@ impl fmt::Debug for ConfigPatch {
             .field("language", &self.language)
             .field("dictionary", &self.dictionary)
             .field("formatting_enabled", &self.formatting_enabled)
+            .field("injection_enabled", &self.injection_enabled)
+            .field("restore_delay_ms", &self.restore_delay_ms)
             .field("stt_model", &self.stt_model)
             .field("format_model", &self.format_model)
             .field("groq_endpoint", &self.groq_endpoint)
@@ -327,6 +350,16 @@ impl fmt::Debug for ConfigPatch {
 }
 
 impl Config {
+    /// 範囲外の値を安全な範囲へ丸める。
+    ///
+    /// パッチ適用時だけでなく**読み込み時にも**通すこと。設定ファイルは
+    /// 手で編集されうるので、UI を通らない値が入ってくる。
+    pub fn normalize(&mut self) {
+        self.restore_delay_ms = self
+            .restore_delay_ms
+            .clamp(MIN_RESTORE_DELAY_MS, MAX_RESTORE_DELAY_MS);
+    }
+
     /// パッチを適用する。空文字が来たフィールドは既定値へ戻す。
     pub fn apply(&mut self, patch: ConfigPatch) {
         if let Some(v) = patch.groq_api_key {
@@ -348,6 +381,14 @@ impl Config {
         if let Some(v) = patch.formatting_enabled {
             self.formatting_enabled = v;
         }
+        if let Some(v) = patch.injection_enabled {
+            self.injection_enabled = v;
+        }
+        if let Some(v) = patch.restore_delay_ms {
+            // 極端な値は事故のもと。0 は即復元 = 旧内容が貼られる、
+            // 長すぎるとユーザーの次のコピーを壊す (R3-b)。
+            self.restore_delay_ms = v;
+        }
         if let Some(v) = patch.stt_model {
             self.stt_model = non_empty_or(v, DEFAULT_STT_MODEL);
         }
@@ -360,6 +401,7 @@ impl Config {
         if let Some(v) = patch.gemini_endpoint {
             self.gemini_endpoint = non_empty_or(v, DEFAULT_GEMINI_ENDPOINT);
         }
+        self.normalize();
     }
 }
 
@@ -409,6 +451,12 @@ impl ConfigStore {
                 Config::default()
             }
         };
+        // 手で編集された設定ファイルにも範囲外の値が入りうる。
+        // 0 だと貼付が消費される前に復元して旧内容が貼られ (R3-b)、
+        // 巨大値だとワーカーがその間ずっと塞がる。読み込み時にも正す。
+        let mut config = config;
+        config.normalize();
+
         Self {
             path,
             config: Mutex::new(config),
@@ -717,6 +765,56 @@ mod tests {
             "最初の原本",
             "既存の退避を潰した"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- m6 回帰: 復元待ち時間のクランプ ---
+
+    #[test]
+    fn restore_delay_is_clamped_when_patched() {
+        let mut cfg = Config::default();
+        cfg.apply(ConfigPatch {
+            restore_delay_ms: Some(0),
+            ..ConfigPatch::default()
+        });
+        assert_eq!(cfg.restore_delay_ms, MIN_RESTORE_DELAY_MS);
+
+        cfg.apply(ConfigPatch {
+            restore_delay_ms: Some(u64::MAX),
+            ..ConfigPatch::default()
+        });
+        assert_eq!(cfg.restore_delay_ms, MAX_RESTORE_DELAY_MS);
+    }
+
+    /// 設定ファイルを手で編集された場合も範囲内に正すこと。
+    ///
+    /// 0 のままだと貼付が消費される前に復元して旧内容が貼られ (R3-b)、
+    /// 巨大値だと後処理ワーカーがその間ずっと塞がる。
+    #[test]
+    fn restore_delay_is_clamped_on_load() {
+        let dir = std::env::temp_dir().join(format!("nox-config-clamp-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("テスト用ディレクトリ");
+
+        fs::write(&path, r#"{"restore_delay_ms": 0}"#).expect("書ける");
+        assert_eq!(
+            ConfigStore::load(path.clone()).snapshot().restore_delay_ms,
+            MIN_RESTORE_DELAY_MS,
+            "0 がそのまま読み込まれている"
+        );
+
+        fs::write(&path, r#"{"restore_delay_ms": 999999999}"#).expect("書ける");
+        assert_eq!(
+            ConfigStore::load(path.clone()).snapshot().restore_delay_ms,
+            MAX_RESTORE_DELAY_MS,
+            "巨大値がそのまま読み込まれている"
+        );
+
+        // 範囲内の値はそのまま。
+        fs::write(&path, r#"{"restore_delay_ms": 400}"#).expect("書ける");
+        assert_eq!(ConfigStore::load(path).snapshot().restore_delay_ms, 400);
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -30,6 +30,7 @@ mod config;
 mod foreground;
 mod format;
 mod hotkey;
+mod inject;
 mod pipeline;
 mod session;
 mod stt;
@@ -52,6 +53,7 @@ use audio::Recorder;
 use config::{ConfigPatch, ConfigStore, ConfigView};
 use format::GeminiFormatter;
 use hotkey::{HookHandle, HotkeyAction, PttInterpreter, TAP_THRESHOLD};
+use inject::{ClipboardState, InjectOutcome, InjectTarget};
 use pipeline::FormatOutcome;
 use session::{RecordingSession, SessionSummary, Status, StatusPayload, TargetWindow};
 use stt::GroqStt;
@@ -83,6 +85,16 @@ pub struct ResultPayload {
     pub target_hwnd: isize,
     /// 録音の実尺。
     pub duration_ms: u64,
+    /// Ctrl+V を送出したか。**貼られた保証ではない** ([`inject`] のモジュール doc)。
+    pub injected: bool,
+    pub inject_outcome: InjectOutcome,
+    /// 終了時点でクリップボードに何が入っているか。
+    ///
+    /// 「復元した」と「ユーザーが別のものをコピーした」を区別する。
+    /// 後者で「Ctrl+V で貼れます」と案内すると嘘になるため。
+    pub clipboard_state: ClipboardState,
+    /// R6: 退避できずに失われたクリップボード形式。
+    pub lost_clipboard_formats: Vec<String>,
 }
 
 /// ファイナライズワーカーへ渡す仕事。
@@ -214,6 +226,9 @@ fn show_window(app: AppHandle) {
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // 常駐運用ではウィンドウが閉じているので、行動を要する通知は
+        // WebView イベントではなく OS トーストで出す必要がある。
+        .plugin(tauri_plugin_notification::init())
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
@@ -696,7 +711,7 @@ fn transcribe_and_format(app: &AppHandle, recording: &RecordingSession) {
 
     match outcome {
         Ok(result) => {
-            let payload = ResultPayload {
+            let mut payload = ResultPayload {
                 degraded: result.outcome.is_degraded(),
                 raw_text: result.raw_text,
                 text: result.text,
@@ -707,6 +722,10 @@ fn transcribe_and_format(app: &AppHandle, recording: &RecordingSession) {
                 target_process: recording.target_process().to_string(),
                 target_hwnd: recording.target_hwnd(),
                 duration_ms: recording.duration.as_millis() as u64,
+                injected: false,
+                inject_outcome: InjectOutcome::Disabled,
+                clipboard_state: ClipboardState::Untouched,
+                lost_clipboard_formats: Vec::new(),
             };
 
             // 本文はユーザーの発話そのものなので info には出さない。
@@ -728,6 +747,17 @@ fn transcribe_and_format(app: &AppHandle, recording: &RecordingSession) {
                 log::warn!("整形をスキップしました: {reason}");
             }
 
+            // R4 の趣旨: 注入より先に結果を保全する。
+            // 注入は数百 ms かかるうえ失敗もしうるので、その前に
+            // `get_last_result` で取り出せる状態にしておく。
+            // (M4 の履歴 DB が入るまでのメモリ上の暫定保全)
+            if let Ok(mut slot) = state.last_result.lock() {
+                *slot = Some(payload.clone());
+            }
+
+            apply_injection(app, &cfg, recording, &mut payload);
+            payload.total_ms = started.elapsed().as_millis() as u64;
+
             if let Ok(mut slot) = state.last_result.lock() {
                 *slot = Some(payload.clone());
             }
@@ -748,7 +778,90 @@ fn transcribe_and_format(app: &AppHandle, recording: &RecordingSession) {
     }
 }
 
-/// STT に失敗した WAV を退避する。
+/// 採用テキストを前景アプリへ注入し、結果を `payload` に反映する。
+///
+/// 中止・失敗はいずれも致命ではない。整形テキストはクリップボードか
+/// 画面に残るので、ユーザーは手で貼り付けられる (design.md R4)。
+fn apply_injection(
+    app: &AppHandle,
+    cfg: &config::Config,
+    recording: &RecordingSession,
+    payload: &mut ResultPayload,
+) {
+    if !cfg.injection_enabled {
+        log::info!("設定により自動貼り付けは無効です");
+        payload.inject_outcome = InjectOutcome::Disabled;
+        return;
+    }
+
+    let report = inject::inject(
+        &payload.text,
+        InjectTarget::new(recording.target_hwnd(), recording.target.process_id),
+        std::time::Duration::from_millis(cfg.restore_delay_ms),
+    );
+
+    log::info!(
+        "注入結果: {:?} (送出={} / クリップボード={:?})",
+        report.outcome,
+        report.injected,
+        report.clipboard_state,
+    );
+
+    // R6: 画像やファイルが失われたことは、注入の成否とは別に必ず伝える。
+    if let Some(message) = inject::lost_formats_message(&report.lost_formats) {
+        log::warn!("{message}");
+        notify(app, Notice::ActionRequired, &message);
+    }
+    // 中止・失敗の理由と復旧方法を伝える。
+    if let Some(message) = &report.message {
+        let level = if report.needs_user_action() {
+            Notice::ActionRequired
+        } else {
+            Notice::Informational
+        };
+        notify(app, level, message);
+    }
+
+    payload.injected = report.injected;
+    payload.inject_outcome = report.outcome;
+    payload.clipboard_state = report.clipboard_state;
+    payload.lost_clipboard_formats = report.lost_formats;
+}
+
+/// 通知の重さ。
+///
+/// このアプリはトレイ常駐で使うので、**メインウィンドウは普段閉じている**。
+/// WebView へのイベントだけでは誰も見ない。ユーザーが動かないと発話が
+/// 失われる/何かが壊れたまま気づかれない類のものは OS トーストにも出す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Notice {
+    /// ユーザーの操作が要る (手で Ctrl+V する、失われたものに気づく)。
+    /// トースト + イベント。
+    ActionRequired,
+    /// 見えていれば役に立つが、見逃しても損はない。イベントのみ。
+    Informational,
+}
+
+/// ユーザーへの通知。重さに応じて OS トーストを併用する。
+fn notify(app: &AppHandle, level: Notice, message: &str) {
+    emit_error(app, message);
+    if level != Notice::ActionRequired {
+        return;
+    }
+    use tauri_plugin_notification::NotificationExt;
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title("nox-voice")
+        .body(message)
+        .show()
+    {
+        // トーストが出せなくてもイベントは出ているので致命ではない。
+        log::warn!("通知を表示できません: {e}");
+    }
+}
+
+/// STT に失敗した WAV を退避する。/// STT に失敗した WAV を退避する。
 ///
 /// M4 の履歴 DB (R4: 注入前の永続化) が入るまでの暫定措置。
 /// 「転写に失敗したから録音も消える」という最悪の失敗モードを避ける。

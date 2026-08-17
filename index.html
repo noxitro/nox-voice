@@ -34,6 +34,7 @@
 
         <div id="result" hidden>
           <p class="degraded-note" id="degraded-note" hidden></p>
+          <p class="inject-note" id="inject-note" hidden></p>
 
           <div class="text-block">
             <div class="text-head">
@@ -97,6 +98,20 @@
           <label class="checkbox">
             <input type="checkbox" id="formatting-enabled" />
             <span>LLM で整形する(オフなら生転写をそのまま使う)</span>
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" id="injection-enabled" />
+            <span>結果を前景アプリへ自動で貼り付ける</span>
+          </label>
+          <label>
+            <span>クリップボード復元までの待ち時間 (ms)</span>
+            <input
+              type="number"
+              id="restore-delay"
+              min="50"
+              max="5000"
+              step="50"
+            />
           </label>
           <div class="form-actions">
             <button type="submit">保存</button>
