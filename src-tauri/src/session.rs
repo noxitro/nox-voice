@@ -138,10 +138,25 @@ pub struct SessionSummary {
     pub target_title: String,
 }
 
+/// 状態変化の出どころ。
+///
+/// オーバーレイは**録音由来の状態だけ**を映す。再転写のような裏方の作業まで
+/// 映すと、小窓が「認識中…」のまま出しっぱなしになる (完了イベントが
+/// 録音の結果としては飛んでこないため)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StatusOrigin {
+    /// ホットキーによる録音の流れ。
+    Recording,
+    /// 履歴からの再転写など、裏方の作業。
+    Background,
+}
+
 /// 状態変化通知のペイロード。
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusPayload {
     pub status: Status,
     /// 補足メッセージ (エラー理由など)。無ければ `None`。
     pub message: Option<String>,
+    pub origin: StatusOrigin,
 }

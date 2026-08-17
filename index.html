@@ -150,6 +150,23 @@
               placeholder="nox-voice&#10;塩谷,しおや"
             ></textarea>
           </label>
+          <label>
+            <span>ホットキー(押している間だけ録音 / 短押しでトグル)</span>
+            <span class="hotkey-row">
+              <output class="hotkey-value" id="hotkey-label">右 Ctrl</output>
+              <button type="button" id="hotkey-capture">キーを押して設定</button>
+            </span>
+          </label>
+          <p class="warn">
+            押している間そのキーは入力先アプリにも流れます。文字キーや Enter は
+            選べません(長押しで連続入力されるため)。
+            <strong>Ctrl / Alt / Shift / Win / CapsLock / F1〜F12</strong>
+            などから選んでください。Esc で取り消せます。
+          </p>
+          <label class="checkbox">
+            <input type="checkbox" id="overlay-enabled" />
+            <span>録音中に小窓を表示する(クリックは下のアプリへ抜けます)</span>
+          </label>
           <label class="checkbox">
             <input type="checkbox" id="deep-context" />
             <span>

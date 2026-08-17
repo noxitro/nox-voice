@@ -6,7 +6,7 @@
 //! そうでなければネイティブ形式で取ってから [`resample_mono`] で変換する。
 
 use std::io::Cursor;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -83,6 +83,8 @@ pub struct Recorder {
     started_at: SystemTime,
     /// 長さ上限に到達したか。
     limit_hit: Arc<AtomicBool>,
+    /// 入力レベル (オーバーレイのメーター用)。
+    meter: Arc<LevelMeter>,
 }
 
 impl Recorder {
@@ -101,6 +103,11 @@ impl Recorder {
         self.limit_hit.load(Ordering::SeqCst)
     }
 
+    /// 入力レベルの共有スロット (録音中の可視化に使う)。
+    pub fn meter(&self) -> Arc<LevelMeter> {
+        Arc::clone(&self.meter)
+    }
+
     /// テスト用: 実デバイスなしで [`finish`] にかけられる Recorder を作る。
     ///
     /// ストリームを持たないので `finish` はバッファをそのまま変換する。
@@ -114,8 +121,63 @@ impl Recorder {
             device_name: "<test device>".to_string(),
             started_at: SystemTime::now(),
             limit_hit: Arc::new(AtomicBool::new(false)),
+            meter: Arc::new(LevelMeter::new()),
         }
     }
+}
+
+/// 入力レベル (RMS) の共有スロット。
+///
+/// 音声コールバックが毎回書き、UI 側のスレッドが読む。
+/// **コールバックからイベントを送らない** — 1 秒に何十回も IPC を叩くと
+/// WebView 側が詰まるし、音声コールバックの時間予算も食う。
+/// ここへ置くだけにして、送るのは別スレッドが間引いて行う。
+#[derive(Debug, Default)]
+pub struct LevelMeter {
+    /// 直近の RMS を f32 のビット表現で持つ (atomic に置ける形)。
+    level_bits: AtomicU32,
+}
+
+impl LevelMeter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// コールバックから呼ぶ。モノラル化済みサンプルの RMS を記録する。
+    pub fn record(&self, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        let sum: f32 = samples.iter().map(|s| s * s).sum();
+        let rms = (sum / samples.len() as f32).sqrt();
+        self.level_bits.store(rms.to_bits(), Ordering::Relaxed);
+    }
+
+    /// 直近の RMS を読む。
+    pub fn level(&self) -> f32 {
+        f32::from_bits(self.level_bits.load(Ordering::Relaxed))
+    }
+
+    /// UI のメーター用に 0.0..=1.0 へ写す。
+    ///
+    /// RMS をそのまま出すと、通常の発話 (0.02〜0.1 くらい) がほぼ振れない。
+    /// 対数にして「静か〜大きい」を見た目の差にする。
+    pub fn display_level(&self) -> f32 {
+        normalize_level(self.level())
+    }
+}
+
+/// RMS を 0.0..=1.0 の表示値へ。純関数なのでテストできる。
+///
+/// -60dB を下限、-6dB を上限として線形に伸ばす。
+pub fn normalize_level(rms: f32) -> f32 {
+    const MIN_DB: f32 = -60.0;
+    const MAX_DB: f32 = -6.0;
+    if !rms.is_finite() || rms <= 0.0 {
+        return 0.0;
+    }
+    let db = 20.0 * rms.log10();
+    ((db - MIN_DB) / (MAX_DB - MIN_DB)).clamp(0.0, 1.0)
 }
 
 /// 音声コールバックが書き込む先一式。
@@ -129,6 +191,8 @@ struct CaptureSink {
     limit_hit: Arc<AtomicBool>,
     /// 上限到達を 1 度だけ通知する。容量 1 の有界チャネル。
     limit_tx: Sender<()>,
+    /// 入力レベルの共有スロット。
+    meter: Arc<LevelMeter>,
 }
 
 /// デフォルト入力デバイスで録音を開始する。
@@ -157,11 +221,13 @@ pub fn start(limit_tx: Sender<()>) -> Result<Recorder, AudioError> {
         source_sample_rate as usize * 4,
     )));
     let limit_hit = Arc::new(AtomicBool::new(false));
+    let meter = Arc::new(LevelMeter::new());
     let sink = CaptureSink {
         buffer: Arc::clone(&buffer),
         max_samples: (source_sample_rate as f64 * MAX_RECORDING_SECONDS) as usize,
         limit_hit: Arc::clone(&limit_hit),
         limit_tx,
+        meter: Arc::clone(&meter),
     };
 
     let err_fn = |err: cpal::Error| {
@@ -205,6 +271,7 @@ pub fn start(limit_tx: Sender<()>) -> Result<Recorder, AudioError> {
         device_name,
         started_at: SystemTime::now(),
         limit_hit,
+        meter,
     })
 }
 
@@ -276,6 +343,7 @@ where
         }
         return;
     }
+    let before = buf.len();
     if channels == 1 {
         buf.extend(data.iter().map(|s| f32::from_sample(*s)));
     } else {
@@ -285,6 +353,8 @@ where
             buf.push(sum * inv);
         }
     }
+    // 今回書き足したぶんだけでレベルを測る (atomic への store だけ)。
+    sink.meter.record(&buf[before..]);
 }
 
 /// f32 モノラルを 16bit PCM の WAV バイト列にする。
@@ -516,6 +586,61 @@ mod tests {
             return 0.0;
         }
         (x.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / x.len() as f64).sqrt()
+    }
+
+    // --- 入力レベル ---
+
+    #[test]
+    fn silence_reads_as_zero() {
+        let meter = LevelMeter::new();
+        meter.record(&[0.0; 128]);
+        assert_eq!(meter.level(), 0.0);
+        assert_eq!(meter.display_level(), 0.0);
+    }
+
+    #[test]
+    fn rms_matches_the_known_value_for_a_sine() {
+        // 正弦の RMS は振幅 / sqrt(2)。
+        let meter = LevelMeter::new();
+        let samples: Vec<f32> = (0..1_000)
+            .map(|i| (2.0 * std::f32::consts::PI * i as f32 / 100.0).sin() * 0.5)
+            .collect();
+        meter.record(&samples);
+        assert!((meter.level() - 0.353).abs() < 0.01, "rms={}", meter.level());
+    }
+
+    #[test]
+    fn an_empty_chunk_keeps_the_previous_level() {
+        let meter = LevelMeter::new();
+        meter.record(&[0.5; 16]);
+        let before = meter.level();
+        meter.record(&[]);
+        assert_eq!(meter.level(), before, "空チャンクで 0 に落ちた");
+    }
+
+    #[test]
+    fn display_level_spreads_speech_across_the_range() {
+        // 生の RMS をそのまま出すと通常の発話でメーターがほぼ振れない。
+        assert_eq!(normalize_level(0.0), 0.0);
+        let quiet = normalize_level(0.002); // 静かな環境音 (-54dB)
+        let speech = normalize_level(0.05); // 通常の発話 (-26dB)
+        let loud = normalize_level(0.5); // 大声 (-6dB)
+        assert!(quiet < speech, "{quiet} < {speech}");
+        assert!(speech < loud, "{speech} < {loud}");
+        assert!(speech > 0.4 && speech < 0.8, "発話が中央付近に来ない: {speech}");
+        // 0.5 は -6.02dB で上限のわずかに下。ほぼ振り切っていればよい。
+        assert!(loud > 0.99, "大声で振り切らない: {loud}");
+    }
+
+    #[test]
+    fn display_level_is_clamped_and_safe() {
+        // 上下限を越えても 0..=1 から出ない。NaN や負値でも落ちない。
+        assert_eq!(normalize_level(10.0), 1.0);
+        assert_eq!(normalize_level(1e-9), 0.0);
+        assert_eq!(normalize_level(-1.0), 0.0);
+        // 非有限値は「レベル不明」。メーターを振り切らせるより黙らせる方が安全。
+        assert_eq!(normalize_level(f32::NAN), 0.0);
+        assert_eq!(normalize_level(f32::INFINITY), 0.0);
     }
 
     #[test]

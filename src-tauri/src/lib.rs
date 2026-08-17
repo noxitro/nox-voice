@@ -34,6 +34,7 @@ mod format;
 mod history;
 mod hotkey;
 mod inject;
+mod overlay;
 mod pipeline;
 mod session;
 mod stt;
@@ -61,7 +62,8 @@ use history::{HistoryStore, SessionDraft, SessionRow};
 use inject::{ClipboardState, InjectOutcome, InjectTarget};
 use pipeline::FormatOutcome;
 use session::{
-    PendingRecording, RecordingSession, SessionSummary, Status, StatusPayload, TargetWindow,
+    PendingRecording, RecordingSession, SessionSummary, Status, StatusOrigin, StatusPayload,
+    TargetWindow,
 };
 use stt::GroqStt;
 
@@ -75,6 +77,30 @@ const EVENT_RESULT: &str = "nox://result";
 const EVENT_ERROR: &str = "nox://error";
 /// 履歴が更新されたことの通知イベント (UI が再読込する)。
 const EVENT_HISTORY: &str = "nox://history";
+/// 入力レベル (0.0..=1.0)。オーバーレイのメーター用に間引いて送る。
+const EVENT_LEVEL: &str = "nox://level";
+/// 設定 UI へキー捕獲の結果を返すイベント。
+const EVENT_HOTKEY_CAPTURED: &str = "nox://hotkey-captured";
+/// 履歴を開くよう UI へ促すイベント (トレイ・通知からの導線)。
+const EVENT_SHOW_HISTORY: &str = "nox://show-history";
+
+/// キー捕獲の制限時間。
+///
+/// 捕獲はフックがグローバルなので、他アプリで打った最初のキーまで拾ってしまう。
+/// 押し忘れたまま放置されると、次に触ったキーがホットキーとして保存され、
+/// 以後そのキーで録音とトグルが暴発する。必ず時間で畳む。
+const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 結果を見せてから小窓を畳むまで。
+const OVERLAY_RESULT_LINGER: std::time::Duration = std::time::Duration::from_millis(1_600);
+/// エラー表示を残す時間 (読む時間が要る)。
+const OVERLAY_ERROR_LINGER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 入力レベルを送る間隔。20fps。
+///
+/// 音声コールバックから直接送ると 1 秒に何百回も IPC を叩くことになる。
+/// 見た目に必要なのは 20fps 程度なので、別スレッドで間引く。
+const LEVEL_EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// 転写・整形の結果。フロントと (M4 の) 履歴が使う。
 #[derive(Debug, Clone, Serialize)]
@@ -154,6 +180,11 @@ struct AppState {
     history: HistoryStore,
     /// 再転写が進行中の履歴 ID。多重発火を弾く。
     retranscribing: Mutex<std::collections::HashSet<i64>>,
+    /// レベル送出の世代。停止済みの録音のスレッドが凍った値を出し続けるのを防ぐ。
+    ///
+    /// 単なる ON/OFF フラグだと、停止→即再開のときに古いスレッドが
+    /// 生き残って二重に送る。世代が変わったら古い方は黙って終わる。
+    level_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// 設定 (API キー・言語・辞書など)。
     config: ConfigStore,
     /// STT / 整形で共用する HTTP クライアント。接続プールを使い回すため
@@ -191,6 +222,7 @@ impl AppState {
             config: ConfigStore::load(config_path),
             history: HistoryStore::new(db_path),
             retranscribing: Mutex::new(std::collections::HashSet::new()),
+            level_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             http,
             last_result: Mutex::new(None),
             failed_dir,
@@ -247,6 +279,16 @@ fn set_config(
     // 保持日数を縮めたなら、次の録音を待たずに今すぐ効かせる。
     if updated.history_retention_days != previous_retention {
         enforce_retention(&app, updated.history_retention_days);
+    }
+    // ホットキーはフックを設置し直さず、比較する仮想キーだけ差し替える。
+    hotkey::set_hotkey_vk(updated.hotkey_vk);
+    // オーバーレイを後から有効にした場合はその場で作る。
+    if updated.overlay_enabled {
+        if let Err(e) = overlay::create(&app) {
+            log::error!("オーバーレイを作成できません: {e}");
+        }
+    } else {
+        overlay::hide(&app);
     }
     Ok(ConfigView::from(&updated))
 }
@@ -322,6 +364,8 @@ fn report_removal(
         "退避した録音 {} 個を削除できませんでした。該当の履歴は残してあります (ファイルが使用中の可能性)",
         removal.wav_failures.len()
     );
+    // 通知はクリックしても何も起きないので、行き先を文言で示す
+    // (トレイの「履歴を開く」からも辿れる)。
     log::error!("{message}: {:?}", removal.wav_failures);
     notify(app, Notice::ActionRequired, &message);
     Err(message)
@@ -381,6 +425,94 @@ fn retranscribe_history_entry(state: tauri::State<'_, AppState>, id: i64) -> Res
     Ok(())
 }
 
+/// キー捕獲モードを開始する (設定 UI の「キーを押して設定」)。
+///
+/// 次に押されたキーが `nox://hotkey-captured` で返る。Esc で取り消し。
+/// 押し忘れて放置されると他アプリのキーを拾ってしまうので、
+/// [`CAPTURE_TIMEOUT`] で自動的に畳む。
+#[tauri::command]
+fn start_hotkey_capture(app: AppHandle) -> Result<u64, String> {
+    // 録音中に捕獲へ入ると、PTT の離しが捕獲側へ吸われて録音が止まらなくなる。
+    hotkey::can_begin_capture(app.state::<AppState>().is_recording())
+        .map_err(str::to_string)?;
+
+    let generation = hotkey::begin_capture();
+
+    // 時間で必ず畳む。自分の世代のときだけ効く。
+    let timer_app = app.clone();
+    let spawned = thread::Builder::new()
+        .name("nox-capture-timeout".to_string())
+        .spawn(move || {
+            std::thread::sleep(CAPTURE_TIMEOUT);
+            if hotkey::end_capture(Some(generation)) {
+                log::info!("キー捕獲がタイムアウトしました");
+                emit_hotkey_captured(&timer_app, None);
+                emit_error(
+                    &timer_app,
+                    "キーが押されなかったため、ホットキーの設定を取り消しました",
+                );
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("キー捕獲のタイムアウトを設定できません: {e}");
+    }
+    Ok(CAPTURE_TIMEOUT.as_secs())
+}
+
+/// キー捕獲モードを中止する (UI 側で閉じた場合など)。
+#[tauri::command]
+fn cancel_hotkey_capture() {
+    hotkey::end_capture(None);
+}
+
+/// オーバーレイの webview が読み込まれたことを知らせる。
+///
+/// **capability に "overlay" を入れ忘れると IPC が全部拒否され、
+/// 小窓は透明な空ウィンドウのまま**になる。見た目では気づけないので、
+/// webview 側から往復で呼ばせてログに残す。この行が出ていれば
+/// 「Rust → イベント → webview → invoke → Rust」が通っている証拠になる。
+#[tauri::command]
+fn overlay_ready(app: AppHandle, listeners: usize) {
+    log::info!("オーバーレイの webview が待受を開始しました (listener {listeners} 件)");
+    // 起動直後の状態を送って同期する。捕獲や再転写の途中でも表示が食い違わない。
+    let status = app
+        .state::<AppState>()
+        .status
+        .lock()
+        .map(|s| *s)
+        .unwrap_or(Status::Idle);
+    if let Err(e) = app.emit(
+        EVENT_STATUS,
+        StatusPayload {
+            status,
+            message: None,
+            origin: StatusOrigin::Recording,
+        },
+    ) {
+        log::warn!("オーバーレイへの初期状態送出に失敗: {e}");
+    }
+}
+
+/// オーバーレイが状態イベントを受けて描画を変えたことを知らせる (疎通確認用)。
+#[tauri::command]
+fn overlay_rendered(state: String) {
+    log::info!("オーバーレイの表示を更新しました: {state}");
+}
+
+/// 履歴を開く (トレイ・通知からの導線)。
+#[tauri::command]
+fn open_history(app: AppHandle) {
+    show_history(&app);
+}
+
+/// メインウィンドウを出して履歴へ誘導する。
+fn show_history(app: &AppHandle) {
+    tray::show_main_window(app);
+    if let Err(e) = app.emit(EVENT_SHOW_HISTORY, ()) {
+        log::warn!("履歴表示イベントの送出に失敗: {e}");
+    }
+}
+
 /// 設定ウィンドウ (現状はメインウィンドウ) を表示する。
 #[tauri::command]
 fn show_window(app: AppHandle) {
@@ -420,6 +552,11 @@ pub fn run() {
             clear_history,
             copy_history_entry,
             retranscribe_history_entry,
+            start_hotkey_capture,
+            cancel_hotkey_capture,
+            overlay_ready,
+            overlay_rendered,
+            open_history,
             show_window
         ])
         .setup(|app| {
@@ -442,12 +579,24 @@ pub fn run() {
                 Err(e) => log::error!("トレイの構築に失敗: {e}"),
             }
 
+            // 設定のホットキーを反映してからフックを設置する。
+            let cfg = handle.state::<AppState>().config.snapshot();
+            hotkey::set_hotkey_vk(cfg.hotkey_vk);
+
+            if cfg.overlay_enabled {
+                if let Err(e) = overlay::create(&handle) {
+                    // 小窓が出せなくても録音はできる。
+                    log::error!("オーバーレイを作成できません: {e}");
+                }
+            }
+
             start_finalize_worker(&handle);
             start_hotkey_controller(&handle);
             Ok(())
         })
         .on_window_event(|window, event| {
             // 「閉じる」は終了ではなく非表示。常駐を維持する。
+            // オーバーレイは装飾なしで閉じる手段が無いが、念のため同じ扱いにする。
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 if let Err(e) = window.hide() {
@@ -469,6 +618,8 @@ pub fn run() {
 
     app.run(|handle, event| {
         if let RunEvent::Exit = event {
+            // レベル送出スレッドを畳む。
+            stop_level_emitter(handle);
             // 録音中の終了 (トレイの「終了」等) で音声を無警告に捨てない。
             finalize_on_exit(handle);
             // 後処理待ちのキューに残っている録音も同様に退避する。
@@ -589,6 +740,11 @@ fn start_hotkey_controller(app: &AppHandle) {
                         // フック側が落ちた = 終了。
                         Err(_) => break,
                         Ok(event) => {
+                            // 設定 UI のキー捕獲は録音とは別経路。
+                            if let hotkey::HotkeyEventKind::Captured(vk) = event.kind {
+                                handle_captured_key(&app, vk);
+                                continue;
+                            }
                             // 判定は必ずイベントの発生時刻で行う。
                             // ここで Instant::now() を使うと、直前の処理で
                             // 詰まった分だけ短押しが長押しに化ける。
@@ -669,6 +825,7 @@ fn start_recording(app: &AppHandle) -> Result<(), String> {
 
     let recorder = audio::start(state.limit_tx.clone()).map_err(|e| e.to_string())?;
     let started_at = recorder.started_at();
+    let meter = recorder.meter();
     log::info!(
         "録音開始 (挿入先: {} / hwnd=0x{:X} / \"{}\")",
         target.process_name,
@@ -703,7 +860,59 @@ fn start_recording(app: &AppHandle) -> Result<(), String> {
     }
 
     set_status(app, Status::Recording, None);
+
+    // 表示とレベル送出は録音開始の後。ここで待たせると最初の一言が削れる。
+    // 小窓を出さないならレベルを送る相手もいない。
+    if cfg.overlay_enabled {
+        overlay::show(app);
+        start_level_emitter(app, meter);
+    }
     Ok(())
+}
+
+/// 入力レベルを間引いてフロントへ送るスレッドを起動する。
+///
+/// 音声コールバックから直接送らないのは、1 秒に何百回も IPC を叩くと
+/// WebView 側が詰まり、コールバックの時間予算も食うため。
+///
+/// 世代を進めてから起動するので、前の録音のスレッドはこの時点で終了へ向かう。
+fn start_level_emitter(app: &AppHandle, meter: std::sync::Arc<audio::LevelMeter>) {
+    use std::sync::atomic::Ordering;
+
+    let state = app.state::<AppState>();
+    let generation = state.level_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let current = std::sync::Arc::clone(&state.level_generation);
+    let app = app.clone();
+
+    let spawned = thread::Builder::new()
+        .name("nox-level".to_string())
+        .spawn(move || {
+            // 自分が最新の世代である間だけ送る。
+            while current.load(Ordering::SeqCst) == generation {
+                if let Err(e) = app.emit(EVENT_LEVEL, meter.display_level()) {
+                    log::debug!("入力レベルの送出に失敗: {e}");
+                    break;
+                }
+                std::thread::sleep(LEVEL_EMIT_INTERVAL);
+            }
+            // 自分が最後の送り手なら、0 を送ってメーターを畳む。
+            if current.load(Ordering::SeqCst) == generation {
+                let _ = app.emit(EVENT_LEVEL, 0.0f32);
+            }
+        });
+
+    if let Err(e) = spawned {
+        log::warn!("入力レベルの送出スレッドを起動できません: {e}");
+    }
+}
+
+/// レベル送出を止める (世代を進めるだけ)。
+fn stop_level_emitter(app: &AppHandle) {
+    use std::sync::atomic::Ordering;
+    let state = app.state::<AppState>();
+    state.level_generation.fetch_add(1, Ordering::SeqCst);
+    // メーターを 0 に畳む。走っていたスレッドは世代違いで黙って終わる。
+    let _ = app.emit(EVENT_LEVEL, 0.0f32);
 }
 
 /// 録音を止め、後処理をワーカーへ引き渡す。
@@ -736,6 +945,7 @@ fn request_finalize(app: &AppHandle) -> Result<(), String> {
             context: context::ScreenContext::default(),
         });
 
+    stop_level_emitter(app);
     set_status(app, Status::Processing, None);
 
     state
@@ -787,8 +997,10 @@ fn finalize_worker(app: AppHandle, rx: Receiver<WorkerJob>) {
             WorkerJob::Finalize(job) => process_job(&app, *job),
             WorkerJob::Retranscribe { id } => {
                 // 録音中なら「録音中」表示を奪わない (再転写は裏方の作業)。
+                // 出どころを Background にして、オーバーレイには映さない
+                // (映すと完了イベントが来ず「認識中…」で固まる)。
                 if !app.state::<AppState>().is_recording() {
-                    set_status(&app, Status::Processing, None);
+                    set_status_from(&app, Status::Processing, None, StatusOrigin::Background);
                 }
                 if guard_panic("再転写", || retranscribe(&app, id)).is_none() {
                     emit_error(&app, "再転写中に内部エラーが発生しました");
@@ -805,6 +1017,8 @@ fn finalize_worker(app: AppHandle, rx: Receiver<WorkerJob>) {
         // 表示が「待機中」に化ける。
         if !app.state::<AppState>().is_recording() {
             set_status(&app, Status::Idle, None);
+            // 小窓は結果を少し見せてから自分で消える (overlay.ts 側)。
+            // ここでは録音が続いていないことだけ確かめる。
         }
     }
     log::info!("ファイナライズワーカーを終了");
@@ -1040,6 +1254,9 @@ fn transcribe_and_format(
             if let Err(e) = app.emit(EVENT_RESULT, &payload) {
                 log::warn!("結果イベントの送出に失敗: {e}");
             }
+            // 結果を少し見せてから畳む。次の録音で表示が更新されれば、
+            // このタイマーは世代違いで何もしない。
+            overlay::hide_after(app, OVERLAY_RESULT_LINGER);
             emit_history_changed(app);
             // 常駐したままでも保持期限が守られるよう、録音のたびに執行する。
             enforce_retention(app, cfg.history_retention_days);
@@ -1280,6 +1497,72 @@ fn enforce_retention(app: &AppHandle, days: u32) {
             emit_history_changed(app);
         }
         Err(e) => log::warn!("履歴の保持期限処理に失敗: {e}"),
+    }
+}
+
+/// 設定 UI のキー捕獲を処理する。
+///
+/// 捕獲は 1 回で終わる (押した時点でモードを抜ける)。押しっぱなしや
+/// 連打で何度も発火すると、UI 側の状態と食い違う。
+fn handle_captured_key(app: &AppHandle, vk: u32) {
+    if !hotkey::is_capturing() {
+        return;
+    }
+    let outcome = hotkey::decide_capture(vk);
+
+    // 使えないキーなら捕獲を続ける。押し直せばよい。
+    if let hotkey::CaptureOutcome::Rejected(label) = &outcome {
+        log::info!("ホットキーに使えないキーです: {label}");
+        emit_error(
+            app,
+            &format!(
+                "「{label}」はホットキーに使えません。押している間ずっと入力先へ流れてしまいます。\n                 Ctrl / Alt / Shift / Win / CapsLock / F1〜F12 などから選んでください"
+            ),
+        );
+        return;
+    }
+
+    hotkey::end_capture(None);
+
+    match outcome {
+        hotkey::CaptureOutcome::Rejected(_) => unreachable!("上で返している"),
+        hotkey::CaptureOutcome::Cancel => {
+            log::info!("キー捕獲を取り消しました");
+            emit_hotkey_captured(app, None);
+        }
+        hotkey::CaptureOutcome::Accept(vk) => {
+            // 確定時、このキーはまだ押されたまま。離すまで通常経路から締め出す。
+            // これをしないと、設定した直後にオートリピートで録音が始まる。
+            hotkey::suppress_until_release(vk);
+            let state = app.state::<AppState>();
+            match state.config.update(config::ConfigPatch {
+                hotkey_vk: Some(vk),
+                ..Default::default()
+            }) {
+                Ok(updated) => {
+                    // 設定が保存できてから実際のフックへ反映する。
+                    // 逆にすると、保存に失敗したときだけ挙動と設定がずれる。
+                    hotkey::set_hotkey_vk(updated.hotkey_vk);
+                    emit_hotkey_captured(app, Some(updated.hotkey_vk));
+                }
+                Err(e) => {
+                    log::error!("ホットキーを保存できません: {e}");
+                    emit_error(app, &format!("ホットキーを保存できません: {e}"));
+                    emit_hotkey_captured(app, None);
+                }
+            }
+        }
+    }
+}
+
+/// 捕獲結果を UI へ返す (`None` は取り消し/失敗)。
+fn emit_hotkey_captured(app: &AppHandle, vk: Option<u32>) {
+    let payload = vk.map(|vk| serde_json::json!({
+        "vk": vk,
+        "label": hotkey::key_label(vk),
+    }));
+    if let Err(e) = app.emit(EVENT_HOTKEY_CAPTURED, payload) {
+        log::warn!("キー捕獲結果の送出に失敗: {e}");
     }
 }
 
@@ -1641,8 +1924,18 @@ fn finalize_on_exit(app: &AppHandle) {
     }
 }
 
-/// 状態を更新し、トレイ表示とフロントへ反映する。
+/// 状態を更新し、トレイ表示とフロントへ反映する (録音由来)。
 fn set_status(app: &AppHandle, status: Status, message: Option<String>) {
+    set_status_from(app, status, message, StatusOrigin::Recording);
+}
+
+/// 出どころを明示して状態を更新する。
+fn set_status_from(
+    app: &AppHandle,
+    status: Status,
+    message: Option<String>,
+    origin: StatusOrigin,
+) {
     let state = app.state::<AppState>();
     if let Ok(mut slot) = state.status.lock() {
         *slot = status;
@@ -1652,7 +1945,14 @@ fn set_status(app: &AppHandle, status: Status, message: Option<String>) {
             tray::update_status(item, status);
         }
     }
-    if let Err(e) = app.emit(EVENT_STATUS, StatusPayload { status, message }) {
+    if let Err(e) = app.emit(
+        EVENT_STATUS,
+        StatusPayload {
+            status,
+            message,
+            origin,
+        },
+    ) {
         log::warn!("状態イベントの送出に失敗: {e}");
     }
 }
@@ -1662,6 +1962,8 @@ fn emit_error(app: &AppHandle, message: &str) {
     if let Err(e) = app.emit(EVENT_ERROR, message) {
         log::warn!("エラーイベントの送出に失敗: {e}");
     }
+    // エラーで小窓が出しっぱなしにならないよう、必ず畳む対を用意する。
+    overlay::hide_after(app, OVERLAY_ERROR_LINGER);
 }
 
 #[cfg(test)]

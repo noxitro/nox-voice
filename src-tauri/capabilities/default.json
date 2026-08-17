@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
-  "windows": ["main"],
+  "description": "メインウィンドウとオーバーレイ小窓の権限。オーバーレイを入れないと、そちらの listen/invoke がすべて拒否されて透明な空ウィンドウになる",
+  "windows": ["main", "overlay"],
   "permissions": [
     "core:default",
     "opener:default",

@@ -1,0 +1,164 @@
+/* オーバーレイ小窓。
+   背景は透明で、中央のピルだけが浮いて見えるようにする。
+   クリックスルー設定 (Rust 側) と合わせて、作業の邪魔をしない。 */
+
+:root {
+  --bg: rgba(28, 28, 30, 0.92);
+  --fg: #f2f2f4;
+  --muted: #a0a0a8;
+  --recording: #e5484d;
+  --processing: #f5a524;
+  --ok: #4ade80;
+  --error: #ff8a80;
+
+  font-family: "Segoe UI", "Yu Gothic UI", system-ui, sans-serif;
+  font-size: 14px;
+  color: var(--fg);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  /* ウィンドウ自体は透明。ピルの外側は完全に抜ける。 */
+  background: transparent;
+  overflow: hidden;
+  /* 保険: Rust 側のクリックスルーが効かない環境でも操作を妨げない。 */
+  user-select: none;
+  pointer-events: none;
+}
+
+.pill {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 100%;
+  padding: 10px 18px;
+  border-radius: 999px;
+  background: var(--bg);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  animation: rise 140ms ease-out;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+/* 完了表示は自然に消える。 */
+.pill[data-state="done"] {
+  animation: rise 140ms ease-out, fade 400ms ease-in 900ms forwards;
+}
+
+@keyframes fade {
+  to {
+    opacity: 0;
+  }
+}
+
+.icon {
+  flex: none;
+  font-size: 15px;
+  line-height: 1;
+  color: var(--muted);
+}
+
+.pill[data-state="recording"] .icon {
+  color: var(--recording);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.pill[data-state="processing"] .icon {
+  color: var(--processing);
+  animation: spin 1s linear infinite;
+}
+
+.pill[data-state="done"] .icon {
+  color: var(--ok);
+}
+
+.pill[data-state="error"] .icon {
+  color: var(--error);
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pill,
+  .pill[data-state="recording"] .icon,
+  .pill[data-state="processing"] .icon {
+    animation: none;
+  }
+  /* 動きを止めても完了表示は消えないと困るので、透明化だけは残す。 */
+  .pill[data-state="done"] {
+    animation: fade 400ms ease-in 900ms forwards;
+  }
+}
+
+.body {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.label {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.elapsed {
+  flex: none;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.meter {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.14);
+  overflow: hidden;
+}
+
+.meter-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 2px;
+  background: var(--recording);
+  /* 20fps で来る値の間を補間して滑らかに見せる。 */
+  transition: width 60ms linear;
+}
+
+.detail {
+  color: var(--muted);
+  font-size: 0.78rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

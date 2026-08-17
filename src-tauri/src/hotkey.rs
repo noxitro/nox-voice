@@ -35,7 +35,115 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub const TAP_THRESHOLD: Duration = Duration::from_millis(300);
 
 /// 既定のホットキー: 右 Ctrl。
-const HOTKEY_VK: u32 = VK_RCONTROL.0 as u32;
+pub const DEFAULT_HOTKEY_VK: u32 = VK_RCONTROL.0 as u32;
+
+/// 現在のホットキー。設定から差し替えられる。
+///
+/// フックは 1 度しか設置しない (再設置は OS 全体の入力経路を触り直すことになる)。
+/// 比較する仮想キーだけを atomic で差し替えれば、変更は次のキー入力から効く。
+static HOTKEY_VK: AtomicU32 = AtomicU32::new(DEFAULT_HOTKEY_VK);
+
+/// キー捕獲モード。設定 UI の「キーを押して設定」で使う。
+///
+/// ON の間、フックは PTT の解釈をやめて**押されたキーをそのまま報告する**。
+/// 捕獲中に録音が始まってしまうのを防ぐため、モードは排他にする。
+static CAPTURE_MODE: AtomicBool = AtomicBool::new(false);
+
+/// 捕獲セッションの世代。タイムアウトが**古い**捕獲を打ち切らないようにする。
+static CAPTURE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// 「離されるまで無視する」キー (0 = なし)。
+///
+/// 捕獲を確定した瞬間、そのキーはまだ物理的に押されたままである。
+/// 捕獲モードを抜けた直後にオートリピートの keydown が通常経路へ流れると、
+/// **設定しただけで録音が始まり、短押し判定でトグルにラッチする**。
+/// 離すまで通常経路から締め出して、その事故を防ぐ。
+static SUPPRESS_UNTIL_RELEASE: AtomicU32 = AtomicU32::new(0);
+
+/// ホットキーを差し替える。フックの再設置は不要。
+pub fn set_hotkey_vk(vk: u32) {
+    HOTKEY_VK.store(vk, Ordering::SeqCst);
+    // 押しっぱなしの状態が残っていると、次の離しだけが届いて状態がねじれる。
+    KEY_IS_DOWN.store(false, Ordering::SeqCst);
+    log::info!("ホットキーを変更: {} (VK 0x{vk:02X})", key_label(vk));
+}
+
+/// キー捕獲モードを開始する。戻り値はこの捕獲セッションの世代。
+///
+/// タイムアウト側はこの世代を持ち回り、**自分が始めた捕獲だけ**を打ち切る。
+/// そうしないと、素早くやり直したときに新しい捕獲を古いタイマーが殺す。
+pub fn begin_capture() -> u64 {
+    // 捕獲へ入る時点の押下状態は持ち越さない。
+    KEY_IS_DOWN.store(false, Ordering::SeqCst);
+    CAPTURE_MODE.store(true, Ordering::SeqCst);
+    let generation = CAPTURE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    log::info!("キー捕獲モード: 開始 (世代 {generation})");
+    generation
+}
+
+/// 捕獲モードを終える。`generation` を渡すと、その世代のときだけ終了する。
+pub fn end_capture(generation: Option<u64>) -> bool {
+    if let Some(generation) = generation {
+        if CAPTURE_GENERATION.load(Ordering::SeqCst) != generation {
+            return false; // 既に別の捕獲が始まっている。
+        }
+    }
+    let was_capturing = CAPTURE_MODE.swap(false, Ordering::SeqCst);
+    if was_capturing {
+        log::info!("キー捕獲モード: 終了");
+    }
+    was_capturing
+}
+
+pub fn is_capturing() -> bool {
+    CAPTURE_MODE.load(Ordering::SeqCst)
+}
+
+/// 指定キーを「離されるまで通常経路で無視する」状態にする。
+pub fn suppress_until_release(vk: u32) {
+    SUPPRESS_UNTIL_RELEASE.store(vk, Ordering::SeqCst);
+    KEY_IS_DOWN.store(false, Ordering::SeqCst);
+}
+
+/// 仮想キーコードを人間が読める名前にする。
+///
+/// 設定 UI に「右 Ctrl」と出すためのもの。網羅ではなく、
+/// ホットキーに選ばれそうなキーを優先して並べてある。
+pub fn key_label(vk: u32) -> String {
+    let name = match vk {
+        0xA2 => "左 Ctrl",
+        0xA3 => "右 Ctrl",
+        0xA0 => "左 Shift",
+        0xA1 => "右 Shift",
+        0xA4 => "左 Alt",
+        0xA5 => "右 Alt",
+        0x5B => "左 Win",
+        0x5C => "右 Win",
+        0x14 => "CapsLock",
+        0x09 => "Tab",
+        0x1B => "Esc",
+        0x20 => "Space",
+        0x0D => "Enter",
+        0x08 => "BackSpace",
+        0x2D => "Insert",
+        0x2E => "Delete",
+        0x24 => "Home",
+        0x23 => "End",
+        0x21 => "PageUp",
+        0x22 => "PageDown",
+        0x91 => "ScrollLock",
+        0x13 => "Pause",
+        0x1D => "無変換",
+        0x1C => "変換",
+        0xF3 | 0xF4 => "半角/全角",
+        0x70..=0x7B => return format!("F{}", vk - 0x6F),
+        0x30..=0x39 => return format!("{}", vk - 0x30),
+        0x41..=0x5A => return char::from(vk as u8).to_string(),
+        0x60..=0x69 => return format!("テンキー {}", vk - 0x60),
+        _ => return format!("VK 0x{vk:02X}"),
+    };
+    name.to_string()
+}
 
 /// フックが観測した生のキーイベントの種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +152,8 @@ pub enum HotkeyEventKind {
     Press,
     /// ホットキーが離された。
     Release,
+    /// 捕獲モード中に押されたキー。PTT の解釈は行わない。
+    Captured(u32),
 }
 
 /// フックが観測したキーイベント。**発生時刻を必ず伴う**。
@@ -137,11 +247,30 @@ fn handle_key_event(message: u32, lparam: LPARAM) {
     // KBDLLHOOKSTRUCT を指す。コールバックの間だけ有効で、読み取りのみ行う。
     let info: KBDLLHOOKSTRUCT = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
 
-    if info.vkCode != HOTKEY_VK {
+    // 合成入力 (自分が SendInput する Ctrl+V 等) は無視する。
+    if info.flags.contains(LLKHF_INJECTED) {
         return;
     }
-    // 合成入力 (自分自身が将来 SendInput する Ctrl+V 等) は無視する。
-    if info.flags.contains(LLKHF_INJECTED) {
+
+    // 捕獲モード中は、どのキーでも「押された」ことだけを報告する。
+    // ここで PTT の判定に混ぜると、設定中に録音が始まってしまう。
+    if CAPTURE_MODE.load(Ordering::SeqCst) {
+        if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+            send(HotkeyEvent::new(HotkeyEventKind::Captured(info.vkCode)));
+        }
+        return;
+    }
+
+    // 捕獲直後の押しっぱなしを締め出す。離した時点で解除する。
+    let suppressed = SUPPRESS_UNTIL_RELEASE.load(Ordering::SeqCst);
+    if suppressed != 0 && info.vkCode == suppressed {
+        if matches!(message, WM_KEYUP | WM_SYSKEYUP) {
+            SUPPRESS_UNTIL_RELEASE.store(0, Ordering::SeqCst);
+        }
+        return;
+    }
+
+    if info.vkCode != HOTKEY_VK.load(Ordering::SeqCst) {
         return;
     }
 
@@ -164,8 +293,11 @@ fn handle_key_event(message: u32, lparam: LPARAM) {
 
     // 時刻はここで採る。デキュー時刻で判定すると、コントローラの詰まりが
     // そのまま「長押し」に化ける (HotkeyEvent の doc 参照)。
-    let event = HotkeyEvent::new(kind);
+    send(HotkeyEvent::new(kind));
+}
 
+/// フックからイベントを送る。確保もブロックもしない。
+fn send(event: HotkeyEvent) {
     if let Some(tx) = EVENT_TX.get() {
         // bounded の try_send は確保もブロックもしない。満杯なら捨てて数える。
         if tx.try_send(event).is_err() {
@@ -219,7 +351,10 @@ fn hook_thread_main(ready_tx: Sender<Result<(), String>>) {
     // SAFETY: 引数なし。
     HOOK_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
     let _ = ready_tx.try_send(Ok(()));
-    log::info!("キーボードフックを設置 (ホットキー: 右 Ctrl)");
+    log::info!(
+        "キーボードフックを設置 (ホットキー: {})",
+        key_label(HOTKEY_VK.load(Ordering::SeqCst))
+    );
 
     let mut msg = MSG::default();
     loop {
@@ -304,6 +439,8 @@ impl PttInterpreter {
         match event.kind {
             HotkeyEventKind::Press => self.on_press(event.at),
             HotkeyEventKind::Release => self.on_release(event.at),
+            // 捕獲は設定操作であって録音操作ではない。
+            HotkeyEventKind::Captured(_) => None,
         }
     }
 
@@ -360,6 +497,73 @@ impl PttInterpreter {
             Some(HotkeyAction::StopRecording)
         }
     }
+}
+
+/// キー捕獲の状態機械 (UI 側の「キーを押して設定」用)。
+///
+/// Win32 に触れないのでテストできる。捕獲したキーをそのまま採用せず、
+/// ここで**採用してよいか**を決める:
+///
+/// - Esc は「取り消し」。ホットキーには選べない (設定をやり直せなくなる)
+/// - 同じキーを選び直した場合も成功として扱う (UI が固まらない)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureOutcome {
+    /// このキーを採用する。
+    Accept(u32),
+    /// 取り消し。
+    Cancel,
+    /// ホットキーには使えないキー (押しっぱなしで実害が出る)。
+    Rejected(String),
+}
+
+/// ホットキーに選んでよいキーか。
+///
+/// # 許可リストにする理由
+///
+/// フックは**キーを抑制しない** (右 Ctrl を握り潰すと右 Ctrl+C 等が壊れるため)。
+/// つまり PTT 中、選んだキーは挿入先アプリにも流れ続ける。
+/// ここで `Enter` を選べてしまうと、長押しのあいだチャットに空行が
+/// 連投される。`A` を選べば文字が入り続ける。
+///
+/// そこで「押しっぱなしでも実害が出ない」キーだけを許す:
+/// 修飾キー・ファンクションキー・ロック系・IME 系。
+pub fn is_allowed_hotkey(vk: u32) -> bool {
+    matches!(vk,
+        // 修飾キー (左右個別)
+        0xA0..=0xA5
+        // Win キー、アプリケーションキー
+        | 0x5B | 0x5C | 0x5D
+        // CapsLock / ScrollLock / Pause
+        | 0x14 | 0x91 | 0x13
+        // F1..F24
+        | 0x70..=0x87
+        // IME 系: 変換 / 無変換 / かな / 半角全角
+        | 0x1C | 0x1D | 0x15 | 0xF3 | 0xF4
+    )
+}
+
+/// 捕獲を始めてよいか。
+///
+/// **録音中は始めない。** PTT を押している最中に捕獲へ入ると、離した瞬間の
+/// Release が捕獲側へ吸われ、`PttInterpreter` は押されたままだと思い込む。
+/// その結果、録音が止まらなくなる。
+pub fn can_begin_capture(is_recording: bool) -> Result<(), &'static str> {
+    if is_recording {
+        return Err("録音中はホットキーを変更できません。録音を止めてからやり直してください");
+    }
+    Ok(())
+}
+
+/// 捕獲したキーをどう扱うか決める。
+pub fn decide_capture(vk: u32) -> CaptureOutcome {
+    const VK_ESCAPE: u32 = 0x1B;
+    if vk == VK_ESCAPE {
+        return CaptureOutcome::Cancel;
+    }
+    if !is_allowed_hotkey(vk) {
+        return CaptureOutcome::Rejected(key_label(vk));
+    }
+    CaptureOutcome::Accept(vk)
 }
 
 #[cfg(test)]
@@ -500,6 +704,138 @@ mod tests {
             }),
             Some(HotkeyAction::StopRecording)
         );
+    }
+
+    // --- ホットキーの差し替えと捕獲 ---
+
+    #[test]
+    fn the_default_hotkey_is_right_ctrl() {
+        assert_eq!(DEFAULT_HOTKEY_VK, 0xA3);
+        assert_eq!(key_label(DEFAULT_HOTKEY_VK), "右 Ctrl");
+    }
+
+    #[test]
+    fn key_labels_cover_the_likely_choices() {
+        assert_eq!(key_label(0xA2), "左 Ctrl");
+        assert_eq!(key_label(0x14), "CapsLock");
+        assert_eq!(key_label(0x70), "F1");
+        assert_eq!(key_label(0x7B), "F12");
+        assert_eq!(key_label(0x41), "A");
+        assert_eq!(key_label(0x30), "0");
+        assert_eq!(key_label(0x60), "テンキー 0");
+        assert_eq!(key_label(0x1D), "無変換");
+        // 知らないキーでも読める形にする (空文字にしない)。
+        assert_eq!(key_label(0xFE), "VK 0xFE");
+    }
+
+    #[test]
+    fn escape_cancels_the_capture() {
+        // Esc を採用できると、設定をやり直す手段が無くなる。
+        assert_eq!(decide_capture(0x1B), CaptureOutcome::Cancel);
+    }
+
+    #[test]
+    fn modifier_and_function_keys_are_accepted() {
+        // 押しっぱなしでも挿入先に実害が出ないキー。
+        for vk in [0xA3, 0xA5, 0xA0, 0x5B, 0x5D, 0x14, 0x91, 0x13, 0x70, 0x87, 0x1D, 0x15] {
+            assert_eq!(decide_capture(vk), CaptureOutcome::Accept(vk), "VK 0x{vk:02X}");
+        }
+    }
+
+    #[test]
+    fn printable_keys_are_rejected() {
+        // フックはキーを抑制しないので、PTT 中ずっと挿入先へ流れる。
+        // Enter なら送信連発、A なら文字が入り続ける。
+        for vk in [0x41, 0x5A, 0x30, 0x39, 0x0D, 0x20, 0x09, 0x08, 0xBC, 0x60] {
+            assert!(
+                matches!(decide_capture(vk), CaptureOutcome::Rejected(_)),
+                "VK 0x{vk:02X} を許してしまった"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejection_names_the_key_for_the_user() {
+        match decide_capture(0x0D) {
+            CaptureOutcome::Rejected(label) => assert_eq!(label, "Enter"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn mouse_buttons_are_rejected() {
+        // マウスは LL キーボードフックに来ないが、設定ファイル経由で
+        // 入りうる値なので拒否側に倒す。
+        for vk in [0x01, 0x02, 0x04, 0x05, 0x06] {
+            assert!(!is_allowed_hotkey(vk), "VK 0x{vk:02X}");
+        }
+    }
+
+    #[test]
+    fn a_confirmed_capture_ignores_the_key_until_it_is_released() {
+        // M1 回帰: 捕獲確定時、そのキーはまだ押されたまま。
+        // オートリピートが通常経路へ流れると設定しただけで録音が始まる。
+        suppress_until_release(0x70);
+        assert_eq!(SUPPRESS_UNTIL_RELEASE.load(Ordering::SeqCst), 0x70);
+        assert!(!KEY_IS_DOWN.load(Ordering::SeqCst), "押下状態が残っている");
+
+        // 後片付け (プロセス共有の状態)。
+        SUPPRESS_UNTIL_RELEASE.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn capture_generations_prevent_a_stale_timeout_from_cancelling() {
+        // M2 の timeout が、やり直した新しい捕獲を殺さないこと。
+        let first = begin_capture();
+        let second = begin_capture();
+        assert_ne!(first, second);
+
+        // 古い世代での終了要求は無視される。
+        assert!(!end_capture(Some(first)));
+        assert!(is_capturing(), "古いタイマーが新しい捕獲を殺した");
+
+        // 現世代なら終了する。
+        assert!(end_capture(Some(second)));
+        assert!(!is_capturing());
+    }
+
+    #[test]
+    fn capture_is_refused_while_recording() {
+        // m6 回帰: PTT 保持中に捕獲へ入ると Release が吸われ、
+        // 解釈器が「押されたまま」と思い込んで録音が止まらなくなる。
+        assert!(can_begin_capture(false).is_ok());
+        let refused = can_begin_capture(true).expect_err("録音中は拒否する");
+        assert!(refused.contains("録音中"), "理由が伝わらない: {refused}");
+    }
+
+    #[test]
+    fn ending_a_capture_twice_is_harmless() {
+        let generation = begin_capture();
+        assert!(end_capture(Some(generation)));
+        assert!(!end_capture(Some(generation)), "二重終了で true を返した");
+        assert!(!end_capture(None));
+    }
+
+    #[test]
+    fn a_captured_event_is_not_a_recording_action() {
+        // 設定操作で録音が始まってはいけない。
+        let mut it = interp();
+        let event = HotkeyEvent {
+            kind: HotkeyEventKind::Captured(0x70),
+            at: Instant::now(),
+        };
+        assert_eq!(it.on_event(event), None);
+    }
+
+    #[test]
+    fn changing_the_hotkey_clears_the_held_state() {
+        // 押しっぱなしのまま差し替えると、次の離しだけが届いて状態がねじれる。
+        KEY_IS_DOWN.store(true, Ordering::SeqCst);
+        set_hotkey_vk(0x70);
+        assert!(!KEY_IS_DOWN.load(Ordering::SeqCst));
+        assert_eq!(HOTKEY_VK.load(Ordering::SeqCst), 0x70);
+        // 後片付け (プロセス共有の状態なので戻す)。
+        set_hotkey_vk(DEFAULT_HOTKEY_VK);
     }
 
     #[test]

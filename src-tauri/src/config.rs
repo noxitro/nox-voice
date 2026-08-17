@@ -150,6 +150,10 @@ pub struct Config {
     /// 結果を前景アプリへ自動で貼り付けるか。
     /// false なら画面に表示するだけ (手動コピー)。
     pub injection_enabled: bool,
+    /// PTT に使う仮想キーコード。既定は右 Ctrl。
+    pub hotkey_vk: u32,
+    /// 録音中・処理中の小窓を出すか。
+    pub overlay_enabled: bool,
     /// 画面のテキストを読んで文脈として使うか (deep context)。
     ///
     /// **既定は無効。** 有効にすると、挿入先の画面に表示されている文章が
@@ -184,6 +188,8 @@ impl Default for Config {
             dictionary: Vec::new(),
             formatting_enabled: true,
             injection_enabled: true,
+            hotkey_vk: crate::hotkey::DEFAULT_HOTKEY_VK,
+            overlay_enabled: true,
             // 画面テキストをクラウドへ送るので、明示的に有効化させる。
             deep_context: false,
             style_profiles: crate::style::default_profiles(),
@@ -288,6 +294,10 @@ pub struct ConfigView {
     pub injection_enabled: bool,
     pub deep_context: bool,
     pub style_profiles: Vec<StyleProfile>,
+    pub hotkey_vk: u32,
+    /// 表示用のキー名 (「右 Ctrl」など)。
+    pub hotkey_label: String,
+    pub overlay_enabled: bool,
     pub history_enabled: bool,
     pub history_retention_days: u32,
     pub restore_delay_ms: u64,
@@ -323,6 +333,9 @@ impl ConfigView {
             injection_enabled: c.injection_enabled,
             deep_context: c.deep_context,
             style_profiles: c.style_profiles.clone(),
+            hotkey_vk: c.hotkey_vk,
+            hotkey_label: crate::hotkey::key_label(c.hotkey_vk),
+            overlay_enabled: c.overlay_enabled,
             history_enabled: c.history_enabled,
             history_retention_days: c.history_retention_days,
             restore_delay_ms: c.restore_delay_ms,
@@ -355,6 +368,8 @@ pub struct ConfigPatch {
     pub injection_enabled: Option<bool>,
     pub deep_context: Option<bool>,
     pub style_profiles: Option<Vec<StyleProfile>>,
+    pub hotkey_vk: Option<u32>,
+    pub overlay_enabled: Option<bool>,
     pub history_enabled: Option<bool>,
     pub history_retention_days: Option<u32>,
     pub restore_delay_ms: Option<u64>,
@@ -385,6 +400,8 @@ impl fmt::Debug for ConfigPatch {
             .field("formatting_enabled", &self.formatting_enabled)
             .field("injection_enabled", &self.injection_enabled)
             .field("deep_context", &self.deep_context)
+            .field("hotkey_vk", &self.hotkey_vk)
+            .field("overlay_enabled", &self.overlay_enabled)
             .field(
                 "style_profiles",
                 &self.style_profiles.as_ref().map(Vec::len),
@@ -406,6 +423,16 @@ impl Config {
     /// パッチ適用時だけでなく**読み込み時にも**通すこと。設定ファイルは
     /// 手で編集されうるので、UI を通らない値が入ってくる。
     pub fn normalize(&mut self) {
+        // 捕獲 UI と同じ不変条件をここでも守る。設定ファイルは手で編集できるので、
+        // UI を通らない値 (文字キー・Enter・マウス・範囲外) が入りうる。
+        // 文字キーが入ると、押している間ずっと入力先へ流れ続ける。
+        if !crate::hotkey::is_allowed_hotkey(self.hotkey_vk) {
+            log::warn!(
+                "ホットキーに使えない値 (VK 0x{:02X}) が設定されていたので既定へ戻します",
+                self.hotkey_vk
+            );
+            self.hotkey_vk = crate::hotkey::DEFAULT_HOTKEY_VK;
+        }
         self.restore_delay_ms = self
             .restore_delay_ms
             .clamp(MIN_RESTORE_DELAY_MS, MAX_RESTORE_DELAY_MS);
@@ -442,6 +469,12 @@ impl Config {
         }
         if let Some(v) = patch.deep_context {
             self.deep_context = v;
+        }
+        if let Some(v) = patch.hotkey_vk {
+            self.hotkey_vk = v;
+        }
+        if let Some(v) = patch.overlay_enabled {
+            self.overlay_enabled = v;
         }
         if let Some(v) = patch.style_profiles {
             // 条件が空のプロファイルは全発話に効いてしまうので落とす。
@@ -736,6 +769,84 @@ mod tests {
             ..ConfigPatch::default()
         });
         assert_eq!(cfg.dictionary, vec!["nox-voice", "Tauri"]);
+    }
+
+    #[test]
+    fn the_default_hotkey_is_right_ctrl() {
+        let cfg = Config::default();
+        assert_eq!(cfg.hotkey_vk, crate::hotkey::DEFAULT_HOTKEY_VK);
+        assert_eq!(ConfigView::from(&cfg).hotkey_label, "右 Ctrl");
+    }
+
+    #[test]
+    fn the_overlay_is_on_by_default() {
+        assert!(Config::default().overlay_enabled);
+    }
+
+    #[test]
+    fn an_invalid_hotkey_falls_back_to_the_default() {
+        // 手編集で入りうる危険な値を、捕獲 UI と同じ基準で弾く。
+        let rejected = [
+            0u32,    // キー無し
+            0x100,   // 範囲外
+            9_999,   // 範囲外
+            0x1B,    // Esc (取り消し用なので選べない)
+            0x01,    // マウス左
+            0x02,    // マウス右
+            0x04,    // マウス中
+            0x05,    // マウス X1
+            0x06,    // マウス X2
+            0x41,    // A (押しっぱなしで文字が入り続ける)
+            0x0D,    // Enter (送信連発)
+            0x20,    // Space
+        ];
+        for broken in rejected {
+            let mut cfg = Config {
+                hotkey_vk: broken,
+                ..Config::default()
+            };
+            cfg.normalize();
+            assert_eq!(
+                cfg.hotkey_vk,
+                crate::hotkey::DEFAULT_HOTKEY_VK,
+                "VK 0x{broken:02X} を受け入れてしまった"
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_hotkey_survives_normalize() {
+        for ok in [0xA3u32, 0xA5, 0x14, 0x70, 0x87, 0x5B] {
+            let mut cfg = Config {
+                hotkey_vk: ok,
+                ..Config::default()
+            };
+            cfg.normalize();
+            assert_eq!(cfg.hotkey_vk, ok, "VK 0x{ok:02X} が消された");
+        }
+    }
+
+    #[test]
+    fn the_hotkey_round_trips_through_disk() {
+        let dir = std::env::temp_dir().join(format!("nox-config-hotkey-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = fs::remove_dir_all(&dir);
+
+        let store = ConfigStore::load(path.clone());
+        store
+            .update(ConfigPatch {
+                hotkey_vk: Some(0x70), // F1
+                overlay_enabled: Some(false),
+                ..ConfigPatch::default()
+            })
+            .expect("保存できる");
+
+        let reloaded = ConfigStore::load(path).snapshot();
+        assert_eq!(reloaded.hotkey_vk, 0x70);
+        assert!(!reloaded.overlay_enabled);
+        assert_eq!(ConfigView::from(&reloaded).hotkey_label, "F1");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

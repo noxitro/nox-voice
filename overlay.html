@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/overlay.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>nox-voice overlay</title>
+    <script type="module" src="/src/overlay.ts" defer></script>
+  </head>
+
+  <body>
+    <div class="pill" id="pill" data-state="idle" hidden>
+      <span class="icon" id="icon" aria-hidden="true">●</span>
+
+      <div class="body">
+        <div class="line">
+          <span class="label" id="label">録音中</span>
+          <span class="elapsed" id="elapsed"></span>
+        </div>
+
+        <div class="meter" id="meter" hidden>
+          <div class="meter-fill" id="meter-fill"></div>
+        </div>
+
+        <div class="detail" id="detail" hidden></div>
+      </div>
+    </div>
+  </body>
+</html>

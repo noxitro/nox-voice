@@ -1,3 +1,5 @@
+import { resolve } from "node:path";
+
 import { defineConfig } from "vite";
 
 // @ts-expect-error process is a nodejs global
@@ -5,6 +7,17 @@ const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
+  build: {
+    rollupOptions: {
+      input: {
+        // メインウィンドウとオーバーレイ小窓の 2 つを出力する。
+        // 片方だけにすると overlay.html が dist に入らず、
+        // オーバーレイが真っ白なウィンドウになる。
+        main: resolve(import.meta.dirname, "index.html"),
+        overlay: resolve(import.meta.dirname, "overlay.html"),
+      },
+    },
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

@@ -2,11 +2,12 @@
 
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder, PredefinedMenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, Wry};
+use tauri::{AppHandle, Emitter, Manager, Wry};
 
 use crate::session::Status;
 
 const MENU_ID_SETTINGS: &str = "settings";
+const MENU_ID_HISTORY: &str = "history";
 const MENU_ID_QUIT: &str = "quit";
 
 /// トレイアイコンとメニューを構築し、状態表示用のメニュー項目を返す。
@@ -17,11 +18,14 @@ pub fn build(app: &AppHandle) -> tauri::Result<MenuItem<Wry>> {
         .enabled(false)
         .build(app)?;
     let settings_item = MenuItemBuilder::with_id(MENU_ID_SETTINGS, "設定を開く").build(app)?;
+    // 通知はクリックしても遷移できないので、履歴への入口をトレイにも置く。
+    let history_item = MenuItemBuilder::with_id(MENU_ID_HISTORY, "履歴を開く").build(app)?;
     let quit_item = MenuItemBuilder::with_id(MENU_ID_QUIT, "終了").build(app)?;
 
     let menu = MenuBuilder::new(app)
         .item(&status_item)
         .item(&PredefinedMenuItem::separator(app)?)
+        .item(&history_item)
         .item(&settings_item)
         .item(&PredefinedMenuItem::separator(app)?)
         .item(&quit_item)
@@ -40,6 +44,12 @@ pub fn build(app: &AppHandle) -> tauri::Result<MenuItem<Wry>> {
         .menu(&menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
             MENU_ID_SETTINGS => show_main_window(app),
+            MENU_ID_HISTORY => {
+                show_main_window(app);
+                if let Err(e) = app.emit(crate::EVENT_SHOW_HISTORY, ()) {
+                    log::warn!("履歴表示イベントの送出に失敗: {e}");
+                }
+            }
             MENU_ID_QUIT => {
                 log::info!("トレイメニューから終了");
                 app.exit(0);

@@ -7,6 +7,7 @@ type Status = "idle" | "recording" | "processing";
 interface StatusPayload {
   status: Status;
   message: string | null;
+  origin: "recording" | "background";
 }
 
 /** Rust 側 `session::SessionSummary` と対応。 */
@@ -145,6 +146,9 @@ interface ConfigView {
   injection_enabled: boolean;
   deep_context: boolean;
   style_profiles: StyleProfile[];
+  hotkey_vk: number;
+  hotkey_label: string;
+  overlay_enabled: boolean;
   history_enabled: boolean;
   history_retention_days: number;
   restore_delay_ms: number;
@@ -349,6 +353,13 @@ function renderConfig(view: ConfigView) {
   if (dictionary) dictionary.value = view.dictionary.join("\n");
   const deepContext = el<HTMLInputElement>("deep-context");
   if (deepContext) deepContext.checked = view.deep_context;
+  const overlayEnabled = el<HTMLInputElement>("overlay-enabled");
+  if (overlayEnabled) overlayEnabled.checked = view.overlay_enabled;
+  const hotkeyLabel = el("hotkey-label");
+  if (hotkeyLabel) {
+    hotkeyLabel.textContent = view.hotkey_label;
+    delete hotkeyLabel.dataset.capturing;
+  }
   const styles = el<HTMLTextAreaElement>("style-profiles");
   if (styles) styles.value = styleProfilesToText(view.style_profiles);
   const groqState = el("groq-state");
@@ -370,6 +381,7 @@ async function saveSettings(event: Event) {
   const retention = el<HTMLInputElement>("history-retention");
   const dictionary = el<HTMLTextAreaElement>("dictionary");
   const deepContext = el<HTMLInputElement>("deep-context");
+  const overlayEnabled = el<HTMLInputElement>("overlay-enabled");
   const styles = el<HTMLTextAreaElement>("style-profiles");
 
   // 入力欄が空 = 「変更しない」。誤って既存キーを消さないため未指定で送る。
@@ -379,6 +391,7 @@ async function saveSettings(event: Event) {
     injection_enabled: injection?.checked ?? true,
     history_enabled: historyEnabled?.checked ?? true,
     deep_context: deepContext?.checked ?? false,
+    overlay_enabled: overlayEnabled?.checked ?? true,
     // 空行は Rust 側で落とされる。
     dictionary: (dictionary?.value ?? "").split(/\r?\n/),
     style_profiles: parseStyleProfiles(styles?.value ?? ""),
@@ -634,6 +647,69 @@ async function loadHistory(append = false) {
   }
 }
 
+/** ホットキー捕獲の結果。`null` は取り消し。 */
+interface HotkeyCaptured {
+  vk: number;
+  label: string;
+}
+
+/** 捕獲モードに入っているか (UI 側の見た目用)。 */
+let capturingHotkey = false;
+/** 残り秒のカウントダウン。 */
+let captureCountdown: number | undefined;
+
+function setHotkeyCapturing(active: boolean, seconds = 0) {
+  capturingHotkey = active;
+  window.clearInterval(captureCountdown);
+
+  const label = el("hotkey-label");
+  const button = el<HTMLButtonElement>("hotkey-capture");
+  if (label) {
+    if (active) {
+      label.dataset.capturing = "true";
+    } else {
+      delete label.dataset.capturing;
+    }
+  }
+  if (button) button.textContent = active ? "キャンセル" : "キーを押して設定";
+
+  if (!active) return;
+
+  // 残り時間を出す。捕獲はグローバルなので、入りっぱなしだと
+  // 他アプリで打ったキーを拾ってしまう。時間が見えている方が安全。
+  let remaining = seconds;
+  const tick = () => {
+    if (label) {
+      label.textContent =
+        remaining > 0 ? `キーを押してください… (${remaining})` : "キーを押してください…";
+    }
+    remaining -= 1;
+    if (remaining < 0) window.clearInterval(captureCountdown);
+  };
+  tick();
+  captureCountdown = window.setInterval(tick, 1000);
+}
+
+async function cancelHotkeyCapture() {
+  setHotkeyCapturing(false);
+  await invoke("cancel_hotkey_capture");
+  renderConfig(await invoke<ConfigView>("get_config"));
+}
+
+async function toggleHotkeyCapture() {
+  if (capturingHotkey) {
+    await cancelHotkeyCapture();
+    return;
+  }
+  try {
+    const seconds = await invoke<number>("start_hotkey_capture");
+    setHotkeyCapturing(true, seconds);
+  } catch (e) {
+    setHotkeyCapturing(false);
+    showError(`${e}`);
+  }
+}
+
 window.addEventListener("DOMContentLoaded", async () => {
   document.querySelectorAll<HTMLButtonElement>("button.copy").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -642,6 +718,16 @@ window.addEventListener("DOMContentLoaded", async () => {
     });
   });
   el("settings-form")?.addEventListener("submit", (e) => void saveSettings(e));
+  el("hotkey-capture")?.addEventListener("click", () => void toggleHotkeyCapture());
+
+  // ウィンドウから離れたら捕獲をやめる。設定画面を離れたまま
+  // 捕獲が続くと、他アプリで打ったキーがホットキーとして保存される。
+  window.addEventListener("blur", () => {
+    if (capturingHotkey) void cancelHotkeyCapture();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && capturingHotkey) void cancelHotkeyCapture();
+  });
   el("history-more")?.addEventListener("click", () => void loadHistory(true));
   el("history-clear")?.addEventListener("click", () => {
     if (!window.confirm("履歴をすべて削除しますか? この操作は取り消せません。")) {
@@ -664,6 +750,25 @@ window.addEventListener("DOMContentLoaded", async () => {
   );
   await listen<string>("nox://error", (event) => showError(event.payload));
   await listen("nox://history", () => void loadHistory());
+
+  await listen<HotkeyCaptured | null>("nox://hotkey-captured", (event) => {
+    setHotkeyCapturing(false);
+    const label = el("hotkey-label");
+    if (event.payload && label) {
+      label.textContent = event.payload.label;
+    } else {
+      // 取り消し・失敗。現在値へ戻す。
+      void invoke<ConfigView>("get_config").then(renderConfig);
+    }
+  });
+
+  // トレイ・通知からの「履歴を開く」。設定を畳んで履歴まで運ぶ。
+  await listen("nox://show-history", () => {
+    const settings = document.querySelector<HTMLDetailsElement>("details.settings");
+    if (settings) settings.open = false;
+    el("history-list")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    void loadHistory();
+  });
 
   // 初期表示は Rust 側の現在値に合わせる (イベントを取り逃していても正しく出る)。
   try {
