@@ -335,6 +335,105 @@ mod tests {
         assert_eq!(formatter.calls(), 0);
     }
 
+    // --- 実 API を使う通しテスト ---
+    //
+    // どちらも環境変数のキーだけを見る。**ユーザーの設定ファイルには触れない**
+    // (読みもしないので、設定を書き換えたり漏らしたりしない)。
+    //
+    //   cargo test -- --ignored --nocapture live_pipeline
+
+    #[cfg(test)]
+    fn live_clients(
+        gemini_key: &str,
+    ) -> Option<(crate::stt::GroqStt, crate::format::GeminiFormatter)> {
+        let groq_key = std::env::var("GROQ_API_KEY").ok()?;
+        let http = crate::stt::build_http_client().expect("クライアント");
+        let cfg = crate::config::Config::default();
+        let stt = crate::stt::GroqStt::new(
+            http.clone(),
+            &cfg.groq_endpoint,
+            &cfg.stt_model,
+            crate::config::Secret::new(groq_key),
+        );
+        let formatter = crate::format::GeminiFormatter::new(
+            http,
+            cfg.gemini_url(),
+            crate::config::Secret::new(gemini_key),
+        );
+        Some((stt, formatter))
+    }
+
+    /// F2: 実際の日本語音声を STT → 整形まで通す。
+    ///
+    /// フィラー (「えーと」) が落ちて内容が残ることまで見る。
+    /// 各段の単体テストが通っていても、**繋いだときに壊れていない**保証は
+    /// これでしか取れない。
+    #[test]
+    #[ignore = "実 API を呼ぶ。GROQ_API_KEY と GEMINI_API_KEY が必要"]
+    fn live_pipeline_transcribes_and_formats_japanese() {
+        let Ok(gemini_key) = std::env::var("GEMINI_API_KEY") else {
+            println!("GEMINI_API_KEY が無いのでスキップします");
+            return;
+        };
+        let Some((stt, formatter)) = live_clients(&gemini_key) else {
+            println!("GROQ_API_KEY が無いのでスキップします");
+            return;
+        };
+        let wav = crate::stt::japanese_sample_wav();
+
+        let result = run(&wav, "ja", &[], &stt, Some(&formatter)).expect("通しで成功する");
+        println!("生転写: {:?}", result.raw_text);
+        println!("整形後: {:?}", result.text);
+        println!("結末  : {:?}", result.outcome);
+        println!("STT {} ms / 整形 {} ms", result.stt_ms, result.format_ms);
+
+        assert_eq!(result.outcome, FormatOutcome::Formatted, "整形されていない");
+        assert!(result.text.contains("会議"), "内容が失われた: {:?}", result.text);
+        assert!(result.text.contains("資料"), "内容が失われた: {:?}", result.text);
+        assert!(
+            !result.text.contains("えーと"),
+            "フィラーが残っている: {:?}",
+            result.text
+        );
+        // R5: 生転写は整形後で上書きされず残る。
+        assert!(!result.raw_text.is_empty());
+    }
+
+    /// F3: R2 劣化モードを実 API で確認する。
+    ///
+    /// STT は本物のキーで成功させ、**整形だけ無効なキーで失敗させる**。
+    /// 生転写が採用され、理由つきの `RawFallback` になること。
+    #[test]
+    #[ignore = "実 API を呼ぶ。GROQ_API_KEY が必要"]
+    fn live_pipeline_degrades_when_formatting_is_rejected() {
+        // わざと通らないキーを渡す。ユーザーの設定は読みも書きもしない。
+        let Some((stt, formatter)) = live_clients("invalid-key-for-degraded-mode-test") else {
+            println!("GROQ_API_KEY が無いのでスキップします");
+            return;
+        };
+        let wav = crate::stt::japanese_sample_wav();
+
+        let result = run(&wav, "ja", &[], &stt, Some(&formatter)).expect("STT は成功する");
+        println!("生転写: {:?}", result.raw_text);
+        println!("採用  : {:?}", result.text);
+        println!("結末  : {:?}", result.outcome);
+
+        assert!(
+            result.outcome.is_degraded(),
+            "整形が失敗したのに劣化モードになっていない: {:?}",
+            result.outcome
+        );
+        assert_eq!(result.text, result.raw_text, "生転写が採用されていない");
+        assert!(!result.text.is_empty(), "採用テキストが空");
+        match result.outcome {
+            FormatOutcome::RawFallback { reason } => {
+                assert!(!reason.is_empty(), "劣化の理由が空");
+                println!("劣化理由: {reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn outcome_serializes_with_a_discriminant_for_the_ui() {
         let json = serde_json::to_string(&FormatOutcome::Formatted).expect("シリアライズ");

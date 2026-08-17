@@ -1538,9 +1538,19 @@ mod tests {
     //
     //   cargo test -- --ignored --test-threads=1 --nocapture e2e_paste
     //
-    // 安全性: inject() 自身が送出直前に前景 HWND を照合するので、
-    // メモ帳を前面にできなかった場合は貼付されずに中止される
-    // (ユーザーの他のウィンドウへ文字が飛ぶことはない)。
+    // # ユーザーの環境を壊さないための約束
+    //
+    // このテストは他人のプロセスを操作する。壊し方を具体的に潰しておく:
+    //
+    // - **既にメモ帳が動いていたら何もせずスキップする。** Windows 11 の
+    //   メモ帳は 1 プロセスで複数ウィンドウを持つため、プロセス単位の操作は
+    //   ユーザーの未保存タブを巻き込む。動いていなければ、これから起こす
+    //   メモ帳は自分のものだと確定できる。
+    // - **操作対象は自分が起動した PID のウィンドウだけ**に限定する。
+    // - **後片付けは対象 HWND への `WM_CLOSE`。** プロセスの強制終了は
+    //   自分が spawn した子ハンドルに対してのみ、最後の手段として行う。
+    // - 貼付は inject() 自身が送出直前に前景 HWND を照合するので、
+    //   メモ帳を前面にできなければ何も貼られずに中止される。
 
     /// メモ帳へ実際に貼り付き、受け手側から読み出せることを確認する。
     #[test]
@@ -1548,28 +1558,59 @@ mod tests {
     fn e2e_paste_reaches_notepad() {
         use std::time::Instant;
 
+        // ユーザーのメモ帳が開いていたら触らない。
+        // (Win11 のメモ帳は単一プロセス複数ウィンドウなので、
+        //  自分のウィンドウだけを閉じたつもりでも巻き添えが出やすい)
+        let existing = notepad_windows();
+        if !existing.is_empty() {
+            println!(
+                "メモ帳が既に {} ウィンドウ開いています。ユーザーの作業を壊さないためスキップします。\n\
+                 メモ帳をすべて閉じてから実行してください",
+                existing.len()
+            );
+            return;
+        }
+
         let user_original = {
             let _guard = ClipboardGuard::open().expect("開ける");
             // SAFETY: クリップボードは開いている。
             unsafe { read_unicode_text() }
         };
+        // クリップボードは何があっても戻す。
+        let restore_user_clipboard = || {
+            if let Some(text) = &user_original {
+                let _ = restore_text(text);
+            }
+        };
 
         let mut child = std::process::Command::new("notepad.exe")
             .spawn()
             .expect("メモ帳を起動できる");
+        let child_pid = child.id();
 
-        // メモ帳のトップレベルウィンドウを探す。
+        // 自分が起こしたメモ帳のウィンドウを探す。
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut target = 0isize;
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(200));
-            if let Some(hwnd) = find_window_by_class("Notepad") {
-                target = hwnd;
+            let windows = notepad_windows();
+            // まず PID 一致で探す。
+            if let Some((hwnd, _)) = windows.iter().find(|(_, pid)| *pid == child_pid) {
+                target = *hwnd;
+                break;
+            }
+            // 起動が別プロセスへ引き継がれることがある (アプリ実行エイリアス)。
+            // 開始前にメモ帳が 1 つも無かったことは確認済みなので、
+            // ここに在るメモ帳は自分が起こしたものと断定してよい。
+            if let Some((hwnd, pid)) = windows.first() {
+                println!("メモ帳が別プロセスへ引き継がれました (pid {pid})");
+                target = *hwnd;
                 break;
             }
         }
         if target == 0 {
             reap(&mut child);
+            restore_user_clipboard();
             println!("メモ帳のウィンドウが見つかりませんでした。スキップします");
             return;
         }
@@ -1578,14 +1619,11 @@ mod tests {
         // フォアグラウンドロックで拒否されることがある (wiki の知見どおり)。
         // 取れなければ環境要因なので、失敗ではなくスキップにする。
         if !take_foreground(target) {
-            kill_window_owner(target);
-            reap(&mut child);
-            if let Some(text) = user_original {
-                let _ = restore_text(&text);
-            }
+            close_test_notepad(target, &mut child);
+            restore_user_clipboard();
             println!(
                 "メモ帳を前景にできませんでした (フォアグラウンドロック)。スキップします。\n\
-                 対話セッションでメモ帳を手前にしてから実行すると検証できます"
+                 対話セッションで実行すると検証できます"
             );
             return;
         }
@@ -1600,11 +1638,8 @@ mod tests {
         let pasted = read_notepad_text(target);
 
         // 後片付けは検証より先に済ませる (assert で落ちてもメモ帳を残さない)。
-        kill_window_owner(target);
-        reap(&mut child);
-        if let Some(text) = user_original {
-            let _ = restore_text(&text);
-        }
+        close_test_notepad(target, &mut child);
+        restore_user_clipboard();
 
         assert_eq!(report.outcome, InjectOutcome::Injected, "送出できていない");
         let pasted = pasted.expect("メモ帳の本文を読めない");
@@ -1616,15 +1651,109 @@ mod tests {
         println!("クリップボードの状態: {:?}", report.clipboard_state);
     }
 
-    /// クラス名でトップレベルウィンドウを探す。
+    /// 動作中のメモ帳のトップレベルウィンドウを (HWND, PID) で列挙する。
     #[cfg(test)]
-    fn find_window_by_class(class: &str) -> Option<isize> {
+    fn notepad_windows() -> Vec<(isize, u32)> {
         use windows::Win32::UI::WindowsAndMessaging::FindWindowExW;
-        let wide: Vec<u16> = class.encode_utf16().chain(std::iter::once(0)).collect();
-        // SAFETY: wide は NUL 終端の UTF-16。親・兄弟指定なしで全体を探す。
-        let hwnd =
-            unsafe { FindWindowExW(None, None, PCWSTR(wide.as_ptr()), PCWSTR::null()) }.ok()?;
-        (!hwnd.0.is_null()).then_some(hwnd.0 as isize)
+
+        let class: Vec<u16> = "Notepad".encode_utf16().chain(std::iter::once(0)).collect();
+        let mut found = Vec::new();
+        let mut prev: Option<HWND> = None;
+        loop {
+            // SAFETY: class は NUL 終端。prev は直前に得た有効な HWND。
+            let hwnd = unsafe {
+                FindWindowExW(None, prev, PCWSTR(class.as_ptr()), PCWSTR::null())
+            };
+            let Ok(hwnd) = hwnd else { break };
+            if hwnd.0.is_null() {
+                break;
+            }
+            found.push((hwnd.0 as isize, window_process_id(hwnd.0 as isize)));
+            prev = Some(hwnd);
+            if found.len() > 64 {
+                break; // 想定外の数。無限ループを避ける。
+            }
+        }
+        found
+    }
+
+    /// テストで起こしたメモ帳を閉じる。
+    ///
+    /// `taskkill` でオーナー PID を落とすのは**やってはいけない**。
+    /// Windows 11 のメモ帳は 1 プロセスで複数ウィンドウを持つので、
+    /// ユーザーの未保存タブごと巻き添えにする。
+    /// 対象ウィンドウへ `WM_CLOSE` を送り、駄目なときだけ
+    /// **自分が spawn した子プロセス**を回収する。
+    #[cfg(test)]
+    fn close_test_notepad(hwnd: isize, child: &mut std::process::Child) {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            IsWindow, PostMessageW, SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_CLOSE, WM_SETTEXT,
+        };
+
+        // 本文を空にしてから閉じる。変更が残っていると保存確認が出て、
+        // ウィンドウが閉じずに残ってしまう。
+        if let Some(edit) = notepad_edit_control(hwnd) {
+            let empty: Vec<u16> = std::iter::once(0).collect();
+            // SAFETY: edit は有効な HWND、empty は NUL 終端の UTF-16。
+            unsafe {
+                SendMessageTimeoutW(
+                    edit,
+                    WM_SETTEXT,
+                    WPARAM(0),
+                    LPARAM(empty.as_ptr() as isize),
+                    SMTO_ABORTIFHUNG,
+                    1_000,
+                    None,
+                )
+            };
+        }
+
+        // SAFETY: hwnd は有効。PostMessage は相手スレッドを待たない。
+        let _ = unsafe { PostMessageW(Some(HWND(hwnd as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+
+        // 閉じるのを少し待つ。
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(100));
+            // SAFETY: 破棄済みの HWND を渡しても FALSE が返るだけ。
+            if !unsafe { IsWindow(Some(HWND(hwnd as *mut _))) }.as_bool() {
+                break;
+            }
+        }
+
+        // SAFETY: 破棄済みなら FALSE。
+        if unsafe { IsWindow(Some(HWND(hwnd as *mut _))) }.as_bool() {
+            println!(
+                "メモ帳のウィンドウが閉じませんでした (保存確認が出ている可能性)。\n\
+                 自分が起動したプロセスだけを回収します"
+            );
+        }
+        // 自分が spawn した子だけを終了させる。他プロセスには触らない。
+        reap(child);
+    }
+
+    /// メモ帳の編集コントロールを探す。
+    #[cfg(test)]
+    fn notepad_edit_control(parent: isize) -> Option<HWND> {
+        use windows::Win32::UI::WindowsAndMessaging::FindWindowExW;
+        for class in ["Edit", "RichEditD2DPT", "RICHEDIT50W", "RichEdit20W"] {
+            let wide: Vec<u16> = class.encode_utf16().chain(std::iter::once(0)).collect();
+            // SAFETY: parent は有効な HWND、wide は NUL 終端。
+            let child = unsafe {
+                FindWindowExW(
+                    Some(HWND(parent as *mut _)),
+                    None,
+                    PCWSTR(wide.as_ptr()),
+                    PCWSTR::null(),
+                )
+            };
+            if let Ok(child) = child {
+                if !child.0.is_null() {
+                    return Some(child);
+                }
+            }
+        }
+        None
     }
 
     /// 対象ウィンドウを前景にする。取れたら `true`。
@@ -1679,26 +1808,13 @@ mod tests {
     fn read_notepad_text(parent: isize) -> Option<String> {
         use windows::Win32::Foundation::{LPARAM, WPARAM};
         use windows::Win32::UI::WindowsAndMessaging::{
-            FindWindowExW, SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_GETTEXT, WM_GETTEXTLENGTH,
+            SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_GETTEXT, WM_GETTEXTLENGTH,
         };
 
         const TIMEOUT_MS: u32 = 2_000;
 
-        for class in ["Edit", "RichEditD2DPT", "RICHEDIT50W", "RichEdit20W"] {
-            let wide: Vec<u16> = class.encode_utf16().chain(std::iter::once(0)).collect();
-            // SAFETY: parent は有効な HWND、wide は NUL 終端。
-            let child = unsafe {
-                FindWindowExW(
-                    Some(HWND(parent as *mut _)),
-                    None,
-                    PCWSTR(wide.as_ptr()),
-                    PCWSTR::null(),
-                )
-            };
-            let Ok(child) = child else { continue };
-            if child.0.is_null() {
-                continue;
-            }
+        {
+            let child = notepad_edit_control(parent)?;
 
             // SAFETY: child は有効な HWND。ハングしたら諦める。
             let len = unsafe {
@@ -1714,7 +1830,7 @@ mod tests {
             }
             .0;
             if len <= 0 {
-                continue;
+                return None;
             }
 
             let mut buf = vec![0u16; len as usize + 1];
@@ -1745,28 +1861,6 @@ mod tests {
     fn reap(child: &mut std::process::Child) {
         let _ = child.kill();
         let _ = child.wait();
-    }
-
-    /// HWND を所有するプロセスを強制終了する。
-    ///
-    /// `Command::spawn` した子を kill するだけでは足りない。Windows 11 の
-    /// メモ帳は既存インスタンスへ引き渡して起動元がすぐ終わることがあり、
-    /// 実際のウィンドウは別プロセスが持っている。
-    #[cfg(test)]
-    fn kill_window_owner(hwnd: isize) {
-        use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
-        if hwnd == 0 {
-            return;
-        }
-        let mut pid = 0u32;
-        // SAFETY: hwnd は有効、出力先はスタック上の u32。
-        unsafe { GetWindowThreadProcessId(HWND(hwnd as *mut _), Some(&mut pid)) };
-        if pid == 0 {
-            return;
-        }
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/PID", &pid.to_string()])
-            .output();
     }
 
     /// 空でないテキストなら、フォーカス不一致で中止しても

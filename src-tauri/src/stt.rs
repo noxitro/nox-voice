@@ -278,6 +278,20 @@ pub fn build_http_client() -> Result<reqwest::blocking::Client, String> {
         .map_err(|e| format!("HTTP クライアントを構築できません: {e}"))
 }
 
+/// テスト用の日本語音声を読む (`tests/assets/japanese-sample.wav`)。
+///
+/// Windows の SAPI 音声で合成した 16kHz mono。中身が決まっているので、
+/// トーン信号と違って「ハルシネーションでも合格」にならない。
+#[cfg(test)]
+pub fn japanese_sample_wav() -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("assets")
+        .join("japanese-sample.wav");
+    std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("音声アセットを読めません ({}): {e}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,7 +516,12 @@ mod tests {
         assert!(!rendered.contains(key), "エラー文にキーが漏れている: {rendered}");
     }
 
-    /// 実 API 疎通。`GROQ_API_KEY` があるときだけ意味がある。
+    /// 実 API の**疎通だけ**を見る。440Hz のトーンなので中身は問わない。
+    ///
+    /// これが通っても「日本語がちゃんと転写できる」証明にはならない
+    /// (ハルシネーションでも合格してしまう)。内容の確認は
+    /// [`live_groq_transcribes_real_japanese`] の方で行う。
+    ///
     /// 実行: `cargo test -- --ignored --nocapture live_groq_transcription`
     #[test]
     #[ignore = "実 API を呼ぶ。GROQ_API_KEY が必要"]
@@ -524,6 +543,58 @@ mod tests {
             Err(SttError::Empty) => println!("空の転写 (無音のため想定内)"),
             Err(e) => panic!("実 API 疎通に失敗: {e}"),
         }
+    }
+
+    /// 実際の日本語音声が**内容として**転写できることを確認する。
+    ///
+    /// 音声は `tests/assets/japanese-sample.wav`
+    /// (Windows の SAPI 音声「Haruka」で合成した 16kHz mono、
+    /// 内容は「えーと、明日の会議の資料を準備してください。」)。
+    /// 合成音声なので発話の癖は本物と違うが、**中身が決まっている**ことが
+    /// 要点 — トーン信号ではハルシネーションでも合格してしまう。
+    ///
+    /// 実行: `cargo test -- --ignored --nocapture live_groq_transcribes_real_japanese`
+    #[test]
+    #[ignore = "実 API を呼ぶ。GROQ_API_KEY が必要"]
+    fn live_groq_transcribes_real_japanese() {
+        let Ok(key) = std::env::var("GROQ_API_KEY") else {
+            println!("GROQ_API_KEY が無いのでスキップします");
+            return;
+        };
+        let wav = super::japanese_sample_wav();
+        let stt = GroqStt::new(
+            build_http_client().expect("クライアント"),
+            crate::config::DEFAULT_GROQ_ENDPOINT,
+            crate::config::DEFAULT_STT_MODEL,
+            Secret::new(key),
+        );
+
+        let transcript = stt.transcribe(&wav, "ja").expect("日本語音声を転写できる");
+        println!("生転写: {:?}", transcript.text);
+
+        // 表記ゆれ (「明日」/「あした」など) はモデル任せなので、
+        // 落ちにくく、かつハルシネーションは弾ける語で確認する。
+        for expected in ["会議", "資料"] {
+            assert!(
+                transcript.text.contains(expected),
+                "転写に「{expected}」が含まれない (ハルシネーションの可能性): {:?}",
+                transcript.text
+            );
+        }
+    }
+
+    #[test]
+    fn japanese_sample_asset_is_a_16k_mono_wav() {
+        // アセットが壊れた/差し替えられたことに live テストより先に気づく。
+        // (ネットワーク不要なので通常のテストとして常時走らせる)
+        let wav = super::japanese_sample_wav();
+        assert_eq!(&wav[0..4], b"RIFF");
+        let reader = hound::WavReader::new(std::io::Cursor::new(wav)).expect("WAV として読める");
+        assert_eq!(reader.spec().sample_rate, 16_000);
+        assert_eq!(reader.spec().channels, 1);
+        assert_eq!(reader.spec().bits_per_sample, 16);
+        // 数秒あること (無音ファイルに差し替わっていないか)。
+        assert!(reader.duration() > 16_000, "音声が短すぎる");
     }
 
     #[cfg(test)]
