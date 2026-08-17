@@ -1,0 +1,13 @@
+# ソースは常に LF で保存する。
+# Windows の一部ツール (Python の text-mode 書き込み等) が CRLF へ
+# 変換してしまい、実質 1 行の変更が全行書き換えの差分に化けるのを防ぐ。
+*.rs      text eol=lf
+*.ts      text eol=lf
+*.html    text eol=lf
+*.css     text eol=lf
+*.json    text eol=lf
+*.toml    text eol=lf
+*.md      text eol=lf
+
+# 音声アセットはバイナリ。
+*.wav     binary
