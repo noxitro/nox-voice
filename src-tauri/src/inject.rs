@@ -1615,6 +1615,32 @@ mod tests {
             return;
         }
 
+        // 起動した文書が空であることを確認する。
+        //
+        // # 「プロセスが無い」≠「空の文書」 (実測でユーザーのメモを消しかけた)
+        //
+        // Win11 のメモ帳はセッション復元により、新プロセスでも**前回の
+        // 未保存タブを内容ごと復元する**。プロセス不在の確認だけでは
+        // 「これから開くウィンドウは無地」を保証できず、復元されたユーザーの
+        // 文書へ貼り付けた上、後片付けの WM_SETTEXT("") が内容を消してしまう
+        // (実測 2026-08-17。テスト出力に写っていた本文から復旧した)。
+        // 空でなければ一切書き込まず、変更を加えないまま閉じてスキップする
+        // (未変更なら閉じてもセッション復元の内容は保全される)。
+        let restored = read_notepad_text(target).unwrap_or_default();
+        if !restored.trim().is_empty() {
+            // WM_SETTEXT で空にしてはいけない (それがまさに事故の経路)。
+            // 変更していないので WM_CLOSE だけで保存確認も出ない。
+            close_without_clearing(target, &mut child);
+            restore_user_clipboard();
+            println!(
+                "起動したメモ帳がセッション復元で文書を持っています ({} 文字)。\n\
+                 ユーザーの内容を壊さないためスキップします。\n\
+                 メモ帳で該当タブを閉じて (保存するか破棄するか選んで) から再実行してください",
+                restored.chars().count()
+            );
+            return;
+        }
+
         // 前景を取りに行く。バックグラウンドのコンソールプロセスからは
         // フォアグラウンドロックで拒否されることがある (wiki の知見どおり)。
         // 取れなければ環境要因なので、失敗ではなくスキップにする。
@@ -1732,28 +1758,77 @@ mod tests {
         reap(child);
     }
 
-    /// メモ帳の編集コントロールを探す。
+    /// 文書に**一切触れずに**メモ帳を閉じる。
+    ///
+    /// セッション復元でユーザーの文書が開いていた場合に使う。
+    /// `WM_SETTEXT("")` は禁止 — 復元された内容ごと消してしまう
+    /// (実測 2026-08-17 の事故経路)。未変更のまま閉じれば
+    /// セッション復元の内容は保全される。
     #[cfg(test)]
-    fn notepad_edit_control(parent: isize) -> Option<HWND> {
-        use windows::Win32::UI::WindowsAndMessaging::FindWindowExW;
-        for class in ["Edit", "RichEditD2DPT", "RICHEDIT50W", "RichEdit20W"] {
-            let wide: Vec<u16> = class.encode_utf16().chain(std::iter::once(0)).collect();
-            // SAFETY: parent は有効な HWND、wide は NUL 終端。
-            let child = unsafe {
-                FindWindowExW(
-                    Some(HWND(parent as *mut _)),
-                    None,
-                    PCWSTR(wide.as_ptr()),
-                    PCWSTR::null(),
-                )
-            };
-            if let Ok(child) = child {
-                if !child.0.is_null() {
-                    return Some(child);
-                }
+    fn close_without_clearing(hwnd: isize, child: &mut std::process::Child) {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{IsWindow, PostMessageW, WM_CLOSE};
+
+        // SAFETY: hwnd は有効。PostMessage は相手スレッドを待たない。
+        let _ = unsafe { PostMessageW(Some(HWND(hwnd as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(100));
+            // SAFETY: 破棄済みの HWND を渡しても FALSE が返るだけ。
+            if !unsafe { IsWindow(Some(HWND(hwnd as *mut _))) }.as_bool() {
+                break;
             }
         }
-        None
+        // spawn ハンドルの回収のみ (プロセスが引き継がれていれば既に終了している)。
+        // 未変更のウィンドウに保存確認は出ないため、ここでの kill は
+        // 自分の子プロセスにしか影響しない。
+        reap(child);
+    }
+
+    /// メモ帳の編集コントロールを探す。
+    ///
+    /// # 直接の子ではなく全子孫を探す理由 (実測で見つからなかった)
+    ///
+    /// `FindWindowExW` は**直下の子ウィンドウしか**列挙しない。Windows 11 の
+    /// メモ帳は編集コントロール (`RichEditD2DPT`) がコンテナ
+    /// (`NotepadTextBox` 等) の下の孫階層にあり、トップレベル直下を探すと
+    /// 見つからない (実測 2026-08-17)。`EnumChildWindows` は子孫全体を
+    /// 列挙するのでこちらを使う。
+    #[cfg(test)]
+    fn notepad_edit_control(parent: isize) -> Option<HWND> {
+        use windows::core::BOOL;
+        use windows::Win32::Foundation::LPARAM;
+        use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetClassNameW};
+
+        unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            // SAFETY: lparam は呼び出し元スタック上の Option<HWND> を指す。
+            let found = unsafe { &mut *(lparam.0 as *mut Option<HWND>) };
+            let mut buf = [0u16; 64];
+            // SAFETY: hwnd は列挙中の有効な HWND、buf は書き込み可能。
+            let len = unsafe { GetClassNameW(hwnd, &mut buf) };
+            if len > 0 {
+                let class = String::from_utf16_lossy(&buf[..len as usize]);
+                if matches!(
+                    class.as_str(),
+                    "Edit" | "RichEditD2DPT" | "RICHEDIT50W" | "RichEdit20W"
+                ) {
+                    *found = Some(hwnd);
+                    return BOOL(0); // 発見したら列挙を止める
+                }
+            }
+            BOOL(1)
+        }
+
+        let mut found: Option<HWND> = None;
+        // SAFETY: parent は有効な HWND。found は列挙の間だけ生きるスタック変数で、
+        // EnumChildWindows は同期的に戻るため参照は列挙終了まで有効。
+        unsafe {
+            let _ = EnumChildWindows(
+                Some(HWND(parent as *mut _)),
+                Some(enum_proc),
+                LPARAM(&mut found as *mut _ as isize),
+            );
+        }
+        found
     }
 
     /// 対象ウィンドウを前景にする。取れたら `true`。
@@ -1816,8 +1891,12 @@ mod tests {
         {
             let child = notepad_edit_control(parent)?;
 
+            // SendMessageTimeoutW の戻り値は成功フラグであって、メッセージの
+            // 結果 (テキスト長・コピー文字数) は最終引数 lpdwResult で受ける。
+            // 戻り値を長さとして使うと常に 1 前後の値になる (実測 2026-08-17)。
+            let mut len: usize = 0;
             // SAFETY: child は有効な HWND。ハングしたら諦める。
-            let len = unsafe {
+            let ok = unsafe {
                 SendMessageTimeoutW(
                     child,
                     WM_GETTEXTLENGTH,
@@ -1825,17 +1904,18 @@ mod tests {
                     LPARAM(0),
                     SMTO_ABORTIFHUNG,
                     TIMEOUT_MS,
-                    None,
+                    Some(&mut len),
                 )
             }
             .0;
-            if len <= 0 {
+            if ok == 0 || len == 0 {
                 return None;
             }
 
-            let mut buf = vec![0u16; len as usize + 1];
+            let mut buf = vec![0u16; len + 1];
+            let mut copied: usize = 0;
             // SAFETY: buf は len+1 要素あり、WPARAM にその長さを渡す。
-            let copied = unsafe {
+            let ok = unsafe {
                 SendMessageTimeoutW(
                     child,
                     WM_GETTEXT,
@@ -1843,12 +1923,12 @@ mod tests {
                     LPARAM(buf.as_mut_ptr() as isize),
                     SMTO_ABORTIFHUNG,
                     TIMEOUT_MS,
-                    None,
+                    Some(&mut copied),
                 )
             }
             .0;
-            if copied > 0 {
-                return Some(String::from_utf16_lossy(&buf[..copied as usize]));
+            if ok != 0 && copied > 0 && copied <= len {
+                return Some(String::from_utf16_lossy(&buf[..copied]));
             }
         }
         None
