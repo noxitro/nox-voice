@@ -9,6 +9,26 @@
   </head>
 
   <body>
+    <!-- 注意アイコン。絵文字ではなく描いた図形を 1 つ定義して使い回す。 -->
+    <svg hidden aria-hidden="true">
+      <symbol id="icon-warn" viewBox="0 0 16 16">
+        <path
+          d="M8 2.4 1.9 13.1h12.2L8 2.4Z"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.4"
+          stroke-linejoin="round"
+        />
+        <path
+          d="M8 6.3v3.1"
+          stroke="currentColor"
+          stroke-width="1.4"
+          stroke-linecap="round"
+        />
+        <circle cx="8" cy="11.3" r="0.85" fill="currentColor" />
+      </symbol>
+    </svg>
+
     <main class="container">
       <h1>nox-voice</h1>
 
@@ -22,7 +42,7 @@
         右 Ctrl を<strong>短押し</strong>すると録音が継続し、もう一度押すと停止。
       </p>
 
-      <p class="error" id="error" hidden></p>
+      <p class="error" id="error" role="alert" hidden></p>
 
       <section class="panel">
         <div class="panel-head">
@@ -82,12 +102,13 @@
           type="search"
           id="history-search"
           class="search"
+          aria-label="履歴を検索"
           placeholder="本文・挿入先アプリで検索"
           autocomplete="off"
         />
 
         <p class="empty" id="history-empty">履歴はまだありません</p>
-        <p class="error" id="history-error" hidden></p>
+        <p class="error" id="history-error" role="alert" hidden></p>
 
         <ul class="history" id="history-list"></ul>
 
@@ -99,143 +120,181 @@
       <details class="panel settings">
         <summary>設定</summary>
         <form id="settings-form">
-          <label>
-            <span>Groq API キー<em id="groq-state"></em></span>
-            <input
-              type="password"
-              id="groq-key"
-              autocomplete="off"
-              placeholder="変更するときだけ入力"
-            />
-          </label>
-          <label>
-            <span>Gemini API キー<em id="gemini-state"></em></span>
-            <input
-              type="password"
-              id="gemini-key"
-              autocomplete="off"
-              placeholder="変更するときだけ入力"
-            />
-          </label>
-          <label>
-            <span>言語 (空欄で自動判定)</span>
-            <input type="text" id="language" autocomplete="off" />
-          </label>
-          <label class="checkbox">
-            <input type="checkbox" id="formatting-enabled" />
-            <span>LLM で整形する(オフなら生転写をそのまま使う)</span>
-          </label>
-          <label class="checkbox">
-            <input type="checkbox" id="injection-enabled" />
-            <span>結果を前景アプリへ自動で貼り付ける</span>
-          </label>
-          <label>
-            <span>クリップボード復元までの待ち時間 (ms)</span>
-            <input
-              type="number"
-              id="restore-delay"
-              min="50"
-              max="5000"
-              step="50"
-            />
-          </label>
-          <label class="checkbox">
-            <input type="checkbox" id="history-enabled" />
-            <span>履歴を保存する(発話の全文が保存されます)</span>
-          </label>
-          <label>
-            <span>履歴の保持日数(0 で無制限)</span>
-            <input type="number" id="history-retention" min="0" max="3650" />
-          </label>
-          <label>
-            <span>
-              辞書(1 行に 1 語。<code>表記,よみ</code> で読みも指定できます)
-            </span>
-            <textarea
-              id="dictionary"
-              rows="5"
-              autocomplete="off"
-              placeholder="nox-voice&#10;塩谷,しおや"
-            ></textarea>
-          </label>
-          <label>
-            <span>ホットキー(押している間だけ録音 / 短押しでトグル)</span>
-            <span class="hotkey-row">
-              <output class="hotkey-value" id="hotkey-label">右 Ctrl</output>
-              <button type="button" id="hotkey-capture">キーを押して設定</button>
-            </span>
-          </label>
-          <p class="warn">
-            押している間そのキーは入力先アプリにも流れます。文字キーや Enter は
-            選べません(長押しで連続入力されるため)。
-            <strong>Ctrl / Alt / Shift / Win / CapsLock / F1〜F12</strong>
-            などから選んでください。Esc で取り消せます。
-          </p>
-          <label class="checkbox">
-            <input type="checkbox" id="start-hidden" />
-            <span>起動時はウィンドウを出さない(トレイに常駐)</span>
-          </label>
-          <label class="checkbox">
-            <input type="checkbox" id="overlay-enabled" />
-            <span>録音中に小窓を表示する(クリックは下のアプリへ抜けます)</span>
-          </label>
-          <label class="checkbox">
-            <input type="checkbox" id="deep-context" />
-            <span>
-              画面のテキストを文脈として使う(deep context)
-            </span>
-          </label>
-          <p class="warn" id="deep-context-warning">
-            ⚠️ オンにすると、録音開始時に<strong>前景アプリの画面に表示されている
-            文章</strong>が読み取られ、認識・整形のためクラウド(Groq / Gemini)へ
-            送信されます。パスワード欄は読み取りません。読み取った内容は履歴には
-            保存されません。
-          </p>
-          <label>
-            <span>
-              アプリ別の文体(1 行に <code>プロセス名 | 指示</code>。
-              <code>プロセス名 | タイトル条件 | 指示</code> で絞り込み)
-            </span>
-            <textarea
-              id="style-profiles"
-              rows="6"
-              autocomplete="off"
-              placeholder="slack.exe | チャットの発言。簡潔な口語にする&#10;chrome.exe | Gmail | メール本文。ですます調にする"
-            ></textarea>
-          </label>
+          <fieldset class="field-group">
+            <legend>API キー</legend>
+            <label>
+              <span>Groq API キー<em id="groq-state"></em></span>
+              <input
+                type="password"
+                id="groq-key"
+                autocomplete="off"
+                placeholder="変更するときだけ入力"
+              />
+            </label>
+            <label>
+              <span>Gemini API キー<em id="gemini-state"></em></span>
+              <input
+                type="password"
+                id="gemini-key"
+                autocomplete="off"
+                placeholder="変更するときだけ入力"
+              />
+            </label>
+            <label>
+              <span>言語 (空欄で自動判定)</span>
+              <input type="text" id="language" autocomplete="off" />
+            </label>
+          </fieldset>
+
+          <fieldset class="field-group">
+            <legend>認識と整形</legend>
+            <label class="checkbox">
+              <input type="checkbox" id="formatting-enabled" />
+              <span>LLM で整形する(オフなら生転写をそのまま使う)</span>
+            </label>
+            <label>
+              <span>
+                辞書(1 行に 1 語。<code>表記,よみ</code> で読みも指定できます)
+              </span>
+              <textarea
+                id="dictionary"
+                rows="5"
+                autocomplete="off"
+                placeholder="nox-voice&#10;塩谷,しおや"
+              ></textarea>
+            </label>
+            <label>
+              <span>
+                アプリ別の文体(1 行に <code>プロセス名 | 指示</code>。
+                <code>プロセス名 | タイトル条件 | 指示</code> で絞り込み)
+              </span>
+              <textarea
+                id="style-profiles"
+                rows="6"
+                autocomplete="off"
+                placeholder="slack.exe | チャットの発言。簡潔な口語にする&#10;chrome.exe | Gmail | メール本文。ですます調にする"
+              ></textarea>
+            </label>
+            <p class="warn">
+              <svg class="warn-icon" aria-hidden="true"><use href="#icon-warn" /></svg>
+              <span>
+                整形は Gemini 無料枠では送信内容が Google の製品改善・モデル訓練に
+                利用されます。機密を扱う場合は整形をオフにするか有料ティアの
+                キーを使ってください。
+              </span>
+            </p>
+          </fieldset>
+
+          <fieldset class="field-group">
+            <legend>貼り付け</legend>
+            <label class="checkbox">
+              <input type="checkbox" id="injection-enabled" />
+              <span>結果を前景アプリへ自動で貼り付ける</span>
+            </label>
+            <label>
+              <span>クリップボード復元までの待ち時間 (ms)</span>
+              <input
+                type="number"
+                id="restore-delay"
+                min="50"
+                max="5000"
+                step="50"
+              />
+            </label>
+          </fieldset>
+
+          <fieldset class="field-group">
+            <legend>画面コンテキスト</legend>
+            <label class="checkbox">
+              <input type="checkbox" id="deep-context" />
+              <span>
+                画面のテキストを文脈として使う(deep context)
+              </span>
+            </label>
+            <p class="warn" id="deep-context-warning">
+              <svg class="warn-icon" aria-hidden="true"><use href="#icon-warn" /></svg>
+              <span>
+                オンにすると、録音開始時に<strong>前景アプリの画面に表示されている
+                文章</strong>が読み取られ、認識・整形のためクラウド(Groq / Gemini)へ
+                送信されます。パスワード欄は読み取りません。読み取った内容は履歴には
+                保存されません。
+              </span>
+            </p>
+          </fieldset>
+
+          <fieldset class="field-group">
+            <legend>ローカル認識</legend>
+            <label>
+              <span>ローカル認識(クラウドが使えないときの代替)</span>
+              <select id="local-stt-mode">
+                <option value="off">使わない</option>
+                <option value="fallback">クラウドが失敗したときだけ使う</option>
+                <option value="only">常にローカルで認識(音声を外へ送らない)</option>
+              </select>
+            </label>
+            <div class="storage" id="local-stt">
+              <span id="local-stt-text">確認中…</span>
+              <button type="button" id="local-stt-download">モデルをダウンロード</button>
+            </div>
+            <p class="warn" id="local-stt-note">
+              <svg class="warn-icon" aria-hidden="true"><use href="#icon-warn" /></svg>
+              <span>
+                モデルは約 1GB です。CPU のみで動くため、認識には
+                <strong>録音時間の数倍</strong>かかります(1 分の録音で数分が目安)。
+                クラウドが使えるときはそちらの方が速く正確です。
+              </span>
+            </p>
+          </fieldset>
+
+          <fieldset class="field-group">
+            <legend>履歴</legend>
+            <label class="checkbox">
+              <input type="checkbox" id="history-enabled" />
+              <span>履歴を保存する(発話の全文が保存されます)</span>
+            </label>
+            <label>
+              <span>履歴の保持日数(0 で無制限)</span>
+              <input type="number" id="history-retention" min="0" max="3650" />
+            </label>
+            <div class="storage" id="storage">
+              <span id="storage-text">退避した録音: 集計中…</span>
+              <button type="button" id="storage-clear" class="danger">
+                未転写の録音をすべて削除
+              </button>
+            </div>
+          </fieldset>
+
+          <fieldset class="field-group">
+            <legend>操作と表示</legend>
+            <label>
+              <span>ホットキー(押している間だけ録音 / 短押しでトグル)</span>
+              <span class="hotkey-row">
+                <output class="hotkey-value" id="hotkey-label">右 Ctrl</output>
+                <button type="button" id="hotkey-capture">キーを押して設定</button>
+              </span>
+            </label>
+            <p class="warn">
+              <svg class="warn-icon" aria-hidden="true"><use href="#icon-warn" /></svg>
+              <span>
+                押している間そのキーは入力先アプリにも流れます。文字キーや Enter は
+                選べません(長押しで連続入力されるため)。
+                <strong>Ctrl / Alt / Shift / Win / CapsLock / F1〜F12</strong>
+                などから選んでください。Esc で取り消せます。
+              </span>
+            </p>
+            <label class="checkbox">
+              <input type="checkbox" id="start-hidden" />
+              <span>起動時はウィンドウを出さない(トレイに常駐)</span>
+            </label>
+            <label class="checkbox">
+              <input type="checkbox" id="overlay-enabled" />
+              <span>録音中に小窓を表示する(クリックは下のアプリへ抜けます)</span>
+            </label>
+          </fieldset>
+
           <div class="form-actions">
             <button type="submit">保存</button>
-            <span class="form-note" id="settings-note"></span>
-          </div>
-          <p class="warn">
-            ⚠️ 整形は Gemini 無料枠では送信内容が Google の製品改善・モデル訓練に
-            利用されます。機密を扱う場合は整形をオフにするか有料ティアの
-            キーを使ってください。
-          </p>
-
-          <label>
-            <span>ローカル認識(クラウドが使えないときの代替)</span>
-            <select id="local-stt-mode">
-              <option value="off">使わない</option>
-              <option value="fallback">クラウドが失敗したときだけ使う</option>
-              <option value="only">常にローカルで認識(音声を外へ送らない)</option>
-            </select>
-          </label>
-          <div class="storage" id="local-stt">
-            <span id="local-stt-text">確認中…</span>
-            <button type="button" id="local-stt-download">モデルをダウンロード</button>
-          </div>
-          <p class="warn" id="local-stt-note">
-            モデルは約 1GB です。CPU のみで動くため、認識には
-            <strong>録音時間の数倍</strong>かかります(1 分の録音で数分が目安)。
-            クラウドが使えるときはそちらの方が速く正確です。
-          </p>
-
-          <div class="storage" id="storage">
-            <span id="storage-text">退避した録音: 集計中…</span>
-            <button type="button" id="storage-clear" class="danger">
-              未転写の録音をすべて削除
-            </button>
+            <span class="form-note" id="settings-note" aria-live="polite"></span>
           </div>
         </form>
       </details>

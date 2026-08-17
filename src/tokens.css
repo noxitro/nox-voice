@@ -1,0 +1,128 @@
+/* nox-voice デザイントークン
+ *
+ * メインウィンドウとオーバーレイ小窓が共有する土台。
+ *
+ * ダークモードの方式:
+ *   ライトを :root に完全に定義し、ダークでは**同じ名前を上書きするだけ**。
+ *   コンポーネント側は生の色を書かず、必ずトークンを参照する。
+ *   こうしておくと「片方のテーマでだけ色が抜ける」事故が起きない。
+ *
+ * 使用場面から決めたこと:
+ *   Windows のデスクトップ常駐ツールを一日中開いておく道具なので、
+ *   OS テーマに追従する (prefers-color-scheme)。派手さより、
+ *   長時間見ても疲れないコントラストと静けさを優先する。
+ */
+
+:root {
+  color-scheme: light dark;
+
+  /* --- 面: 下から上へ 3 層 --- */
+  --surface-base: #f4f4f6; /* ウィンドウの地 */
+  --surface-raised: #ffffff; /* パネル */
+  --surface-sunken: #f0f0f3; /* 入力欄・本文表示 */
+  --surface-hover: rgba(16, 16, 20, 0.045);
+  --surface-active: rgba(16, 16, 20, 0.075);
+
+  /* --- 文字: 3 段 --- */
+  --text-primary: #1a1a1f;
+  --text-secondary: #5a5a64; /* #ffffff 上で 6.6:1 */
+  --text-tertiary: #66666f; /* 補助。最暗の面 --surface-sunken 上でも 4.5:1 以上 */
+
+  /* --- 罫線 --- */
+  --line: #e3e3e8;
+  --line-strong: #c9c9d1;
+
+  /* --- アクセント: 主操作とフォーカスのみ。装飾に使わない --- */
+  --accent: #2f6fdb;
+  --accent-hover: #2a63c4;
+  --accent-text: #ffffff;
+  --accent-soft: rgba(47, 111, 219, 0.1);
+  --focus-ring: #2f6fdb;
+
+  /* --- 状態: 色は状態にだけ割り当てる --- */
+  --status-idle: #8a8a94;
+  --status-recording: #d92d3c;
+  --status-recording-soft: rgba(217, 45, 60, 0.12);
+  --status-processing: #96580a; /* soft 地の上でも 4.5:1 以上(劣化バッジは最重要表示) */
+  --status-processing-soft: rgba(180, 106, 0, 0.12);
+  --status-ok: #176e3e;
+  --status-ok-soft: rgba(28, 122, 69, 0.12);
+  --status-danger: #c3282f;
+  --status-danger-soft: rgba(195, 40, 47, 0.1);
+
+  /* --- 奥行き: どの影もオフセットとぼかしを持つ --- */
+  --shadow-sm: 0 1px 2px rgba(16, 16, 24, 0.06), 0 1px 1px rgba(16, 16, 24, 0.04);
+  --shadow-md: 0 4px 12px rgba(16, 16, 24, 0.1), 0 1px 3px rgba(16, 16, 24, 0.06);
+  --shadow-overlay: 0 8px 28px rgba(0, 0, 0, 0.28), 0 2px 6px rgba(0, 0, 0, 0.18);
+
+  /* --- 余白: 4px 基準 --- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+
+  /* --- 角丸 --- */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-pill: 999px;
+
+  /* --- 文字サイズ: 固定 rem。比率 1.125 前後で段差を小さく --- */
+  --text-xs: 0.75rem; /* 12px 補助・計測値 */
+  --text-sm: 0.8125rem; /* 13px ラベル・注記 */
+  --text-base: 0.875rem; /* 14px 本文 */
+  --text-md: 0.9375rem; /* 15px 強めの本文 */
+  --text-lg: 1.0625rem; /* 17px 見出し */
+  --text-xl: 1.25rem; /* 20px 画面タイトル */
+
+  /* --- 書体 ---
+   * 欧文は Segoe UI、和文はそこから落ちて Yu Gothic UI が拾う。
+   * 外部フォントは読み込まない (オフラインで動くことが要件)。 */
+  --font-ui: "Segoe UI", "Yu Gothic UI", "Meiryo UI", "Hiragino Sans",
+    system-ui, sans-serif;
+
+  --duration-fast: 120ms;
+  --duration-base: 180ms;
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface-base: #17171a;
+    --surface-raised: #202024;
+    --surface-sunken: #191a1d;
+    --surface-hover: rgba(255, 255, 255, 0.055);
+    --surface-active: rgba(255, 255, 255, 0.09);
+
+    --text-primary: #ececed;
+    --text-secondary: #a6a6b0; /* #202024 上で 7.2:1 */
+    --text-tertiary: #8e8e99;
+
+    --line: #313138;
+    --line-strong: #45454e;
+
+    /* 暗い面では彩度を落とし、明度を上げないと沈む */
+    --accent: #6aa1f2;
+    --accent-hover: #82b0f5;
+    --accent-text: #10121a;
+    --accent-soft: rgba(106, 161, 242, 0.16);
+    --focus-ring: #6aa1f2;
+
+    --status-idle: #7c7c86;
+    --status-recording: #f2646f;
+    --status-recording-soft: rgba(242, 100, 111, 0.18);
+    --status-processing: #e2a33c;
+    --status-processing-soft: rgba(226, 163, 60, 0.16);
+    --status-ok: #5cc98b;
+    --status-ok-soft: rgba(92, 201, 139, 0.16);
+    --status-danger: #f2818a;
+    --status-danger-soft: rgba(242, 129, 138, 0.14);
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.3);
+    --shadow-overlay: 0 10px 32px rgba(0, 0, 0, 0.6), 0 2px 8px rgba(0, 0, 0, 0.45);
+  }
+}

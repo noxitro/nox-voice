@@ -908,7 +908,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   await listen("nox://show-history", () => {
     const settings = document.querySelector<HTMLDetailsElement>("details.settings");
     if (settings) settings.open = false;
-    el("history-list")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    el("history-list")?.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" });
     void loadHistory();
   });
 

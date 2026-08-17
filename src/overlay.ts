@@ -54,17 +54,8 @@ function setState(
   const labelEl = el("label");
   if (labelEl) labelEl.textContent = label;
 
-  const icon = el("icon");
-  if (icon) {
-    icon.textContent =
-      state === "recording"
-        ? "●"
-        : state === "processing"
-          ? "◐"
-          : state === "done"
-            ? "✓"
-            : "!";
-  }
+  // アイコンは overlay.html に描いた SVG を CSS が data-state で出し分ける。
+  // ここで textContent を書くと、その SVG を消してしまう。
 
   const detailEl = el("detail");
   if (detailEl) {
@@ -138,7 +129,8 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   await listen<number>("nox://level", (event) => {
     const fill = el("meter-fill");
-    if (fill) fill.style.width = `${Math.round(event.payload * 100)}%`;
+    // 幅ではなく scaleX。毎フレームのレイアウト再計算を避ける。
+    if (fill) fill.style.transform = `scaleX(${Math.min(1, Math.max(0, event.payload))})`;
   });
 
   await listen<ResultPayload>("nox://result", (event) => {

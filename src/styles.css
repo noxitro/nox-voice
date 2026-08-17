@@ -1,496 +1,674 @@
-:root {
-  --bg: #f6f6f6;
-  --fg: #1c1c1e;
-  --muted: #6b6b70;
-  --panel: #ffffff;
-  --border: #e2e2e5;
-  --idle: #8a8a8e;
-  --recording: #e5484d;
-  --processing: #f5a524;
-  --error: #c62828;
-  --ok: #2e7d32;
-  --accent: #3b82f6;
+@import "./tokens.css";
 
-  font-family: "Segoe UI", "Yu Gothic UI", system-ui, sans-serif;
-  font-size: 15px;
-  line-height: 1.6;
-  color: var(--fg);
-  background-color: var(--bg);
-}
+/* nox-voice メインウィンドウ (設定 + 履歴)。
+ *
+ * タスク完遂型の画面。走査しやすさと一貫性が表現より優先される。
+ * 色は状態にだけ割り当て、アクセントは主操作とフォーカスに限る。 */
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #1c1c1e;
-    --fg: #f2f2f4;
-    --muted: #9a9aa0;
-    --panel: #262629;
-    --border: #38383c;
-    --error: #ff8a80;
-    --ok: #81c784;
-  }
-}
-
-* {
+*,
+*::before,
+*::after {
   box-sizing: border-box;
+}
+
+html {
+  font-family: var(--font-ui);
+  font-size: 16px;
+  line-height: 1.65;
+  color: var(--text-primary);
+  background: var(--surface-base);
+  -webkit-font-smoothing: antialiased;
 }
 
 body {
   margin: 0;
+  font-size: var(--text-base);
+}
+
+/* アイコン定義用のインライン SVG スプライトを隠す。
+   hidden 属性は SVG 要素には効かず、既定サイズ 300x150 のまま
+   場所を取る (実測: 本文が 180px 押し下げられていた)。明示的に消す。 */
+svg[hidden] {
+  display: none;
 }
 
 .container {
-  max-width: 520px;
+  max-width: 560px;
   margin: 0 auto;
-  padding: 24px 20px 32px;
+  padding: var(--space-5) var(--space-5) var(--space-7);
+  display: grid;
+  gap: var(--space-4);
 }
 
+/* --- 見出し ------------------------------------------------------------- */
+
 h1 {
-  margin: 0 0 16px;
-  font-size: 1.3rem;
-  letter-spacing: 0.02em;
+  margin: 0;
+  font-size: var(--text-xl);
+  font-weight: 650;
+  letter-spacing: -0.01em;
 }
 
 h2 {
-  margin: 0 0 8px;
-  font-size: 0.85rem;
-  font-weight: 600;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 650;
+  color: var(--text-secondary);
+  letter-spacing: 0.05em;
 }
+
+h3 {
+  margin: 0;
+  font-size: var(--text-xs);
+  font-weight: 650;
+  color: var(--text-secondary);
+  letter-spacing: 0.04em;
+}
+
+/* --- 現在の状態 --------------------------------------------------------- */
 
 .status-card {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 14px 16px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--panel);
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-sm);
 }
 
 .status-dot {
-  width: 12px;
-  height: 12px;
+  position: relative;
+  width: 9px;
+  height: 9px;
   flex: none;
   border-radius: 50%;
-  background: var(--idle);
+  background: var(--status-idle);
 }
 
+/* 録音中は点そのものではなく、周囲の輪を広げる。
+   点滅より視界の端で気づきやすく、うるさくない。 */
 .status-card[data-status="recording"] .status-dot {
-  background: var(--recording);
-  animation: pulse 1.2s ease-in-out infinite;
+  background: var(--status-recording);
+}
+
+.status-card[data-status="recording"] .status-dot::after {
+  content: "";
+  position: absolute;
+  inset: -5px;
+  border-radius: 50%;
+  border: 1.5px solid var(--status-recording);
+  animation: ring 1.6s var(--ease-out) infinite;
 }
 
 .status-card[data-status="processing"] .status-dot {
-  background: var(--processing);
+  background: var(--status-processing);
 }
 
-@keyframes pulse {
-  50% {
-    opacity: 0.35;
+@keyframes ring {
+  from {
+    opacity: 0.65;
+    transform: scale(0.7);
   }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .status-card[data-status="recording"] .status-dot {
-    animation: none;
+  to {
+    opacity: 0;
+    transform: scale(1.35);
   }
 }
 
 .status-text {
   font-weight: 600;
+  font-size: var(--text-md);
 }
 
 .hint {
-  margin: 12px 0 24px;
-  color: var(--muted);
-  font-size: 0.9rem;
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
 }
+
+.hint strong {
+  color: var(--text-primary);
+  font-weight: 650;
+}
+
+/* --- パネル ------------------------------------------------------------- */
 
 .panel {
-  padding: 14px 16px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--panel);
-}
-
-.kv {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 4px 16px;
-  margin: 0;
-  font-size: 0.9rem;
-}
-
-.kv dt {
-  color: var(--muted);
-  white-space: nowrap;
-}
-
-.kv dd {
-  margin: 0;
-  overflow-wrap: anywhere;
-}
-
-.error {
-  margin: 0 0 16px;
-  padding: 10px 12px;
-  border: 1px solid var(--error);
-  border-radius: 8px;
-  color: var(--error);
-  font-size: 0.9rem;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.panel + .panel,
-.panel + .settings {
-  margin-top: 16px;
+  padding: var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-sm);
 }
 
 .panel-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--space-3);
+  min-height: 28px;
 }
 
-.panel-head h2 {
-  margin-bottom: 0;
-}
+/* --- バッジ: 結末の分類 -------------------------------------------------- */
 
 .badge {
-  padding: 2px 8px;
-  border-radius: 999px;
-  font-size: 0.72rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  background: var(--border);
-  color: var(--muted);
+  flex: none;
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--surface-sunken);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  line-height: 1.5;
+  white-space: nowrap;
 }
 
 .badge[data-kind="formatted"] {
-  background: color-mix(in srgb, var(--ok) 18%, transparent);
-  color: var(--ok);
+  background: var(--status-ok-soft);
+  color: var(--status-ok);
 }
 
 .badge[data-kind="degraded"] {
-  background: color-mix(in srgb, var(--processing) 20%, transparent);
-  color: var(--processing);
+  background: var(--status-processing-soft);
+  color: var(--status-processing);
 }
+
+.badge[data-kind="untranscribed"] {
+  background: var(--surface-sunken);
+  color: var(--text-tertiary);
+}
+
+/* --- 本文の表示 --------------------------------------------------------- */
 
 .empty {
-  margin: 8px 0 0;
-  color: var(--muted);
-  font-size: 0.9rem;
-}
-
-.degraded-note {
-  margin: 10px 0 0;
-  padding: 8px 10px;
-  border-left: 3px solid var(--processing);
-  background: color-mix(in srgb, var(--processing) 10%, transparent);
-  color: var(--fg);
-  font-size: 0.85rem;
-}
-
-.inject-note {
-  margin: 10px 0 0;
-  padding: 8px 10px;
-  border-left: 3px solid var(--border);
-  background: var(--bg);
-  font-size: 0.85rem;
-}
-
-.inject-note[data-kind="ok"] {
-  border-left-color: var(--ok);
-}
-
-.inject-note[data-kind="warn"] {
-  border-left-color: var(--processing);
-}
-
-.settings input[type="number"] {
-  padding: 6px 10px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: var(--bg);
-  color: var(--fg);
-  font: inherit;
-  font-size: 0.9rem;
-  max-width: 10rem;
+  margin: var(--space-3) 0 0;
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
 }
 
 .text-block {
-  margin-top: 14px;
+  margin-top: var(--space-4);
 }
 
 .text-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-}
-
-.text-head h3 {
-  margin: 0;
-  font-size: 0.8rem;
-  font-weight: 600;
-  color: var(--muted);
-  letter-spacing: 0.04em;
+  gap: var(--space-2);
+  margin-bottom: var(--space-1);
 }
 
 .text {
-  margin: 6px 0 0;
-  padding: 10px 12px;
-  min-height: 2.6em;
-  max-height: 12em;
+  margin: 0;
+  padding: var(--space-3);
+  min-height: 3em;
+  max-height: 13em;
   overflow: auto;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
   font-family: inherit;
-  font-size: 0.92rem;
+  font-size: var(--text-base);
+  line-height: 1.7;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
 .timings {
-  margin: 14px 0 0;
-  color: var(--muted);
-  font-size: 0.8rem;
+  margin: var(--space-4) 0 0;
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
 }
 
+/* --- 注記: 劣化・注入結果 -------------------------------------------------
+ * 太い色付き左罫は使わない。面の色と文字色で分類を示す。 */
+
+.degraded-note,
+.inject-note {
+  margin: var(--space-3) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.degraded-note {
+  background: var(--status-processing-soft);
+  border-color: color-mix(in srgb, var(--status-processing) 24%, transparent);
+  color: var(--text-primary);
+}
+
+.inject-note[data-kind="ok"] {
+  background: var(--status-ok-soft);
+  border-color: color-mix(in srgb, var(--status-ok) 22%, transparent);
+  color: var(--text-primary);
+}
+
+.inject-note[data-kind="warn"] {
+  background: var(--status-processing-soft);
+  border-color: color-mix(in srgb, var(--status-processing) 24%, transparent);
+  color: var(--text-primary);
+}
+
+/* --- エラー ------------------------------------------------------------- */
+
+.error {
+  margin: 0;
+  padding: var(--space-3);
+  border: 1px solid color-mix(in srgb, var(--status-danger) 40%, transparent);
+  border-radius: var(--radius-md);
+  background: var(--status-danger-soft);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* --- 録音メタ情報 -------------------------------------------------------- */
+
+.kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--space-1) var(--space-4);
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-sm);
+}
+
+.kv dt {
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+.kv dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- ボタン ------------------------------------------------------------- */
+
 button {
-  padding: 5px 12px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: var(--bg);
-  color: var(--fg);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-height: 30px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--text-primary);
   font: inherit;
-  font-size: 0.85rem;
+  font-size: var(--text-sm);
+  font-weight: 550;
   cursor: pointer;
+  transition:
+    background-color var(--duration-fast) ease,
+    border-color var(--duration-fast) ease;
 }
 
-button:hover {
-  border-color: var(--muted);
+button:hover:not(:disabled) {
+  background: var(--surface-hover);
 }
 
-button:focus-visible {
-  outline: 2px solid var(--accent);
+button:active:not(:disabled) {
+  background: var(--surface-active);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button[type="submit"] {
+  border-color: transparent;
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+button[type="submit"]:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+button.danger {
+  color: var(--status-danger);
+  border-color: color-mix(in srgb, var(--status-danger) 35%, var(--line-strong));
+}
+
+button.danger:hover:not(:disabled) {
+  background: var(--status-danger-soft);
+  border-color: var(--status-danger);
+}
+
+:where(button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
 
-/* --- 履歴 --- */
+/* --- 履歴 --------------------------------------------------------------- */
+
+.search {
+  width: 100%;
+  margin-top: var(--space-3);
+}
 
 .history {
   list-style: none;
-  margin: 10px 0 0;
+  margin: var(--space-2) 0 0;
   padding: 0;
 }
 
 .history-item + .history-item {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line);
 }
 
 .history-head {
   display: grid;
-  gap: 3px;
+  gap: 2px;
   width: 100%;
-  padding: 10px 4px;
+  min-height: 0;
+  padding: var(--space-3) var(--space-2);
   border: 0;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: none;
   text-align: left;
+  font-weight: 400;
   cursor: pointer;
 }
 
 .history-head:hover {
-  background: color-mix(in srgb, var(--border) 35%, transparent);
+  background: var(--surface-hover);
 }
 
 .history-topline {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .history-meta {
-  color: var(--muted);
-  font-size: 0.78rem;
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
 
 .history-preview {
-  font-size: 0.9rem;
+  font-size: var(--text-base);
+  color: var(--text-primary);
   overflow-wrap: anywhere;
 }
 
-.badge[data-kind="untranscribed"] {
-  background: color-mix(in srgb, var(--muted) 22%, transparent);
-  color: var(--muted);
+/* 展開中の行は面の色で示す (左罫を太らせない) */
+.history-item:has(.history-detail) {
+  background: var(--surface-sunken);
+  border-radius: var(--radius-md);
+}
+
+.history-item:has(.history-detail) + .history-item {
+  border-top-color: transparent;
 }
 
 .history-detail {
-  padding: 4px 4px 14px;
+  padding: 0 var(--space-2) var(--space-3);
 }
 
 .history-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 12px;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
 }
 
-button.danger {
-  color: var(--error);
-  border-color: color-mix(in srgb, var(--error) 45%, var(--border));
-}
-
-button.danger:hover {
-  border-color: var(--error);
-}
-
-button:disabled {
-  opacity: 0.55;
-  cursor: default;
-}
-
-.settings textarea {
-  padding: 6px 10px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: var(--bg);
-  color: var(--fg);
-  font: inherit;
-  font-size: 0.9rem;
-  resize: vertical;
-}
+/* --- 設定 --------------------------------------------------------------- */
 
 .settings summary {
-  font-size: 0.85rem;
-  font-weight: 600;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: 650;
+  color: var(--text-secondary);
+  letter-spacing: 0.05em;
   cursor: pointer;
+  list-style: none;
+}
+
+.settings summary::-webkit-details-marker {
+  display: none;
+}
+
+/* 開閉マーカーは自前で描く (絵文字を使わない) */
+.settings summary::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg) translate(1px, -1px);
+  transition: transform var(--duration-base) var(--ease-out);
+}
+
+.settings[open] summary::before {
+  transform: rotate(45deg) translate(-1px, -1px);
 }
 
 .settings form {
   display: grid;
-  gap: 12px;
-  margin-top: 14px;
+  gap: var(--space-5);
+  margin-top: var(--space-5);
+}
+
+/* 設定は主題ごとに束ねる。1 枚の長いリストは走査できない。 */
+.field-group {
+  display: grid;
+  gap: var(--space-3);
+  padding: 0;
+  margin: 0;
+  border: 0;
+}
+
+.field-group + .field-group {
+  padding-top: var(--space-5);
+  border-top: 1px solid var(--line);
+}
+
+/* 見出しの上は下より広く取る */
+.field-group > legend {
+  padding: 0;
+  margin-bottom: var(--space-1);
+  font-size: var(--text-xs);
+  font-weight: 650;
+  color: var(--text-secondary);
+  letter-spacing: 0.06em;
 }
 
 .settings label {
   display: grid;
-  gap: 4px;
-  font-size: 0.85rem;
+  gap: var(--space-1);
+  font-size: var(--text-sm);
 }
 
-.settings label span {
-  color: var(--muted);
+.settings label > span:first-child {
+  color: var(--text-secondary);
 }
 
 .settings label em {
   font-style: normal;
-  color: var(--fg);
+  color: var(--text-primary);
+  font-weight: 600;
 }
 
+/* フォーム部品の見た目は 1 か所で決める */
 .settings input[type="text"],
-.settings input[type="password"] {
-  padding: 6px 10px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: var(--bg);
-  color: var(--fg);
+.settings input[type="password"],
+.settings input[type="number"],
+.settings select,
+.settings textarea,
+.search {
+  padding: 6px var(--space-3);
+  min-height: 30px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-primary);
   font: inherit;
-  font-size: 0.9rem;
+  font-size: var(--text-sm);
+  transition:
+    border-color var(--duration-fast) ease,
+    background-color var(--duration-fast) ease;
+}
+
+.settings input:hover:not(:disabled),
+.settings select:hover:not(:disabled),
+.settings textarea:hover:not(:disabled),
+.search:hover {
+  border-color: var(--text-tertiary);
+}
+
+.settings input::placeholder,
+.settings textarea::placeholder,
+.search::placeholder {
+  color: var(--text-tertiary);
+  opacity: 1; /* 既定の半透明はコントラストを割る */
+}
+
+.settings input[type="number"] {
+  max-width: 9rem;
+}
+
+.settings textarea {
+  min-height: 5.5em;
+  line-height: 1.6;
+  resize: vertical;
 }
 
 .settings label.checkbox {
   grid-template-columns: auto 1fr;
-  align-items: center;
-  gap: 8px;
+  align-items: start;
+  gap: var(--space-2);
+  line-height: 1.5;
 }
 
 .settings label.checkbox span {
-  color: var(--fg);
+  color: var(--text-primary);
 }
 
-.search {
-  width: 100%;
-  margin-top: 12px;
-  padding: 6px 10px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: var(--bg);
-  color: var(--fg);
-  font: inherit;
-  font-size: 0.9rem;
+.settings input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  margin: 3px 0 0;
+  accent-color: var(--accent);
+  cursor: pointer;
 }
+
+.settings code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--surface-sunken);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.92em;
+}
+
+/* --- ホットキー --------------------------------------------------------- */
+
+.hotkey-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.hotkey-value {
+  padding: 4px var(--space-3);
+  min-width: 8rem;
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-weight: 650;
+  text-align: center;
+}
+
+.hotkey-value[data-capturing="true"] {
+  /* 読むべき瞬間の文字なので色は落とさない。赤は枠と地だけに乗せる */
+  border-color: var(--status-recording);
+  background: var(--status-recording-soft);
+  color: var(--text-primary);
+}
+
+/* --- 状態行 (ローカル認識・保存容量) -------------------------------------- */
 
 .storage {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
-  color: var(--muted);
-  font-size: 0.82rem;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
 }
 
-.settings select {
-  padding: 6px 10px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: var(--bg);
-  color: var(--fg);
-  font: inherit;
-  font-size: 0.9rem;
+/* --- 注意書き ----------------------------------------------------------- */
+
+.warn {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  line-height: 1.6;
 }
 
-.hotkey-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
+.warn strong {
+  color: var(--text-primary);
+  font-weight: 650;
 }
 
-.hotkey-value {
-  padding: 4px 12px;
-  min-width: 7rem;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: var(--bg);
-  font-weight: 600;
-  text-align: center;
-}
-
-.hotkey-value[data-capturing="true"] {
-  border-color: var(--recording);
-  color: var(--recording);
+.warn-icon {
+  width: 14px;
+  height: 14px;
+  margin-top: 3px;
+  flex: none;
+  color: var(--status-processing);
 }
 
 .form-actions {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--space-3);
+  padding-top: var(--space-2);
 }
 
 .form-note {
-  color: var(--muted);
-  font-size: 0.82rem;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
 }
 
-.warn {
-  margin: 0;
-  color: var(--muted);
-  font-size: 0.78rem;
-  line-height: 1.5;
+/* --- 動きを抑える設定への追従 --------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

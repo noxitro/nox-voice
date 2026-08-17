@@ -1,22 +1,31 @@
+@import "./tokens.css";
+
 /* オーバーレイ小窓。
-   背景は透明で、中央のピルだけが浮いて見えるようにする。
-   クリックスルー設定 (Rust 側) と合わせて、作業の邪魔をしない。 */
+ *
+ * 画面の隅で状態だけを伝える。作業の邪魔をしないことが第一で、
+ * 見せ場を作らない。ウィンドウ自体は透明で、ピルだけが浮いて見える。
+ * クリックスルーとフォーカス非奪取は Rust 側 (overlay.rs) が担保する。
+ *
+ * 独自トークン: 小窓はデスクトップの上に直接乗るので、
+ * メインウィンドウの面より不透明度と縁の扱いを別に決める。 */
 
 :root {
-  --bg: rgba(28, 28, 30, 0.92);
-  --fg: #f2f2f4;
-  --muted: #a0a0a8;
-  --recording: #e5484d;
-  --processing: #f5a524;
-  --ok: #4ade80;
-  --error: #ff8a80;
-
-  font-family: "Segoe UI", "Yu Gothic UI", system-ui, sans-serif;
-  font-size: 14px;
-  color: var(--fg);
+  --pill-bg: rgba(255, 255, 255, 0.94);
+  --pill-border: rgba(16, 16, 24, 0.1);
+  --pill-track: rgba(16, 16, 24, 0.1);
 }
 
-* {
+@media (prefers-color-scheme: dark) {
+  :root {
+    --pill-bg: rgba(30, 30, 34, 0.94);
+    --pill-border: rgba(255, 255, 255, 0.09);
+    --pill-track: rgba(255, 255, 255, 0.14);
+  }
+}
+
+*,
+*::before,
+*::after {
   box-sizing: border-box;
 }
 
@@ -27,6 +36,9 @@ body {
   /* ウィンドウ自体は透明。ピルの外側は完全に抜ける。 */
   background: transparent;
   overflow: hidden;
+  font-family: var(--font-ui);
+  font-size: var(--text-base);
+  color: var(--text-primary);
   /* 保険: Rust 側のクリックスルーが効かない環境でも操作を妨げない。 */
   user-select: none;
   pointer-events: none;
@@ -35,62 +47,89 @@ body {
 .pill {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-3);
   height: 100%;
-  padding: 10px 18px;
-  border-radius: 999px;
-  background: var(--bg);
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
-  animation: rise 140ms ease-out;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--pill-border);
+  border-radius: var(--radius-pill);
+  background: var(--pill-bg);
+  box-shadow: var(--shadow-overlay);
+  /* backdrop-filter は使わない: 透明な Tauri ウィンドウはネイティブ背後の
+     デスクトップをサンプルできず、効果ゼロでコンポジットコストだけ払う */
+  animation: rise var(--duration-base) var(--ease-out);
 }
 
 @keyframes rise {
   from {
     opacity: 0;
-    transform: translateY(6px);
+    transform: translateY(8px) scale(0.98);
   }
 }
 
-/* 完了表示は自然に消える。 */
+/* 完了表示は自然に消える。畳むのは Rust 側だが、
+   その前に視覚的に引いておく。 */
 .pill[data-state="done"] {
-  animation: rise 140ms ease-out, fade 400ms ease-in 900ms forwards;
+  animation:
+    rise var(--duration-base) var(--ease-out),
+    fade 420ms ease-in 1s forwards;
 }
 
 @keyframes fade {
   to {
     opacity: 0;
+    transform: translateY(4px);
   }
 }
 
+/* --- 状態アイコン --------------------------------------------------------- */
+
 .icon {
+  position: relative;
   flex: none;
-  font-size: 15px;
-  line-height: 1;
-  color: var(--muted);
+  width: 20px;
+  height: 20px;
+  color: var(--text-tertiary);
+}
+
+.glyph {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: none;
 }
 
 .pill[data-state="recording"] .icon {
-  color: var(--recording);
-  animation: pulse 1.2s ease-in-out infinite;
+  color: var(--status-recording);
+}
+.pill[data-state="recording"] .glyph-mic {
+  display: block;
 }
 
 .pill[data-state="processing"] .icon {
-  color: var(--processing);
-  animation: spin 1s linear infinite;
+  color: var(--status-processing);
+}
+.pill[data-state="processing"] .glyph-spinner {
+  display: block;
+  animation: spin 900ms linear infinite;
+  transform-origin: 50% 50%;
 }
 
 .pill[data-state="done"] .icon {
-  color: var(--ok);
+  color: var(--status-ok);
+}
+.pill[data-state="done"] .glyph-check {
+  display: block;
+  /* 線を引く動きで「終わった」ことを伝える */
+  stroke-dasharray: 20;
+  animation: draw 260ms var(--ease-out) both;
 }
 
 .pill[data-state="error"] .icon {
-  color: var(--error);
+  color: var(--status-danger);
 }
-
-@keyframes pulse {
-  50% {
-    opacity: 0.3;
-  }
+.pill[data-state="error"] .glyph-alert {
+  display: block;
 }
 
 @keyframes spin {
@@ -99,17 +138,16 @@ body {
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .pill,
-  .pill[data-state="recording"] .icon,
-  .pill[data-state="processing"] .icon {
-    animation: none;
+@keyframes draw {
+  from {
+    stroke-dashoffset: 20;
   }
-  /* 動きを止めても完了表示は消えないと困るので、透明化だけは残す。 */
-  .pill[data-state="done"] {
-    animation: fade 400ms ease-in 900ms forwards;
+  to {
+    stroke-dashoffset: 0;
   }
 }
+
+/* --- 本文 ---------------------------------------------------------------- */
 
 .body {
   flex: 1;
@@ -122,10 +160,11 @@ body {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 10px;
+  gap: var(--space-3);
 }
 
 .label {
+  font-size: var(--text-sm);
   font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
@@ -134,31 +173,53 @@ body {
 
 .elapsed {
   flex: none;
-  color: var(--muted);
-  font-size: 0.82rem;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
 }
 
+/* --- 入力レベル ----------------------------------------------------------- */
+
 .meter {
-  height: 4px;
-  border-radius: 2px;
-  background: rgba(255, 255, 255, 0.14);
+  height: 3px;
+  border-radius: var(--radius-pill);
+  background: var(--pill-track);
   overflow: hidden;
 }
 
 .meter-fill {
   height: 100%;
-  width: 0%;
-  border-radius: 2px;
-  background: var(--recording);
-  /* 20fps で来る値の間を補間して滑らかに見せる。 */
-  transition: width 60ms linear;
+  width: 100%;
+  border-radius: var(--radius-pill);
+  background: var(--status-recording);
+  /* 幅ではなく transform で伸縮させる。20fps で来る値ごとに
+     レイアウトを起こさないため (幅アニメーションは毎フレーム再計算になる)。 */
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition: transform 60ms linear;
+  will-change: transform;
 }
 
 .detail {
-  color: var(--muted);
-  font-size: 0.78rem;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* --- 動きを抑える設定への追従 ---------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .pill,
+  .glyph {
+    animation: none;
+  }
+  .meter-fill {
+    transition: none;
+  }
+  /* 動きを止めても完了表示は消えないと困るので、透明化だけは残す。 */
+  .pill[data-state="done"] {
+    animation: fade 420ms ease-in 1s forwards;
+  }
 }
