@@ -150,6 +150,18 @@ pub struct Config {
     /// 結果を前景アプリへ自動で貼り付けるか。
     /// false なら画面に表示するだけ (手動コピー)。
     pub injection_enabled: bool,
+    /// ローカル STT の使い方。
+    pub local_stt_mode: LocalSttMode,
+    /// ダウンロード済みモデルの SHA-256。
+    ///
+    /// 初回ダウンロードの成功時に記録し、以後の再ダウンロードで照合する
+    /// (TOFU: 最初に取得したものを正とする)。空なら未固定。
+    pub local_model_sha256: String,
+    /// 起動時にメインウィンドウを出さない (トレイ常駐で始める)。
+    ///
+    /// 常駐アプリなので既定は「出さない」。ただし**初回起動だけは出す** —
+    /// API キーを設定しないと何もできず、窓が出ないと設定画面へ辿り着けない。
+    pub start_hidden: bool,
     /// PTT に使う仮想キーコード。既定は右 Ctrl。
     pub hotkey_vk: u32,
     /// 録音中・処理中の小窓を出すか。
@@ -188,6 +200,9 @@ impl Default for Config {
             dictionary: Vec::new(),
             formatting_enabled: true,
             injection_enabled: true,
+            local_stt_mode: LocalSttMode::Fallback,
+            local_model_sha256: String::new(),
+            start_hidden: true,
             hotkey_vk: crate::hotkey::DEFAULT_HOTKEY_VK,
             overlay_enabled: true,
             // 画面テキストをクラウドへ送るので、明示的に有効化させる。
@@ -201,6 +216,28 @@ impl Default for Config {
             stt_model: DEFAULT_STT_MODEL.to_string(),
             format_model: DEFAULT_FORMAT_MODEL.to_string(),
         }
+    }
+}
+
+/// ローカル STT (whisper.cpp) の使い方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalSttMode {
+    /// 使わない (常に Groq)。
+    Off,
+    /// Groq が失敗したときだけ使う。
+    #[default]
+    Fallback,
+    /// 常にローカルで認識する (クラウドへ音声を送らない)。
+    Only,
+}
+
+impl LocalSttMode {
+    pub fn uses_cloud(self) -> bool {
+        !matches!(self, LocalSttMode::Only)
+    }
+    pub fn allows_local(self) -> bool {
+        !matches!(self, LocalSttMode::Off)
     }
 }
 
@@ -294,6 +331,8 @@ pub struct ConfigView {
     pub injection_enabled: bool,
     pub deep_context: bool,
     pub style_profiles: Vec<StyleProfile>,
+    pub local_stt_mode: LocalSttMode,
+    pub start_hidden: bool,
     pub hotkey_vk: u32,
     /// 表示用のキー名 (「右 Ctrl」など)。
     pub hotkey_label: String,
@@ -333,6 +372,8 @@ impl ConfigView {
             injection_enabled: c.injection_enabled,
             deep_context: c.deep_context,
             style_profiles: c.style_profiles.clone(),
+            local_stt_mode: c.local_stt_mode,
+            start_hidden: c.start_hidden,
             hotkey_vk: c.hotkey_vk,
             hotkey_label: crate::hotkey::key_label(c.hotkey_vk),
             overlay_enabled: c.overlay_enabled,
@@ -368,6 +409,9 @@ pub struct ConfigPatch {
     pub injection_enabled: Option<bool>,
     pub deep_context: Option<bool>,
     pub style_profiles: Option<Vec<StyleProfile>>,
+    pub local_stt_mode: Option<LocalSttMode>,
+    pub local_model_sha256: Option<String>,
+    pub start_hidden: Option<bool>,
     pub hotkey_vk: Option<u32>,
     pub overlay_enabled: Option<bool>,
     pub history_enabled: Option<bool>,
@@ -400,6 +444,8 @@ impl fmt::Debug for ConfigPatch {
             .field("formatting_enabled", &self.formatting_enabled)
             .field("injection_enabled", &self.injection_enabled)
             .field("deep_context", &self.deep_context)
+            .field("local_stt_mode", &self.local_stt_mode)
+            .field("start_hidden", &self.start_hidden)
             .field("hotkey_vk", &self.hotkey_vk)
             .field("overlay_enabled", &self.overlay_enabled)
             .field(
@@ -470,6 +516,15 @@ impl Config {
         if let Some(v) = patch.deep_context {
             self.deep_context = v;
         }
+        if let Some(v) = patch.local_stt_mode {
+            self.local_stt_mode = v;
+        }
+        if let Some(v) = patch.local_model_sha256 {
+            self.local_model_sha256 = v.trim().to_string();
+        }
+        if let Some(v) = patch.start_hidden {
+            self.start_hidden = v;
+        }
         if let Some(v) = patch.hotkey_vk {
             self.hotkey_vk = v;
         }
@@ -523,11 +578,14 @@ fn non_empty_or(value: String, fallback: &str) -> String {
 pub struct ConfigStore {
     path: PathBuf,
     config: Mutex<Config>,
+    /// 起動時に設定ファイルが存在したか (初回起動の判定に使う)。
+    existed: bool,
 }
 
 impl ConfigStore {
     /// ファイルから読み込む。壊れていても既定値で起動する (落とさない)。
     pub fn load(path: PathBuf) -> Self {
+        let existed = path.exists();
         let config = match fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<Config>(&text) {
                 Ok(c) => {
@@ -565,7 +623,13 @@ impl ConfigStore {
         Self {
             path,
             config: Mutex::new(config),
+            existed,
         }
+    }
+
+    /// 初回起動か (設定ファイルが無かったか)。
+    pub fn is_first_run(&self) -> bool {
+        !self.existed
     }
 
     /// 現在の設定のコピーを返す。
@@ -769,6 +833,79 @@ mod tests {
             ..ConfigPatch::default()
         });
         assert_eq!(cfg.dictionary, vec!["nox-voice", "Tauri"]);
+    }
+
+    #[test]
+    fn the_model_hash_starts_unpinned_and_can_be_recorded() {
+        // TOFU: 初回に取得したものを正とし、以後はそれと照合する。
+        let mut cfg = Config::default();
+        assert!(cfg.local_model_sha256.is_empty(), "既定で固定されている");
+        cfg.apply(ConfigPatch {
+            local_model_sha256: Some("  ABC123  ".to_string()),
+            ..ConfigPatch::default()
+        });
+        assert_eq!(cfg.local_model_sha256, "ABC123", "前後の空白が残っている");
+    }
+
+    #[test]
+    fn local_stt_defaults_to_fallback() {
+        let cfg = Config::default();
+        assert_eq!(cfg.local_stt_mode, LocalSttMode::Fallback);
+        assert!(cfg.local_stt_mode.uses_cloud());
+        assert!(cfg.local_stt_mode.allows_local());
+    }
+
+    #[test]
+    fn local_only_mode_never_uses_the_cloud() {
+        // 音声を外へ出したくない人向け。R1 の観点で意味がある。
+        assert!(!LocalSttMode::Only.uses_cloud());
+        assert!(LocalSttMode::Only.allows_local());
+    }
+
+    #[test]
+    fn local_off_mode_never_uses_local() {
+        assert!(LocalSttMode::Off.uses_cloud());
+        assert!(!LocalSttMode::Off.allows_local());
+    }
+
+    #[test]
+    fn local_stt_mode_round_trips_through_disk() {
+        let dir = std::env::temp_dir().join(format!("nox-config-local-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = fs::remove_dir_all(&dir);
+        let store = ConfigStore::load(path.clone());
+        store
+            .update(ConfigPatch {
+                local_stt_mode: Some(LocalSttMode::Only),
+                ..ConfigPatch::default()
+            })
+            .expect("保存できる");
+        assert_eq!(
+            ConfigStore::load(path).snapshot().local_stt_mode,
+            LocalSttMode::Only
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_install_is_detected_as_the_first_run() {
+        let dir = std::env::temp_dir().join(format!("nox-config-first-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = fs::remove_dir_all(&dir);
+
+        let store = ConfigStore::load(path.clone());
+        assert!(store.is_first_run(), "設定が無いのに初回と判定されない");
+        store.update(ConfigPatch::default()).expect("保存できる");
+
+        // 2 回目以降は初回ではない。
+        assert!(!ConfigStore::load(path).is_first_run());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_app_starts_hidden_by_default() {
+        // トレイ常駐が本来の姿。起動のたびに窓が出て前景を奪うのは邪魔。
+        assert!(Config::default().start_hidden);
     }
 
     #[test]

@@ -146,6 +146,8 @@ interface ConfigView {
   injection_enabled: boolean;
   deep_context: boolean;
   style_profiles: StyleProfile[];
+  local_stt_mode: "off" | "fallback" | "only";
+  start_hidden: boolean;
   hotkey_vk: number;
   hotkey_label: string;
   overlay_enabled: boolean;
@@ -355,6 +357,10 @@ function renderConfig(view: ConfigView) {
   if (deepContext) deepContext.checked = view.deep_context;
   const overlayEnabled = el<HTMLInputElement>("overlay-enabled");
   if (overlayEnabled) overlayEnabled.checked = view.overlay_enabled;
+  const startHidden = el<HTMLInputElement>("start-hidden");
+  if (startHidden) startHidden.checked = view.start_hidden;
+  const localMode = el<HTMLSelectElement>("local-stt-mode");
+  if (localMode) localMode.value = view.local_stt_mode;
   const hotkeyLabel = el("hotkey-label");
   if (hotkeyLabel) {
     hotkeyLabel.textContent = view.hotkey_label;
@@ -382,6 +388,8 @@ async function saveSettings(event: Event) {
   const dictionary = el<HTMLTextAreaElement>("dictionary");
   const deepContext = el<HTMLInputElement>("deep-context");
   const overlayEnabled = el<HTMLInputElement>("overlay-enabled");
+  const startHidden = el<HTMLInputElement>("start-hidden");
+  const localMode = el<HTMLSelectElement>("local-stt-mode");
   const styles = el<HTMLTextAreaElement>("style-profiles");
 
   // 入力欄が空 = 「変更しない」。誤って既存キーを消さないため未指定で送る。
@@ -392,6 +400,8 @@ async function saveSettings(event: Event) {
     history_enabled: historyEnabled?.checked ?? true,
     deep_context: deepContext?.checked ?? false,
     overlay_enabled: overlayEnabled?.checked ?? true,
+    start_hidden: startHidden?.checked ?? true,
+    local_stt_mode: localMode?.value ?? "fallback",
     // 空行は Rust 側で落とされる。
     dictionary: (dictionary?.value ?? "").split(/\r?\n/),
     style_profiles: parseStyleProfiles(styles?.value ?? ""),
@@ -616,10 +626,79 @@ function renderHistory() {
   if (!list) return;
   list.replaceChildren(...historyRows.map(buildHistoryItem));
   // 「読めなかった」を「0 件」と表示しない。消えたと誤解させる。
-  if (empty) empty.hidden = historyRows.length > 0 || historyLoadFailed;
+  if (empty) {
+    empty.hidden = historyRows.length > 0 || historyLoadFailed;
+    empty.textContent = historyQuery
+      ? `「${historyQuery}」に一致する履歴はありません`
+      : "履歴はまだありません";
+  }
 }
 
 const HISTORY_PAGE = 50;
+
+/** 現在の検索語。 */
+let historyQuery = "";
+/** 入力のたびに問い合わせないための遅延。 */
+let searchDebounce: number | undefined;
+
+interface StorageStats {
+  failed_bytes: number;
+  failed_files: number;
+  untranscribed_rows: number;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+interface LocalSttStatus {
+  state: "ready" | "not_compiled" | "model_missing";
+  path?: string;
+  bytes?: number;
+  expected_path?: string;
+}
+
+async function loadLocalSttStatus() {
+  const text = el("local-stt-text");
+  const button = el<HTMLButtonElement>("local-stt-download");
+  try {
+    const status = await invoke<LocalSttStatus>("get_local_stt_status");
+    if (text) {
+      text.textContent =
+        status.state === "ready"
+          ? `モデル準備済み (${formatBytes(status.bytes ?? 0)})`
+          : status.state === "not_compiled"
+            ? "このビルドにはローカル認識が含まれていません"
+            : "モデル未ダウンロード";
+    }
+    // ビルドに含まれていないならダウンロードしても使えない。
+    if (button) button.disabled = status.state === "not_compiled";
+  } catch (e) {
+    if (text) text.textContent = `状態を取得できません (${e})`;
+    if (button) button.disabled = true;
+  }
+}
+
+async function loadStorageStats() {
+  const text = el("storage-text");
+  const button = el<HTMLButtonElement>("storage-clear");
+  try {
+    const stats = await invoke<StorageStats>("get_storage_stats");
+    if (text) {
+      text.textContent =
+        stats.failed_files === 0
+          ? "退避した録音: なし"
+          : `退避した録音: ${stats.failed_files} 件 / ${formatBytes(stats.failed_bytes)}` +
+            `(未転写 ${stats.untranscribed_rows} 件)`;
+    }
+    if (button) button.disabled = stats.untranscribed_rows === 0;
+  } catch (e) {
+    if (text) text.textContent = `退避した録音: 集計できません (${e})`;
+    if (button) button.disabled = true;
+  }
+}
 
 async function loadHistory(append = false) {
   const more = el<HTMLButtonElement>("history-more");
@@ -631,6 +710,7 @@ async function loadHistory(append = false) {
     const rows = await invoke<SessionRow[]>("get_history", {
       limit: HISTORY_PAGE,
       beforeId,
+      query: historyQuery || null,
     });
     historyRows = append ? [...historyRows, ...rows] : rows;
     historyLoadFailed = false;
@@ -729,6 +809,38 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (document.hidden && capturingHotkey) void cancelHotkeyCapture();
   });
   el("history-more")?.addEventListener("click", () => void loadHistory(true));
+  el<HTMLInputElement>("history-search")?.addEventListener("input", (e) => {
+    historyQuery = (e.target as HTMLInputElement).value.trim();
+    // 打つたびに DB を叩かない。
+    window.clearTimeout(searchDebounce);
+    searchDebounce = window.setTimeout(() => void loadHistory(), 200);
+  });
+  el("local-stt-download")?.addEventListener("click", () => {
+    const button = el<HTMLButtonElement>("local-stt-download");
+    if (button) {
+      button.disabled = true;
+      button.textContent = "ダウンロード中…";
+    }
+    void invoke("download_local_model").catch((e) => {
+      showError(`ダウンロードを開始できません: ${e}`);
+      if (button) {
+        button.disabled = false;
+        button.textContent = "モデルをダウンロード";
+      }
+    });
+  });
+  el("storage-clear")?.addEventListener("click", () => {
+    if (
+      !window.confirm(
+        "未転写の録音をすべて削除しますか? 音声ファイルも消えます。この操作は取り消せません。",
+      )
+    ) {
+      return;
+    }
+    void invoke("delete_untranscribed")
+      .then(() => loadStorageStats())
+      .catch((e) => showHistoryError(`削除に失敗しました: ${e}`));
+  });
   el("history-clear")?.addEventListener("click", () => {
     if (!window.confirm("履歴をすべて削除しますか? この操作は取り消せません。")) {
       return;
@@ -748,8 +860,13 @@ window.addEventListener("DOMContentLoaded", async () => {
   await listen<ResultPayload>("nox://result", (event) =>
     renderResult(event.payload),
   );
-  await listen<string>("nox://error", (event) => showError(event.payload));
-  await listen("nox://history", () => void loadHistory());
+  await listen<{ message: string; origin: string }>("nox://error", (event) =>
+    showError(event.payload.message),
+  );
+  await listen("nox://history", () => {
+    void loadHistory();
+    void loadStorageStats();
+  });
 
   await listen<HotkeyCaptured | null>("nox://hotkey-captured", (event) => {
     setHotkeyCapturing(false);
@@ -763,6 +880,31 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
 
   // トレイ・通知からの「履歴を開く」。設定を畳んで履歴まで運ぶ。
+  await listen<{
+    downloaded: number;
+    total: number | null;
+    done: boolean;
+    failed?: boolean;
+  }>("nox://model-progress", (event) => {
+      const text = el("local-stt-text");
+      const button = el<HTMLButtonElement>("local-stt-download");
+      const { downloaded, total, done } = event.payload;
+      if (done) {
+        if (button) {
+          button.disabled = false;
+          button.textContent = "モデルをダウンロード";
+        }
+        void loadLocalSttStatus();
+        return;
+      }
+      if (text) {
+        text.textContent = total
+          ? `ダウンロード中… ${formatBytes(downloaded)} / ${formatBytes(total)}` +
+            `(${Math.round((downloaded / total) * 100)}%)`
+          : `ダウンロード中… ${formatBytes(downloaded)}`;
+      }
+  });
+
   await listen("nox://show-history", () => {
     const settings = document.querySelector<HTMLDetailsElement>("details.settings");
     if (settings) settings.open = false;
@@ -779,6 +921,8 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (result) renderResult(result);
     renderConfig(await invoke<ConfigView>("get_config"));
     await loadHistory();
+    await loadStorageStats();
+    await loadLocalSttStatus();
   } catch (e) {
     showError(`状態の取得に失敗しました: ${e}`);
   }

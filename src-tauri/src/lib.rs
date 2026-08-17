@@ -34,6 +34,7 @@ mod format;
 mod history;
 mod hotkey;
 mod inject;
+mod local_stt;
 mod overlay;
 mod pipeline;
 mod session;
@@ -84,6 +85,9 @@ const EVENT_HOTKEY_CAPTURED: &str = "nox://hotkey-captured";
 /// 履歴を開くよう UI へ促すイベント (トレイ・通知からの導線)。
 const EVENT_SHOW_HISTORY: &str = "nox://show-history";
 
+/// 保持期限を定期執行する間隔。
+const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 /// キー捕獲の制限時間。
 ///
 /// 捕獲はフックがグローバルなので、他アプリで打った最初のキーまで拾ってしまう。
@@ -101,6 +105,15 @@ const OVERLAY_ERROR_LINGER: std::time::Duration = std::time::Duration::from_secs
 /// 音声コールバックから直接送ると 1 秒に何百回も IPC を叩くことになる。
 /// 見た目に必要なのは 20fps 程度なので、別スレッドで間引く。
 const LEVEL_EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// エラー通知のペイロード。
+///
+/// `origin` が要るのは、**裏方のエラーを小窓に出させない**ため。
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorPayload {
+    pub message: String,
+    pub origin: StatusOrigin,
+}
 
 /// 転写・整形の結果。フロントと (M4 の) 履歴が使う。
 #[derive(Debug, Clone, Serialize)]
@@ -153,6 +166,8 @@ enum WorkerJob {
     Finalize(Box<FinalizeJob>),
     /// 履歴にある未転写行を、退避 WAV から転写し直す。
     Retranscribe { id: i64 },
+    /// 保持期限の執行。定期タイマーから来る。
+    EnforceRetention,
 }
 
 /// アプリ全体の共有状態。
@@ -194,10 +209,17 @@ struct AppState {
     last_result: Mutex<Option<ResultPayload>>,
     /// STT に失敗した WAV の退避先 (M4 の履歴 DB が入るまでの暫定)。
     failed_dir: PathBuf,
+    /// ローカル STT のモデル置き場。
+    models_dir: PathBuf,
 }
 
 impl AppState {
-    fn new(config_path: PathBuf, failed_dir: PathBuf, db_path: PathBuf) -> Self {
+    fn new(
+        config_path: PathBuf,
+        failed_dir: PathBuf,
+        db_path: PathBuf,
+        models_dir: PathBuf,
+    ) -> Self {
         // 上限到達は 1 録音につき高々 1 回。
         let (limit_tx, limit_rx) = crossbeam_channel::bounded(1);
         let (finalize_tx, finalize_rx) = crossbeam_channel::unbounded();
@@ -226,6 +248,7 @@ impl AppState {
             http,
             last_result: Mutex::new(None),
             failed_dir,
+            models_dir,
         }
     }
 
@@ -302,10 +325,11 @@ fn get_history(
     state: tauri::State<'_, AppState>,
     limit: Option<u32>,
     before_id: Option<i64>,
+    query: Option<String>,
 ) -> Result<Vec<SessionRow>, String> {
     state
         .history
-        .recent(limit.unwrap_or(50), before_id)
+        .search(limit.unwrap_or(50), before_id, query.as_deref())
         .map_err(|e| e.to_string())
 }
 
@@ -499,6 +523,165 @@ fn overlay_rendered(state: String) {
     log::info!("オーバーレイの表示を更新しました: {state}");
 }
 
+/// 退避 WAV の使用量。
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageStats {
+    /// `failed/` 配下の WAV の合計バイト数。
+    pub failed_bytes: u64,
+    /// WAV の個数。
+    pub failed_files: usize,
+    /// 未転写として履歴に載っている行数。
+    pub untranscribed_rows: u64,
+}
+
+/// ローカル STT が使えるかを返す。
+#[tauri::command]
+fn get_local_stt_status(state: tauri::State<'_, AppState>) -> local_stt::Availability {
+    local_stt::availability(&state.models_dir)
+}
+
+/// モデルのダウンロード進捗イベント。
+const EVENT_MODEL_PROGRESS: &str = "nox://model-progress";
+
+/// ローカル STT のモデルをダウンロードする。
+///
+/// 1GB 級で数分かかるので、専用スレッドで走らせて進捗をイベントで返す。
+/// UI スレッドも録音もブロックしない。
+#[tauri::command]
+fn download_local_model(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let Some(http) = state.http.clone() else {
+        return Err("HTTP クライアントを構築できませんでした".to_string());
+    };
+    let models_dir = state.models_dir.clone();
+    // 期待ハッシュは設定から取る (TOFU: 初回の値を以後の照合に使う)。
+    let expected = state.config.snapshot().local_model_sha256;
+
+    // 2 本が同じ .part を交互に書くと、壊れたモデルが検証を通ってしまう。
+    if !local_stt::begin_download() {
+        return Err("既にダウンロード中です".to_string());
+    }
+
+    let spawned = thread::Builder::new()
+        .name("nox-model-download".to_string())
+        .spawn(move || {
+            let progress_app = app.clone();
+            let result = local_stt::download_model(
+                &http,
+                &models_dir,
+                local_stt::DEFAULT_MODEL_URL,
+                (!expected.is_empty()).then_some(expected.as_str()),
+                |progress| {
+                    if let Err(e) = progress_app.emit(EVENT_MODEL_PROGRESS, &progress) {
+                        log::debug!("進捗イベントの送出に失敗: {e}");
+                    }
+                },
+            );
+            local_stt::end_download();
+
+            match result {
+                Ok(outcome) => {
+                    // 初回成功時に計算値を固定する。以後の再取得はこれと照合される。
+                    if expected.is_empty() {
+                        if let Err(e) = app.state::<AppState>().config.update(config::ConfigPatch {
+                            local_model_sha256: Some(outcome.sha256.clone()),
+                            ..Default::default()
+                        }) {
+                            log::warn!("モデルのハッシュを保存できません: {e}");
+                        } else {
+                            log::info!("モデルの SHA-256 を記録しました: {}", outcome.sha256);
+                        }
+                    }
+                    notify(
+                        &app,
+                        Notice::ActionRequired,
+                        "ローカル認識のモデルを準備しました",
+                    );
+                }
+                Err(e) => {
+                    log::error!("モデルのダウンロードに失敗: {e}");
+                    // UI が「ダウンロード中…」で固まらないよう、必ず終了を知らせる。
+                    if let Err(e) = app.emit(
+                        EVENT_MODEL_PROGRESS,
+                        serde_json::json!({
+                            "downloaded": 0,
+                            "total": serde_json::Value::Null,
+                            "done": true,
+                            "failed": true,
+                        }),
+                    ) {
+                        log::debug!("進捗イベントの送出に失敗: {e}");
+                    }
+                    emit_background_error(&app, &format!("モデルのダウンロードに失敗しました: {e}"));
+                }
+            }
+        });
+
+    if let Err(e) = spawned {
+        local_stt::end_download();
+        return Err(format!("ダウンロードを開始できません: {e}"));
+    }
+    Ok(())
+}
+
+/// 退避 WAV の使用量を返す。
+#[tauri::command]
+fn get_storage_stats(state: tauri::State<'_, AppState>) -> Result<StorageStats, String> {
+    let (failed_bytes, failed_files) = measure_failed_dir(&state.failed_dir);
+    let untranscribed_rows = state
+        .history
+        .untranscribed_count()
+        .map_err(|e| e.to_string())?;
+    Ok(StorageStats {
+        failed_bytes,
+        failed_files,
+        untranscribed_rows,
+    })
+}
+
+/// `failed/` の WAV を数えて合計サイズを出す。
+///
+/// 読めないディレクトリは 0 件として扱う (統計表示のためだけなので、
+/// ここで失敗してもアプリの機能は損なわれない)。
+fn measure_failed_dir(dir: &std::path::Path) -> (u64, usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    let mut bytes = 0u64;
+    let mut files = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("wav") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            bytes += meta.len();
+            files += 1;
+        }
+    }
+    (bytes, files)
+}
+
+/// 未転写の録音をまとめて削除する (WAV + 履歴行)。
+///
+/// 呼び出し側で確認を取ってから使うこと。
+#[tauri::command]
+fn delete_untranscribed(app: AppHandle) -> Result<u64, String> {
+    let removal = app
+        .state::<AppState>()
+        .history
+        .delete_untranscribed()
+        .map_err(|e| e.to_string())?;
+    log::info!(
+        "未転写の録音を削除しました ({} 行 / WAV {} 個)",
+        removal.rows,
+        removal.wavs_removed
+    );
+    emit_history_changed(&app);
+    report_removal(&app, &removal, "未転写の録音を削除しました")?;
+    Ok(removal.rows)
+}
+
 /// 履歴を開く (トレイ・通知からの導線)。
 #[tauri::command]
 fn open_history(app: AppHandle) {
@@ -557,6 +740,10 @@ pub fn run() {
             overlay_ready,
             overlay_rendered,
             open_history,
+            get_storage_stats,
+            delete_untranscribed,
+            get_local_stt_status,
+            download_local_model,
             show_window
         ])
         .setup(|app| {
@@ -566,7 +753,11 @@ pub fn run() {
             // 状態の登録は builder ではなく setup で行う。
             let (config_path, failed_dir) = resolve_paths(&handle);
             let db_path = resolve_db_path(&handle);
-            app.manage(AppState::new(config_path, failed_dir, db_path));
+            let models_dir = db_path
+                .parent()
+                .map(|dir| dir.join("models"))
+                .unwrap_or_else(|| PathBuf::from("models"));
+            app.manage(AppState::new(config_path, failed_dir, db_path, models_dir));
             initialize_history(&handle);
 
             match tray::build(&handle) {
@@ -592,6 +783,19 @@ pub fn run() {
 
             start_finalize_worker(&handle);
             start_hotkey_controller(&handle);
+            start_retention_timer(&handle);
+
+            // ウィンドウは tauri.conf.json で非表示にして作られる。
+            // 「出してから隠す」と一瞬フラッシュするので、出す側を明示する。
+            let first_run = handle.state::<AppState>().config.is_first_run();
+            if first_run || !cfg.start_hidden {
+                if first_run {
+                    log::info!("初回起動のため設定ウィンドウを表示します");
+                }
+                tray::show_main_window(&handle);
+            } else {
+                log::info!("トレイ常駐で起動しました (ウィンドウ非表示)");
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -650,7 +854,7 @@ fn drain_pending_finalizations(rx: &Receiver<WorkerJob>, dir: &std::path::Path) 
     let mut recovered = 0;
     // try_recv なのでキューが空になれば即抜ける (終了処理を止めない)。
     while let Ok(job) = rx.try_recv() {
-        // 再転写待ちは WAV がディスク上にあるので失うものが無い。
+        // 再転写・保持期限は失うものが無い (WAV はディスク上にある)。
         let WorkerJob::Finalize(job) = job else {
             continue;
         };
@@ -995,6 +1199,10 @@ fn finalize_worker(app: AppHandle, rx: Receiver<WorkerJob>) {
     while let Ok(job) = rx.recv() {
         match job {
             WorkerJob::Finalize(job) => process_job(&app, *job),
+            WorkerJob::EnforceRetention => {
+                let days = app.state::<AppState>().config.snapshot().history_retention_days;
+                enforce_retention(&app, days);
+            }
             WorkerJob::Retranscribe { id } => {
                 // 録音中なら「録音中」表示を奪わない (再転写は裏方の作業)。
                 // 出どころを Background にして、オーバーレイには映さない
@@ -1003,7 +1211,7 @@ fn finalize_worker(app: AppHandle, rx: Receiver<WorkerJob>) {
                     set_status_from(&app, Status::Processing, None, StatusOrigin::Background);
                 }
                 if guard_panic("再転写", || retranscribe(&app, id)).is_none() {
-                    emit_error(&app, "再転写中に内部エラーが発生しました");
+                    emit_background_error(&app, "再転写中に内部エラーが発生しました");
                 }
                 // panic しても進行中の印は必ず外す (二度と再転写できなくなる)。
                 if let Ok(mut running) = app.state::<AppState>().retranscribing.lock() {
@@ -1129,11 +1337,6 @@ fn transcribe_and_format(
     let cfg = state.config.snapshot();
     let started = Instant::now();
 
-    // キーが無い場合も同じ経路を通す。GroqStt が MissingApiKey を返し、
-    // ユーザーには「キーを設定してください」という文言で届く。
-    let groq_key = cfg.groq_key().secret.unwrap_or_default();
-    let stt_client = GroqStt::new(http.clone(), &cfg.groq_endpoint, &cfg.stt_model, groq_key);
-
     // 整形が有効なら、キーが無くても Formatter を作る。
     // そうすることで「キー未設定」が Disabled ではなく
     // RawFallback(理由つき) として UI に出る。
@@ -1163,23 +1366,22 @@ fn transcribe_and_format(
     }
 
     let entries = cfg.dictionary_entries();
-    let outcome = pipeline::run(
-        &pipeline::PipelineInput {
-            wav: &recording.wav_bytes,
-            language: &cfg.language,
-            dictionary: &entries,
-            style: profile.map(|p| p.instruction.as_str()),
-            // 前景が取れなかった録音では "<unknown>" が入る。
-            // それをアプリ名としてプロンプトへ載せても意味が無い。
-            app: recording
-                .target
-                .is_known()
-                .then(|| recording.target_process()),
-            context: screen_context.as_prompt_text(),
-        },
-        &stt_client,
-        formatter.as_ref().map(|f| f as &dyn format::TextFormatter),
-    );
+    let input = pipeline::PipelineInput {
+        wav: &recording.wav_bytes,
+        language: &cfg.language,
+        dictionary: &entries,
+        style: profile.map(|p| p.instruction.as_str()),
+        // 前景が取れなかった録音では "<unknown>" が入る。
+        // それをアプリ名としてプロンプトへ載せても意味が無い。
+        app: recording
+            .target
+            .is_known()
+            .then(|| recording.target_process()),
+        context: screen_context.as_prompt_text(),
+    };
+    let formatter_ref = formatter.as_ref().map(|f| f as &dyn format::TextFormatter);
+
+    let outcome = run_stt_pipeline(app, &cfg, &input, formatter_ref);
 
     match outcome {
         Ok(result) => {
@@ -1373,6 +1575,98 @@ fn notify(app: &AppHandle, level: Notice, message: &str) {
     }
 }
 
+/// 設定に従って STT を選び、パイプラインを回す。
+///
+/// **新規録音と再転写の両方がここを通る。** 片方だけが設定を見ていないと、
+/// 「ローカルのみ」を選んだ人の音声がクラウドへ出てしまう
+/// (実際に再転写だけがモードを見ておらず、そうなっていた)。
+fn run_stt_pipeline(
+    app: &AppHandle,
+    cfg: &config::Config,
+    input: &pipeline::PipelineInput<'_>,
+    formatter: Option<&dyn format::TextFormatter>,
+) -> Result<pipeline::PipelineResult, stt::SttError> {
+    let plan = local_stt::EnginePlan::from_mode(cfg.local_stt_mode);
+
+    if !plan.use_cloud {
+        // ローカルのみ: クラウドのクライアントを**作りもしない**。
+        log::info!("ローカルのみモードのため、音声はクラウドへ送りません");
+        return run_with_local_stt(app, input, formatter, None);
+    }
+
+    let Some(http) = app.state::<AppState>().http.clone() else {
+        return Err(stt::SttError::Network(
+            "HTTP クライアントを構築できませんでした".to_string(),
+        ));
+    };
+    let stt_client = GroqStt::new(
+        http,
+        &cfg.groq_endpoint,
+        &cfg.stt_model,
+        // キーが無い場合も同じ経路を通す。GroqStt が MissingApiKey を返す。
+        cfg.groq_key().secret.unwrap_or_default(),
+    );
+
+    match pipeline::run(input, &stt_client, formatter) {
+        Err(e) if plan.use_local && local_stt::should_fall_back(&e) => {
+            log::warn!("Groq が使えないためローカル認識へ切り替えます: {e}");
+            notify(
+                app,
+                Notice::Informational,
+                "クラウド認識が使えないため、ローカルで認識します (時間がかかります)",
+            );
+            run_with_local_stt(app, input, formatter, Some(&e))
+        }
+        other => other,
+    }
+}
+
+/// ローカルモデルで転写してからパイプラインの続きを回す。
+///
+/// `cloud_error` は「なぜローカルへ来たか」(`None` はローカルのみモード)。
+/// ローカルも使えない場合は、**元のクラウド側の失敗を返す** —
+/// 「モデルが無い」より「ネットワークが繋がらない」の方が効く情報だから。
+/// ローカルのみモードでは Groq のキーの話をしない (誤誘導になる)。
+fn run_with_local_stt(
+    app: &AppHandle,
+    input: &pipeline::PipelineInput<'_>,
+    formatter: Option<&dyn format::TextFormatter>,
+    cloud_error: Option<&stt::SttError>,
+) -> Result<pipeline::PipelineResult, stt::SttError> {
+    let models_dir = app.state::<AppState>().models_dir.clone();
+    let availability = local_stt::availability(&models_dir);
+    if !availability.is_ready() {
+        log::warn!("ローカル認識も使えません: {}", availability.message());
+        return Err(match cloud_error {
+            // クラウドから落ちてきた場合は、そちらの理由の方が効く
+            // (「モデルが無い」より「ネットワークが繋がらない」)。
+            Some(e) => e.clone(),
+            // ローカルのみモードで来た場合は、Groq のキーの話をしない。
+            None => stt::SttError::Decode(availability.message()),
+        });
+    }
+
+    let local = LocalStt {
+        models_dir,
+    };
+    pipeline::run(input, &local, formatter)
+}
+
+/// [`local_stt`] を [`stt::SpeechToText`] として使うためのラッパ。
+struct LocalStt {
+    models_dir: PathBuf,
+}
+
+impl stt::SpeechToText for LocalStt {
+    fn transcribe(
+        &self,
+        request: &stt::TranscribeRequest<'_>,
+    ) -> Result<stt::Transcript, stt::SttError> {
+        // ローカルモデルは prompt を使わない (辞書バイアスは整形側で効かせる)。
+        local_stt::transcribe(&self.models_dir, request.wav, request.language)
+    }
+}
+
 /// 履歴へ 1 件書く (R4: 注入前)。
 ///
 /// 書けなければ `None` を返し、呼び出し側は注入を続ける。
@@ -1485,6 +1779,29 @@ fn record_untranscribed(
     }
 }
 
+/// 保持期限の定期執行を始める。
+///
+/// 常駐アプリは何日も起動しっぱなしになる。「起動時 + 録音時」だけでは、
+/// 録音せずに放置した場合に「30 日保持」の約束が守られない期間が延々と続く。
+///
+/// 実行はワーカーへ投げる (DB を触るのはワーカーと短命接続だけ、という
+/// 取り決めを守るため)。
+fn start_retention_timer(app: &AppHandle) {
+    let tx = app.state::<AppState>().finalize_tx.clone();
+    let spawned = thread::Builder::new()
+        .name("nox-retention".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(RETENTION_INTERVAL);
+            // 受け手が落ちていればループを畳む。
+            if tx.send(WorkerJob::EnforceRetention).is_err() {
+                break;
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("保持期限の定期実行を開始できません: {e}");
+    }
+}
+
 /// 保持期限を執行する。起動時だけでなく録音のたびにも通す。
 ///
 /// 常駐アプリは何日も起動しっぱなしになる。起動時だけの執行では
@@ -1516,7 +1833,8 @@ fn handle_captured_key(app: &AppHandle, vk: u32) {
         emit_error(
             app,
             &format!(
-                "「{label}」はホットキーに使えません。押している間ずっと入力先へ流れてしまいます。\n                 Ctrl / Alt / Shift / Win / CapsLock / F1〜F12 などから選んでください"
+                "「{label}」はホットキーに使えません。押している間ずっと入力先へ流れてしまいます。\n\
+Ctrl / Alt / Shift / Win / CapsLock / F1〜F12 などから選んでください"
             ),
         );
         return;
@@ -1680,11 +1998,11 @@ fn retranscribe(app: &AppHandle, id: i64) {
     let wav_path = match state.history.wav_path(id) {
         Ok(Some(p)) => p,
         Ok(None) => {
-            emit_error(app, "この履歴には再転写できる音声がありません");
+            emit_background_error(app, "この履歴には再転写できる音声がありません");
             return;
         }
         Err(e) => {
-            emit_error(app, &format!("履歴を読めません: {e}"));
+            emit_background_error(app, &format!("履歴を読めません: {e}"));
             return;
         }
     };
@@ -1692,39 +2010,36 @@ fn retranscribe(app: &AppHandle, id: i64) {
     let wav = match std::fs::read(&wav_path) {
         Ok(bytes) => bytes,
         Err(e) => {
-            emit_error(app, &format!("退避した音声を読めません ({wav_path}): {e}"));
+            emit_background_error(app, &format!("退避した音声を読めません ({wav_path}): {e}"));
             return;
         }
     };
 
-    let Some(http) = state.http.clone() else {
-        emit_error(app, "HTTP クライアントを構築できなかったため再転写できません");
-        return;
-    };
     let cfg = state.config.snapshot();
-    let stt_client = GroqStt::new(
-        http.clone(),
-        &cfg.groq_endpoint,
-        &cfg.stt_model,
-        cfg.groq_key().secret.unwrap_or_default(),
-    );
-    let formatter = cfg.formatting_enabled.then(|| {
-        GeminiFormatter::new(
-            http,
-            cfg.gemini_url(),
-            cfg.gemini_key().secret.unwrap_or_default(),
-        )
-        .with_timeout(format::FORMAT_TIMEOUT)
-    });
+    // 整形はクラウドのみ。ローカルのみモードでも整形は使う
+    // (テキストの送信は R1 で受容済み。**音声**を出さないことが要点)。
+    let formatter = match (cfg.formatting_enabled, state.http.clone()) {
+        (true, Some(http)) => Some(
+            GeminiFormatter::new(
+                http,
+                cfg.gemini_url(),
+                cfg.gemini_key().secret.unwrap_or_default(),
+            )
+            .with_timeout(format::FORMAT_TIMEOUT),
+        ),
+        _ => None,
+    };
 
     // 再転写では画面コンテキストを使わない。録音時の画面はもう無く、
     // 今の画面を混ぜると当時と違う文脈で整形してしまう。
     let entries = cfg.dictionary_entries();
     let mut input = pipeline::PipelineInput::new(&wav, &cfg.language);
     input.dictionary = &entries;
-    match pipeline::run(
+    // 新規録音と同じ経路。ここを別実装にすると設定の見落としが起きる。
+    match run_stt_pipeline(
+        app,
+        &cfg,
         &input,
-        &stt_client,
         formatter.as_ref().map(|f| f as &dyn format::TextFormatter),
     ) {
         Ok(result) => {
@@ -1760,7 +2075,7 @@ fn retranscribe(app: &AppHandle, id: i64) {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    emit_error(app, &format!("再転写の結果を保存できません: {e}"));
+                    emit_background_error(app, &format!("再転写の結果を保存できません: {e}"));
                     return;
                 }
             }
@@ -1768,7 +2083,7 @@ fn retranscribe(app: &AppHandle, id: i64) {
         }
         Err(e) => {
             // 音声は退避先に残ったままなので、もう一度試せる。
-            emit_error(app, &format!("再転写に失敗しました: {e}"));
+            emit_background_error(app, &format!("再転写に失敗しました: {e}"));
         }
     }
 }
@@ -1957,13 +2272,34 @@ fn set_status_from(
     }
 }
 
-/// ユーザー可視のエラーをフロントへ送る。
+/// 録音の流れで起きたエラーをフロントへ送る。小窓にも出す。
 fn emit_error(app: &AppHandle, message: &str) {
-    if let Err(e) = app.emit(EVENT_ERROR, message) {
+    emit_error_from(app, message, StatusOrigin::Recording);
+}
+
+/// 裏方の作業で起きたエラー。**小窓には出さない。**
+///
+/// 再転写や履歴操作の失敗を小窓に出すと、録音中なら表示を乗っ取り、
+/// さらに `hide_after` が録音中の小窓を消してしまう。
+fn emit_background_error(app: &AppHandle, message: &str) {
+    emit_error_from(app, message, StatusOrigin::Background);
+}
+
+/// 出どころを明示してエラーを送る。
+fn emit_error_from(app: &AppHandle, message: &str, origin: StatusOrigin) {
+    if let Err(e) = app.emit(
+        EVENT_ERROR,
+        ErrorPayload {
+            message: message.to_string(),
+            origin,
+        },
+    ) {
         log::warn!("エラーイベントの送出に失敗: {e}");
     }
-    // エラーで小窓が出しっぱなしにならないよう、必ず畳む対を用意する。
-    overlay::hide_after(app, OVERLAY_ERROR_LINGER);
+    // 小窓に出したものだけ、畳む対を予約する。
+    if origin == StatusOrigin::Recording {
+        overlay::hide_after(app, OVERLAY_ERROR_LINGER);
+    }
 }
 
 #[cfg(test)]

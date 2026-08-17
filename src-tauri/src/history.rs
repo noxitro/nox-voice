@@ -314,17 +314,53 @@ impl HistoryStore {
         .map_err(|e| HistoryError::Query(e.to_string()))
     }
 
+    /// 検索語を LIKE パターンへ変換する。
+    ///
+    /// `%` と `_` は LIKE のワイルドカード。ユーザーが「50%」や「a_b」を
+    /// 探したときに全件マッチしないよう、`ESCAPE` 付きで無害化する。
+    /// バインドパラメータは維持する (文字列連結で SQL を組まない)。
+    pub fn like_pattern(query: &str) -> String {
+        let mut escaped = String::with_capacity(query.len() + 2);
+        for ch in query.chars() {
+            // エスケープ文字自身も含めて 3 種を退避する。
+            if matches!(ch, '\\' | '%' | '_') {
+                escaped.push('\\');
+            }
+            escaped.push(ch);
+        }
+        format!("%{escaped}%")
+    }
+
     /// 新しい順に取り出す。`before_id` を渡すとそれより古い行から続きを返す。
     ///
-    /// **失敗時に空の `Vec` を返さない。** 読めなかったことと
-    /// 0 件であることは、UI にとってまったく違う情報。
+    /// 絞り込みなしの [`HistoryStore::search`] と同じ。テストと内部利用向け。
+    #[cfg(test)]
     pub fn recent(
         &self,
         limit: u32,
         before_id: Option<i64>,
     ) -> Result<Vec<SessionRow>, HistoryError> {
+        self.search(limit, before_id, None)
+    }
+
+    /// 新しい順に取り出す。`query` を渡すと本文・挿入先を部分一致で絞る。
+    ///
+    /// **失敗時に空の `Vec` を返さない。** 読めなかったことと
+    /// 0 件であることは、UI にとってまったく違う情報。
+    ///
+    /// 大文字小文字は SQLite の `LIKE` の既定 (ASCII は区別しない) に従う。
+    pub fn search(
+        &self,
+        limit: u32,
+        before_id: Option<i64>,
+        query: Option<&str>,
+    ) -> Result<Vec<SessionRow>, HistoryError> {
         let conn = self.connect()?;
         let limit = limit.clamp(1, 500) as i64;
+        let pattern = query
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .map(Self::like_pattern);
 
         let mut stmt = conn
             .prepare(
@@ -334,17 +370,89 @@ impl HistoryStore {
                         wav_path, created_at_ms
                    FROM sessions
                   WHERE (?2 IS NULL OR id < ?2)
+                    AND (?3 IS NULL
+                         OR raw_text       LIKE ?3 ESCAPE '\\'
+                         OR formatted_text LIKE ?3 ESCAPE '\\'
+                         OR target_process LIKE ?3 ESCAPE '\\')
                   ORDER BY id DESC
                   LIMIT ?1",
             )
             .map_err(|e| HistoryError::Query(e.to_string()))?;
 
         let rows = stmt
-            .query_map(params![limit, before_id], row_to_session)
+            .query_map(params![limit, before_id, pattern], row_to_session)
             .map_err(|e| HistoryError::Query(e.to_string()))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| HistoryError::Query(e.to_string()))?;
         Ok(rows)
+    }
+
+    /// 未転写行 (退避 WAV を持つ行) をまとめて消す。
+    ///
+    /// ファイルも一緒に消す ([`HistoryStore`] の所有権ルール)。
+    pub fn delete_untranscribed(&self) -> Result<Removal, HistoryError> {
+        let conn = self.connect()?;
+        // (id, wav_path) で拾う。**id を持ち回るのが要点** —
+        // 条件式で消し直すと、その間にワーカーが登録した新しい失敗録音まで
+        // 巻き込み、ファイルを残したまま行だけ消えて次回起動で復活する。
+        let targets: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, wav_path FROM sessions
+                      WHERE wav_path IS NOT NULL AND outcome = ?1",
+                )
+                .map_err(|e| HistoryError::Query(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![OUTCOME_UNTRANSCRIBED], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| HistoryError::Query(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| HistoryError::Query(e.to_string()))?;
+            rows
+        };
+
+        let mut removed = 0usize;
+        let mut failures = Vec::new();
+        let mut deletable: Vec<i64> = Vec::new();
+        for (id, path) in targets {
+            match remove_wav_files(&path) {
+                Ok(()) => {
+                    removed += 1;
+                    deletable.push(id);
+                }
+                Err(e) => {
+                    log::error!("退避 WAV を削除できません: {e}");
+                    failures.push(path);
+                }
+            }
+        }
+
+        // ファイルを手放せた行だけを、id 指定で消す。
+        let mut rows = 0u64;
+        for id in deletable {
+            rows += conn
+                .execute("DELETE FROM sessions WHERE id = ?1", params![id])
+                .map_err(|e| HistoryError::Query(e.to_string()))? as u64;
+        }
+
+        Ok(Removal {
+            rows,
+            wavs_removed: removed,
+            wav_failures: failures,
+        })
+    }
+
+    /// 未転写行の件数。
+    pub fn untranscribed_count(&self) -> Result<u64, HistoryError> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE outcome = ?1",
+            params![OUTCOME_UNTRANSCRIBED],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|v| v as u64)
+        .map_err(|e| HistoryError::Query(e.to_string()))
     }
 
     /// 1 件取得。
@@ -392,8 +500,17 @@ impl HistoryStore {
     /// 次の起動で「知らないファイル」として取り込まれ、削除したはずの履歴が
     /// 復活する。
     pub fn delete(&self, id: i64) -> Result<Removal, HistoryError> {
-        let paths = self.wav_path(id)?.into_iter().collect::<Vec<_>>();
-        let (removed, failures) = release_wavs(&paths);
+        let mut removed = 0usize;
+        let mut failures = Vec::new();
+        if let Some(path) = self.wav_path(id)? {
+            match remove_wav_files(&path) {
+                Ok(()) => removed += 1,
+                Err(e) => {
+                    log::error!("退避 WAV を削除できません: {e}");
+                    failures.push(path);
+                }
+            }
+        }
         if !failures.is_empty() {
             // 所有ファイルを手放せていないので行は残す。
             return Ok(Removal {
@@ -419,23 +536,59 @@ impl HistoryStore {
     /// 退避 WAV も消す。残すと次の起動で復活し、「すべて削除」が嘘になる。
     /// 消せなかったファイルを持つ行だけは残し、その事実を返す。
     pub fn clear(&self) -> Result<Removal, HistoryError> {
-        let owned = self.owned_wav_paths(None)?;
-        let (removed, failures) = release_wavs(&owned);
-
         let conn = self.connect()?;
-        // 消せなかったファイルを持つ行は残す (孤児を作らない)。
-        let rows = if failures.is_empty() {
-            conn.execute("DELETE FROM sessions", [])
-        } else {
-            let keep = failures.join("\u{1}");
-            conn.execute(
-                "DELETE FROM sessions
-                  WHERE wav_path IS NULL
-                     OR instr(?1, wav_path) = 0",
-                params![keep],
-            )
+        // 音声を持つ行は id つきで拾う。パスの部分一致で生存判定すると、
+        // 別のパスの部分文字列になっている行まで巻き添えにする。
+        let owned: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, wav_path FROM sessions WHERE wav_path IS NOT NULL")
+                .map_err(|e| HistoryError::Query(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+                .map_err(|e| HistoryError::Query(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| HistoryError::Query(e.to_string()))?;
+            rows
+        };
+
+        let mut removed = 0usize;
+        let mut failures = Vec::new();
+        let mut stuck: Vec<i64> = Vec::new();
+        for (id, path) in owned {
+            match remove_wav_files(&path) {
+                Ok(()) => removed += 1,
+                Err(e) => {
+                    log::error!("退避 WAV を削除できません: {e}");
+                    failures.push(path);
+                    stuck.push(id);
+                }
+            }
         }
-        .map_err(|e| HistoryError::Query(e.to_string()))? as u64;
+
+        // ファイルを手放せなかった行だけ残す (孤児を作らない)。
+        let rows = if stuck.is_empty() {
+            conn.execute("DELETE FROM sessions", [])
+                .map_err(|e| HistoryError::Query(e.to_string()))? as u64
+        } else {
+            let ids: Vec<i64> = {
+                let mut stmt = conn
+                    .prepare("SELECT id FROM sessions")
+                    .map_err(|e| HistoryError::Query(e.to_string()))?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, i64>(0))
+                    .map_err(|e| HistoryError::Query(e.to_string()))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| HistoryError::Query(e.to_string()))?;
+                rows
+            };
+            let mut deleted = 0u64;
+            for id in ids.into_iter().filter(|id| !stuck.contains(id)) {
+                deleted += conn
+                    .execute("DELETE FROM sessions WHERE id = ?1", params![id])
+                    .map_err(|e| HistoryError::Query(e.to_string()))? as u64;
+            }
+            deleted
+        };
 
         Ok(Removal {
             rows,
@@ -472,25 +625,7 @@ impl HistoryStore {
         .map_err(|e| HistoryError::Query(e.to_string()))
     }
 
-    /// 行が所有している WAV のパス一覧。`before_cutoff` を渡すとそれより古い行だけ。
-    fn owned_wav_paths(&self, before_cutoff: Option<u64>) -> Result<Vec<String>, HistoryError> {
-        let conn = self.connect()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT wav_path FROM sessions
-                  WHERE wav_path IS NOT NULL
-                    AND (?1 IS NULL OR started_at_ms < ?1)",
-            )
-            .map_err(|e| HistoryError::Query(e.to_string()))?;
-        let paths = stmt
-            .query_map(params![before_cutoff.map(|v| v as i64)], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|e| HistoryError::Query(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| HistoryError::Query(e.to_string()))?;
-        Ok(paths)
-    }
+
 }
 
 /// 削除の結果。行とファイルの両方について報告する。
@@ -533,22 +668,6 @@ fn remove_if_exists(path: &std::path::Path) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
-}
-
-/// まとめて WAV を手放す。戻り値は (消せた数, 消せなかったパス)。
-fn release_wavs(paths: &[String]) -> (usize, Vec<String>) {
-    let mut removed = 0;
-    let mut failures = Vec::new();
-    for path in paths {
-        match remove_wav_files(path) {
-            Ok(()) => removed += 1,
-            Err(e) => {
-                log::error!("退避 WAV を削除できません: {e}");
-                failures.push(path.clone());
-            }
-        }
-    }
-    (removed, failures)
 }
 
 /// 保持期限の境界時刻 (これより古い行は消す)。純関数なのでテストできる。
@@ -894,6 +1013,126 @@ mod tests {
         // 回収済みの行は通常の録音と同じ状態 (音声なし) に収束する。
         assert!(!row.has_audio, "wav_path を持ったままだと幽霊行の元になる");
         assert_eq!(db.store.wav_path(id).expect("読める"), None);
+    }
+
+    // --- 検索 ---
+
+    #[test]
+    fn search_matches_body_and_target() {
+        let db = TempDb::new("search");
+        let mut a = draft(1);
+        a.raw_text = Some("会議の議事録です".to_string());
+        a.formatted_text = Some("会議の議事録です。".to_string());
+        a.target_process = "slack.exe".to_string();
+        let id_a = db.store.insert(&a).expect("書ける");
+
+        let mut b = draft(2);
+        b.raw_text = Some("買い物のメモ".to_string());
+        b.formatted_text = Some("買い物のメモ。".to_string());
+        b.target_process = "notepad.exe".to_string();
+        let id_b = db.store.insert(&b).expect("書ける");
+
+        let hits = db.store.search(50, None, Some("議事録")).expect("読める");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, id_a);
+
+        // 挿入先アプリ名でも引ける。
+        let hits = db.store.search(50, None, Some("notepad")).expect("読める");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, id_b);
+
+        // 空・空白は絞り込みなし。
+        assert_eq!(db.store.search(50, None, Some("  ")).expect("読める").len(), 2);
+        assert_eq!(db.store.search(50, None, None).expect("読める").len(), 2);
+    }
+
+    #[test]
+    fn search_is_case_insensitive_for_ascii() {
+        let db = TempDb::new("search-case");
+        let mut d = draft(1);
+        d.target_process = "Slack.exe".to_string();
+        db.store.insert(&d).expect("書ける");
+        assert_eq!(db.store.search(50, None, Some("slack")).expect("読める").len(), 1);
+        assert_eq!(db.store.search(50, None, Some("SLACK")).expect("読める").len(), 1);
+    }
+
+    #[test]
+    fn wildcards_in_the_query_are_literal() {
+        // `%` を打った人は「%」を含む発話を探している。全件返してはいけない。
+        let db = TempDb::new("search-escape");
+        let mut with = draft(1);
+        with.formatted_text = Some("達成率は50%でした。".to_string());
+        let id = db.store.insert(&with).expect("書ける");
+        let mut without = draft(2);
+        without.formatted_text = Some("達成率は半分でした。".to_string());
+        db.store.insert(&without).expect("書ける");
+
+        let hits = db.store.search(50, None, Some("50%")).expect("読める");
+        assert_eq!(hits.len(), 1, "ワイルドカード扱いで全件返った");
+        assert_eq!(hits[0].id, id);
+
+        // `_` も同様 (1 文字ワイルドカードにしない)。
+        let hits = db.store.search(50, None, Some("5_%")).expect("読める");
+        assert!(hits.is_empty(), "アンダースコアが 1 文字ワイルドカードになっている");
+    }
+
+    #[test]
+    fn like_pattern_escapes_the_special_characters() {
+        assert_eq!(HistoryStore::like_pattern("abc"), "%abc%");
+        assert_eq!(HistoryStore::like_pattern("50%"), "%50\\%%");
+        assert_eq!(HistoryStore::like_pattern("a_b"), "%a\\_b%");
+        // エスケープ文字自身も退避する。
+        assert_eq!(HistoryStore::like_pattern("a\\b"), "%a\\\\b%");
+    }
+
+    #[test]
+    fn search_pages_like_recent_does() {
+        let db = TempDb::new("search-page");
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let mut d = draft(i);
+            d.formatted_text = Some(format!("共通語 {i}"));
+            ids.push(db.store.insert(&d).expect("書ける"));
+        }
+        let page1 = db.store.search(3, None, Some("共通語")).expect("読める");
+        assert_eq!(page1.len(), 3);
+        let page2 = db
+            .store
+            .search(3, Some(page1[2].id), Some("共通語"))
+            .expect("読める");
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2[1].id, ids[0]);
+    }
+
+    // --- 未転写のまとめ削除 ---
+
+    #[test]
+    fn deleting_untranscribed_rows_removes_their_audio_only() {
+        let db = TempDb::new("delete-untranscribed");
+        let (pending_id, wav) = seed_pending(&db, "pending");
+        let kept_id = db.store.insert(&draft(now_ms())).expect("書ける");
+
+        assert_eq!(db.store.untranscribed_count().expect("読める"), 1);
+        let removal = db.store.delete_untranscribed().expect("消せる");
+        assert_eq!(removal.rows, 1);
+        assert_eq!(removal.wavs_removed, 1);
+        assert!(!wav.exists(), "WAV が残っている");
+        assert!(db.store.get(pending_id).expect("読める").is_none());
+        assert!(
+            db.store.get(kept_id).expect("読める").is_some(),
+            "転写済みの行まで消した"
+        );
+        assert_eq!(db.store.untranscribed_count().expect("読める"), 0);
+    }
+
+    #[test]
+    fn deleting_untranscribed_when_there_are_none_is_a_no_op() {
+        let db = TempDb::new("delete-untranscribed-empty");
+        db.store.insert(&draft(now_ms())).expect("書ける");
+        let removal = db.store.delete_untranscribed().expect("消せる");
+        assert_eq!(removal.rows, 0);
+        assert!(removal.is_complete());
+        assert_eq!(db.store.count().expect("読める"), 1);
     }
 
     // --- 削除と保持ポリシー ---

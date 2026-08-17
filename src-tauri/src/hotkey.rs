@@ -537,8 +537,12 @@ pub fn is_allowed_hotkey(vk: u32) -> bool {
         | 0x14 | 0x91 | 0x13
         // F1..F24
         | 0x70..=0x87
-        // IME 系: 変換 / 無変換 / かな / 半角全角
-        | 0x1C | 0x1D | 0x15 | 0xF3 | 0xF4
+        // IME 系: 変換 / 無変換
+        //
+        // 半角/全角 (0xF3 / 0xF4) は**押すたびに別の VK が来る**ため除外する。
+        // 片方だけを登録すると 2 回に 1 回しか効かない。
+        // かな (0x15) も、実キーが返す 0xF2 と対応が取れないので外す。
+        | 0x1C | 0x1D
     )
 }
 
@@ -737,7 +741,7 @@ mod tests {
     #[test]
     fn modifier_and_function_keys_are_accepted() {
         // 押しっぱなしでも挿入先に実害が出ないキー。
-        for vk in [0xA3, 0xA5, 0xA0, 0x5B, 0x5D, 0x14, 0x91, 0x13, 0x70, 0x87, 0x1D, 0x15] {
+        for vk in [0xA3, 0xA5, 0xA0, 0x5B, 0x5D, 0x14, 0x91, 0x13, 0x70, 0x87, 0x1C, 0x1D] {
             assert_eq!(decide_capture(vk), CaptureOutcome::Accept(vk), "VK 0x{vk:02X}");
         }
     }
@@ -760,6 +764,19 @@ mod tests {
             CaptureOutcome::Rejected(label) => assert_eq!(label, "Enter"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn toggling_ime_keys_are_rejected() {
+        // 半角/全角は押すたびに 0xF3 と 0xF4 が交互に来る。片方を登録すると
+        // 2 回に 1 回しか効かないホットキーになる。
+        assert!(!is_allowed_hotkey(0xF3));
+        assert!(!is_allowed_hotkey(0xF4));
+        // かな (0x15) は実キーの 0xF2 と対応が取れない。
+        assert!(!is_allowed_hotkey(0x15));
+        // 変換 / 無変換は 1 キー 1 VK なので使える。
+        assert!(is_allowed_hotkey(0x1C));
+        assert!(is_allowed_hotkey(0x1D));
     }
 
     #[test]

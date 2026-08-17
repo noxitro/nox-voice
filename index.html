@@ -78,6 +78,14 @@
           </button>
         </div>
 
+        <input
+          type="search"
+          id="history-search"
+          class="search"
+          placeholder="本文・挿入先アプリで検索"
+          autocomplete="off"
+        />
+
         <p class="empty" id="history-empty">履歴はまだありません</p>
         <p class="error" id="history-error" hidden></p>
 
@@ -164,6 +172,10 @@
             などから選んでください。Esc で取り消せます。
           </p>
           <label class="checkbox">
+            <input type="checkbox" id="start-hidden" />
+            <span>起動時はウィンドウを出さない(トレイに常駐)</span>
+          </label>
+          <label class="checkbox">
             <input type="checkbox" id="overlay-enabled" />
             <span>録音中に小窓を表示する(クリックは下のアプリへ抜けます)</span>
           </label>
@@ -200,6 +212,31 @@
             利用されます。機密を扱う場合は整形をオフにするか有料ティアの
             キーを使ってください。
           </p>
+
+          <label>
+            <span>ローカル認識(クラウドが使えないときの代替)</span>
+            <select id="local-stt-mode">
+              <option value="off">使わない</option>
+              <option value="fallback">クラウドが失敗したときだけ使う</option>
+              <option value="only">常にローカルで認識(音声を外へ送らない)</option>
+            </select>
+          </label>
+          <div class="storage" id="local-stt">
+            <span id="local-stt-text">確認中…</span>
+            <button type="button" id="local-stt-download">モデルをダウンロード</button>
+          </div>
+          <p class="warn" id="local-stt-note">
+            モデルは約 1GB です。CPU のみで動くため、認識には
+            <strong>録音時間の数倍</strong>かかります(1 分の録音で数分が目安)。
+            クラウドが使えるときはそちらの方が速く正確です。
+          </p>
+
+          <div class="storage" id="storage">
+            <span id="storage-text">退避した録音: 集計中…</span>
+            <button type="button" id="storage-clear" class="danger">
+              未転写の録音をすべて削除
+            </button>
+          </div>
         </form>
       </details>
     </main>

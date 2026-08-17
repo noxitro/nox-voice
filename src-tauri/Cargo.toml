@@ -41,3 +41,17 @@ windows = { version = "0.62", features = [
 reqwest = { version = "0.13", features = ["blocking", "json", "multipart"] }
 tauri-plugin-notification = "2.3.3"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+whisper-rs = { version = "0.16", default-features = false, optional = true }
+sha2 = "0.11.0"
+
+[features]
+default = []
+
+# ローカル STT (whisper.cpp バインディング)。
+#
+# 既定で無効にしてあるのは、whisper.cpp のビルドに CMake と C++ ツールチェーンが
+# 要り、環境によっては通らないため。ネットワークや API キーが使えないときの
+# 代替手段なので、本体のビルドを人質に取らせない。
+#
+#   cargo build --features local-stt
+local-stt = ["dep:whisper-rs"]

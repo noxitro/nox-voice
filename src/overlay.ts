@@ -19,6 +19,11 @@ interface StatusPayload {
   origin: StatusOrigin;
 }
 
+interface ErrorPayload {
+  message: string;
+  origin: StatusOrigin;
+}
+
 interface ResultPayload {
   text: string;
   stt_ms: number;
@@ -147,8 +152,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     setState("done", label, r.degraded ? `${timing}(整形なし)` : timing);
   });
 
-  await listen<string>("nox://error", (event) => {
-    const first = event.payload.split("\n")[0] ?? "エラー";
+  await listen<ErrorPayload>("nox://error", (event) => {
+    // 裏方 (再転写など) のエラーは映さない。録音中の表示を奪ってしまう。
+    if (event.payload.origin !== "recording") return;
+    const first = event.payload.message.split("\n")[0] ?? "エラー";
     setState("error", first.slice(0, 30), "詳細は履歴から確認できます");
   });
 
