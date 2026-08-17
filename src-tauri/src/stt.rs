@@ -88,12 +88,32 @@ pub struct Transcript {
     pub text: String,
 }
 
+/// 転写 1 回分の入力。
+#[derive(Debug, Clone, Default)]
+pub struct TranscribeRequest<'a> {
+    pub wav: &'a [u8],
+    /// 言語ヒント (ISO-639-1)。空なら自動判定に任せる。
+    pub language: &'a str,
+    /// 認識のバイアスに使うプロンプト。辞書と画面コンテキストから作る
+    /// ([`crate::dictionary::build_whisper_prompt`])。
+    pub prompt: Option<&'a str>,
+}
+
+impl<'a> TranscribeRequest<'a> {
+    pub fn new(wav: &'a [u8], language: &'a str) -> Self {
+        Self {
+            wav,
+            language,
+            prompt: None,
+        }
+    }
+}
+
 /// STT のインターフェース。
 ///
 /// トレイトにしてあるのは、上位のパイプラインを実 API なしでテストするため。
 pub trait SpeechToText: Send + Sync {
-    /// WAV バイト列を転写する。`language` が空なら自動判定に任せる。
-    fn transcribe(&self, wav: &[u8], language: &str) -> Result<Transcript, SttError>;
+    fn transcribe(&self, request: &TranscribeRequest<'_>) -> Result<Transcript, SttError>;
 }
 
 /// Groq 実装。
@@ -121,8 +141,8 @@ impl GroqStt {
         }
     }
 
-    fn send_once(&self, wav: &[u8], language: &str) -> Result<String, SttError> {
-        let part = reqwest::blocking::multipart::Part::bytes(wav.to_vec())
+    fn send_once(&self, request: &TranscribeRequest<'_>) -> Result<String, SttError> {
+        let part = reqwest::blocking::multipart::Part::bytes(request.wav.to_vec())
             .file_name("audio.wav")
             .mime_str("audio/wav")
             .map_err(|e| SttError::Decode(format!("multipart を組み立てられません: {e}")))?;
@@ -133,8 +153,12 @@ impl GroqStt {
             // M2 の用途 (本文だけ) には json で十分。
             .text("response_format", "json")
             .part("file", part);
-        if !language.trim().is_empty() {
-            form = form.text("language", language.trim().to_string());
+        if !request.language.trim().is_empty() {
+            form = form.text("language", request.language.trim().to_string());
+        }
+        // 固有名詞や文脈を先に見せて、誤変換自体を減らす。
+        if let Some(prompt) = request.prompt.map(str::trim).filter(|p| !p.is_empty()) {
+            form = form.text("prompt", prompt.to_string());
         }
 
         let response = self
@@ -157,7 +181,7 @@ impl GroqStt {
 }
 
 impl SpeechToText for GroqStt {
-    fn transcribe(&self, wav: &[u8], language: &str) -> Result<Transcript, SttError> {
+    fn transcribe(&self, request: &TranscribeRequest<'_>) -> Result<Transcript, SttError> {
         if self.api_key.is_empty() {
             return Err(SttError::MissingApiKey);
         }
@@ -166,7 +190,7 @@ impl SpeechToText for GroqStt {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.send_once(wav, language) {
+            match self.send_once(request) {
                 Ok(text) => {
                     log::info!(
                         "STT 完了: {} 文字 / {} ms / 試行 {attempt} 回",
@@ -373,7 +397,7 @@ mod tests {
     #[test]
     fn missing_key_fails_before_any_request() {
         let server = TestServer::start(vec![CannedResponse::ok(r#"{"text":"呼ばれないはず"}"#)]);
-        let result = stt(&server, "").transcribe(b"RIFFfake", "ja");
+        let result = stt(&server, "").transcribe(&TranscribeRequest::new(b"RIFFfake", "ja"));
         assert_eq!(result, Err(SttError::MissingApiKey));
         assert_eq!(server.request_count(), 0, "キー無しで送信してしまった");
     }
@@ -382,7 +406,7 @@ mod tests {
     fn sends_key_in_header_and_never_in_the_url() {
         let server = TestServer::start(vec![CannedResponse::ok(r#"{"text":"ok"}"#)]);
         stt(&server, "gsk_secret_key")
-            .transcribe(b"RIFFfake", "ja")
+            .transcribe(&TranscribeRequest::new(b"RIFFfake", "ja"))
             .expect("成功する");
 
         let requests = server.requests();
@@ -403,7 +427,7 @@ mod tests {
     #[test]
     fn sends_model_language_and_wav_as_multipart() {
         let server = TestServer::start(vec![CannedResponse::ok(r#"{"text":"ok"}"#)]);
-        stt(&server, "k").transcribe(b"RIFFWAVEDATA", "ja").expect("成功する");
+        stt(&server, "k").transcribe(&TranscribeRequest::new(b"RIFFWAVEDATA", "ja")).expect("成功する");
 
         let requests = server.requests();
         let req = requests.first().expect("1 件受信している");
@@ -420,9 +444,34 @@ mod tests {
     }
 
     #[test]
+    fn the_prompt_is_sent_when_present() {
+        let server = TestServer::start(vec![CannedResponse::ok(r#"{"text":"ok"}"#)]);
+        let mut request = TranscribeRequest::new(b"RIFF", "ja");
+        request.prompt = Some("nox-voice、Tauri");
+        stt(&server, "k").transcribe(&request).expect("成功する");
+
+        let requests = server.requests();
+        let body = requests.first().expect("1 件").body_lossy();
+        assert!(body.contains("name=\"prompt\""), "prompt を送っていない");
+        assert!(body.contains("nox-voice、Tauri"), "辞書が載っていない");
+    }
+
+    #[test]
+    fn a_blank_prompt_is_omitted() {
+        let server = TestServer::start(vec![CannedResponse::ok(r#"{"text":"ok"}"#)]);
+        let mut request = TranscribeRequest::new(b"RIFF", "ja");
+        request.prompt = Some("   ");
+        stt(&server, "k").transcribe(&request).expect("成功する");
+
+        let requests = server.requests();
+        let body = requests.first().expect("1 件").body_lossy();
+        assert!(!body.contains("name=\"prompt\""), "空の prompt を送った");
+    }
+
+    #[test]
     fn blank_language_is_omitted_for_auto_detection() {
         let server = TestServer::start(vec![CannedResponse::ok(r#"{"text":"ok"}"#)]);
-        stt(&server, "k").transcribe(b"RIFF", "  ").expect("成功する");
+        stt(&server, "k").transcribe(&TranscribeRequest::new(b"RIFF", "  ")).expect("成功する");
 
         let requests = server.requests();
         let body = requests.first().expect("1 件").body_lossy();
@@ -435,7 +484,7 @@ mod tests {
             CannedResponse::status(401, r#"{"error":{"message":"bad key"}}"#),
             CannedResponse::ok(r#"{"text":"届かないはず"}"#),
         ]);
-        let result = stt(&server, "wrong").transcribe(b"RIFF", "ja");
+        let result = stt(&server, "wrong").transcribe(&TranscribeRequest::new(b"RIFF", "ja"));
         assert!(matches!(result, Err(SttError::Unauthorized(_))), "{result:?}");
         assert_eq!(server.request_count(), 1, "認証エラーで再試行してしまった");
     }
@@ -447,7 +496,7 @@ mod tests {
             CannedResponse::ok(r#"{"text":"二回目で成功"}"#),
         ]);
         let transcript = stt(&server, "k")
-            .transcribe(b"RIFF", "ja")
+            .transcribe(&TranscribeRequest::new(b"RIFF", "ja"))
             .expect("再試行で成功する");
         assert_eq!(transcript.text, "二回目で成功");
         assert_eq!(server.request_count(), 2);
@@ -460,7 +509,7 @@ mod tests {
             CannedResponse::status(500, "boom again"),
             CannedResponse::ok(r#"{"text":"三回目は無い"}"#),
         ]);
-        let result = stt(&server, "k").transcribe(b"RIFF", "ja");
+        let result = stt(&server, "k").transcribe(&TranscribeRequest::new(b"RIFF", "ja"));
         assert!(matches!(result, Err(SttError::Server { status: 500, .. })), "{result:?}");
         assert_eq!(server.request_count(), 2, "再試行は 1 回だけのはず");
     }
@@ -472,7 +521,7 @@ mod tests {
             CannedResponse::slow(Duration::from_millis(1_500)),
             CannedResponse::slow(Duration::from_millis(1_500)),
         ]);
-        let result = stt(&server, "k").transcribe(b"RIFF", "ja");
+        let result = stt(&server, "k").transcribe(&TranscribeRequest::new(b"RIFF", "ja"));
         assert_eq!(result, Err(SttError::Timeout));
     }
 
@@ -494,7 +543,7 @@ mod tests {
             "whisper-large-v3",
             Secret::new("k"),
         );
-        let err = stt.transcribe(b"RIFF", "ja").expect_err("到達できないので失敗する");
+        let err = stt.transcribe(&TranscribeRequest::new(b"RIFF", "ja")).expect_err("到達できないので失敗する");
         assert!(
             matches!(err, SttError::Network(_) | SttError::Timeout),
             "想定外の失敗種別: {err:?}"
@@ -510,7 +559,7 @@ mod tests {
         ]);
         let key = "gsk_this_must_not_leak";
         let err = stt(&server, key)
-            .transcribe(b"RIFF", "ja")
+            .transcribe(&TranscribeRequest::new(b"RIFF", "ja"))
             .expect_err("失敗する");
         let rendered = format!("{err} / {err:?}");
         assert!(!rendered.contains(key), "エラー文にキーが漏れている: {rendered}");
@@ -537,7 +586,7 @@ mod tests {
             crate::config::DEFAULT_STT_MODEL,
             Secret::new(key),
         );
-        match stt.transcribe(&wav, "ja") {
+        match stt.transcribe(&TranscribeRequest::new(&wav, "ja")) {
             Ok(t) => println!("転写結果: {:?}", t.text),
             // 無音に近い音声なので Empty は想定内。疎通の確認が目的。
             Err(SttError::Empty) => println!("空の転写 (無音のため想定内)"),
@@ -569,7 +618,7 @@ mod tests {
             Secret::new(key),
         );
 
-        let transcript = stt.transcribe(&wav, "ja").expect("日本語音声を転写できる");
+        let transcript = stt.transcribe(&TranscribeRequest::new(&wav, "ja")).expect("日本語音声を転写できる");
         println!("生転写: {:?}", transcript.text);
 
         // 表記ゆれ (「明日」/「あした」など) はモデル任せなので、

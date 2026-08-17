@@ -27,6 +27,8 @@
 
 mod audio;
 mod config;
+mod context;
+mod dictionary;
 mod foreground;
 mod format;
 mod history;
@@ -35,6 +37,7 @@ mod inject;
 mod pipeline;
 mod session;
 mod stt;
+mod style;
 mod tray;
 
 #[cfg(test)]
@@ -57,7 +60,9 @@ use hotkey::{HookHandle, HotkeyAction, PttInterpreter, TAP_THRESHOLD};
 use history::{HistoryStore, SessionDraft, SessionRow};
 use inject::{ClipboardState, InjectOutcome, InjectTarget};
 use pipeline::FormatOutcome;
-use session::{RecordingSession, SessionSummary, Status, StatusPayload, TargetWindow};
+use session::{
+    PendingRecording, RecordingSession, SessionSummary, Status, StatusPayload, TargetWindow,
+};
 use stt::GroqStt;
 
 /// 状態変化の通知イベント。
@@ -108,6 +113,8 @@ struct FinalizeJob {
     recorder: Recorder,
     target: TargetWindow,
     started_at: SystemTime,
+    /// deep context の結果。使い捨てで、履歴には残さない。
+    context: context::ScreenContext,
 }
 
 /// ワーカーが処理する仕事。
@@ -130,7 +137,7 @@ struct AppState {
     status: Mutex<Status>,
     recorder: Mutex<Option<Recorder>>,
     /// 録音開始時に確定させた挿入先と開始時刻。停止時に取り出す。
-    pending: Mutex<Option<(TargetWindow, SystemTime)>>,
+    pending: Mutex<Option<PendingRecording>>,
     last_session: Mutex<Option<RecordingSession>>,
     /// トレイの状態表示項目。トレイ構築後にセットされる。
     tray_status_item: Mutex<Option<MenuItem<Wry>>>,
@@ -496,7 +503,7 @@ fn drain_pending_finalizations(rx: &Receiver<WorkerJob>, dir: &std::path::Path) 
         let WorkerJob::Finalize(job) = job else {
             continue;
         };
-        let Some(Ok(recording)) = guard_panic("終了時の WAV 化", || finalize_one(*job)) else {
+        let Some(Ok((recording, _))) = guard_panic("終了時の WAV 化", || finalize_one(*job)) else {
             log::error!("終了時に後処理待ちの録音を WAV 化できませんでした");
             continue;
         };
@@ -649,6 +656,8 @@ fn start_recording(app: &AppHandle) -> Result<(), String> {
         return Err("すでに録音中です".to_string());
     }
 
+    let cfg = state.config.snapshot();
+
     // 前回の録音が残した上限通知を捨てる。取りこぼすと、次の録音が
     // 開始直後に「上限到達」で止められてしまう。
     // (この関数はコントローラスレッド専用なので、受信の競合は起きない)
@@ -673,8 +682,24 @@ fn start_recording(app: &AppHandle) -> Result<(), String> {
     *slot = Some(recorder);
     drop(slot);
 
+    // 画面コンテキストは録音開始の瞬間の画面を見る必要がある。
+    // 取得は短命スレッド + 打ち切りつきなので、録音を待たせるのは最大 300ms。
+    // 無効なら即座に空が返る。
+    let screen_context = context::capture(cfg.deep_context);
+    if !screen_context.is_empty() {
+        log::info!(
+            "画面コンテキストを取得: {} ({} 文字)",
+            screen_context.source.label(),
+            screen_context.text.chars().count()
+        );
+    }
+
     if let Ok(mut pending) = state.pending.lock() {
-        *pending = Some((target, started_at));
+        *pending = Some(PendingRecording {
+            target,
+            started_at,
+            context: screen_context,
+        });
     }
 
     set_status(app, Status::Recording, None);
@@ -700,12 +725,16 @@ fn request_finalize(app: &AppHandle) -> Result<(), String> {
         return Err("録音していません".to_string());
     };
 
-    let (target, started_at) = state
+    let pending = state
         .pending
         .lock()
         .ok()
         .and_then(|mut slot| slot.take())
-        .unwrap_or_else(|| (TargetWindow::unknown(), recorder.started_at()));
+        .unwrap_or_else(|| PendingRecording {
+            target: TargetWindow::unknown(),
+            started_at: recorder.started_at(),
+            context: context::ScreenContext::default(),
+        });
 
     set_status(app, Status::Processing, None);
 
@@ -713,8 +742,9 @@ fn request_finalize(app: &AppHandle) -> Result<(), String> {
         .finalize_tx
         .send(WorkerJob::Finalize(Box::new(FinalizeJob {
             recorder,
-            target,
-            started_at,
+            target: pending.target,
+            started_at: pending.started_at,
+            context: pending.context,
         })))
         .map_err(|_| "後処理ワーカーが停止しています".to_string())
 }
@@ -784,8 +814,8 @@ fn finalize_worker(app: AppHandle, rx: Receiver<WorkerJob>) {
 fn process_job(app: &AppHandle, job: FinalizeJob) {
     // 第 1 段: WAV 化。ここで panic すると音声は救えないので、
     // せめてワーカーを生かして次の録音を処理できるようにする。
-    let recording = match guard_panic("録音の WAV 化", || finalize_one(job)) {
-        Some(Ok(recording)) => recording,
+    let (recording, screen_context) = match guard_panic("録音の WAV 化", || finalize_one(job)) {
+        Some(Ok(pair)) => pair,
         Some(Err(e)) => {
             log::error!("録音を確定できません: {e}");
             emit_error(app, &e);
@@ -803,7 +833,11 @@ fn process_job(app: &AppHandle, job: FinalizeJob) {
     }
 
     // 第 2 段: 転写と整形。ここで panic しても WAV は手元にあるので退避できる。
-    if guard_panic("転写・整形", || transcribe_and_format(app, &recording)).is_none() {
+    if guard_panic("転写・整形", || {
+        transcribe_and_format(app, &recording, &screen_context)
+    })
+    .is_none()
+    {
         let dir = app.state::<AppState>().failed_dir.clone();
         let saved = save_failed_recording(&dir, &recording, "後処理中に内部エラー (panic)");
         let notice = match saved {
@@ -822,11 +856,12 @@ fn process_job(app: &AppHandle, job: FinalizeJob) {
 }
 
 /// 1 件の録音を WAV 化し、[`RecordingSession`] を確定させる。
-fn finalize_one(job: FinalizeJob) -> Result<RecordingSession, String> {
+fn finalize_one(job: FinalizeJob) -> Result<(RecordingSession, context::ScreenContext), String> {
     let FinalizeJob {
         recorder,
         target,
         started_at,
+        context,
     } = job;
     let device_name = recorder.device_name().to_string();
     let limit_reached = recorder.limit_reached();
@@ -855,7 +890,7 @@ fn finalize_one(job: FinalizeJob) -> Result<RecordingSession, String> {
             ""
         },
     );
-    Ok(recording)
+    Ok((recording, context))
 }
 
 /// WAV を転写し、必要なら整形して結果を通知する。
@@ -863,7 +898,11 @@ fn finalize_one(job: FinalizeJob) -> Result<RecordingSession, String> {
 /// - 整形の失敗は [`pipeline::run`] が生転写へ落とす (R2 劣化モード)。
 /// - **STT の失敗は劣化できない**ので、WAV を退避してから通知する
 ///   (M4 の履歴 DB が入るまでの暫定措置 / R4 の趣旨)。
-fn transcribe_and_format(app: &AppHandle, recording: &RecordingSession) {
+fn transcribe_and_format(
+    app: &AppHandle,
+    recording: &RecordingSession,
+    screen_context: &context::ScreenContext,
+) {
     let state = app.state::<AppState>();
     let Some(http) = state.http.clone() else {
         let msg = "HTTP クライアントを構築できなかったため転写できません".to_string();
@@ -895,10 +934,35 @@ fn transcribe_and_format(app: &AppHandle, recording: &RecordingSession) {
         .with_timeout(format::FORMAT_TIMEOUT)
     });
 
+    // 挿入先に合う文体を選ぶ。
+    let profile = style::match_profile(
+        &cfg.style_profiles,
+        recording.target_process(),
+        &recording.target.window_title,
+    );
+    if let Some(profile) = profile {
+        log::info!(
+            "スタイルプロファイルを適用: {} → {}",
+            profile.process,
+            profile.instruction.chars().take(30).collect::<String>()
+        );
+    }
+
+    let entries = cfg.dictionary_entries();
     let outcome = pipeline::run(
-        &recording.wav_bytes,
-        &cfg.language,
-        &cfg.dictionary,
+        &pipeline::PipelineInput {
+            wav: &recording.wav_bytes,
+            language: &cfg.language,
+            dictionary: &entries,
+            style: profile.map(|p| p.instruction.as_str()),
+            // 前景が取れなかった録音では "<unknown>" が入る。
+            // それをアプリ名としてプロンプトへ載せても意味が無い。
+            app: recording
+                .target
+                .is_known()
+                .then(|| recording.target_process()),
+            context: screen_context.as_prompt_text(),
+        },
         &stt_client,
         formatter.as_ref().map(|f| f as &dyn format::TextFormatter),
     );
@@ -1370,10 +1434,13 @@ fn retranscribe(app: &AppHandle, id: i64) {
         .with_timeout(format::FORMAT_TIMEOUT)
     });
 
+    // 再転写では画面コンテキストを使わない。録音時の画面はもう無く、
+    // 今の画面を混ぜると当時と違う文脈で整形してしまう。
+    let entries = cfg.dictionary_entries();
+    let mut input = pipeline::PipelineInput::new(&wav, &cfg.language);
+    input.dictionary = &entries;
     match pipeline::run(
-        &wav,
-        &cfg.language,
-        &cfg.dictionary,
+        &input,
         &stt_client,
         formatter.as_ref().map(|f| f as &dyn format::TextFormatter),
     ) {
@@ -1538,21 +1605,24 @@ fn finalize_on_exit(app: &AppHandle) {
     };
 
     log::warn!("録音中に終了が要求されました。録音の確定を試みます");
-    let (target, started_at) = state
+    let pending = state
         .pending
         .lock()
         .ok()
         .and_then(|mut slot| slot.take())
-        .unwrap_or_else(|| (TargetWindow::unknown(), recorder.started_at()));
+        .unwrap_or_else(|| PendingRecording {
+            target: TargetWindow::unknown(),
+            started_at: recorder.started_at(),
+            context: context::ScreenContext::default(),
+        });
 
-    match finalize_one(
-        FinalizeJob {
-            recorder,
-            target,
-            started_at,
-        },
-    ) {
-        Ok(recording) => {
+    match finalize_one(FinalizeJob {
+        recorder,
+        target: pending.target,
+        started_at: pending.started_at,
+        context: pending.context,
+    }) {
+        Ok((recording, _)) => {
             // 終了処理をネットワーク待ちで引き延ばさないため転写はしない。
             // 代わりに退避しておき、後から拾えるようにする。
             let saved =
@@ -1719,6 +1789,7 @@ mod tests {
             recorder: Recorder::for_test(samples, audio::TARGET_SAMPLE_RATE),
             target: TargetWindow::unknown(),
             started_at: SystemTime::now(),
+            context: context::ScreenContext::default(),
         }
     }
 

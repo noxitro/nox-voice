@@ -68,6 +68,18 @@ impl TargetWindow {
     }
 }
 
+/// 録音開始時に押さえておく情報。
+///
+/// 画面コンテキストは**その場限り**で、[`RecordingSession`] にも履歴にも
+/// 残さない (design.md R1 / [`crate::context`] のプライバシー方針)。
+#[derive(Debug, Clone)]
+pub struct PendingRecording {
+    pub target: TargetWindow,
+    pub started_at: SystemTime,
+    /// deep context で読んだ画面テキスト。無効なら空。
+    pub context: crate::context::ScreenContext,
+}
+
 /// 1 回の PTT 録音の成果物。M2 の STT はこれを入力に取る。
 #[derive(Debug, Clone)]
 pub struct RecordingSession {

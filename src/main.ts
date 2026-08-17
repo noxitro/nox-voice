@@ -87,6 +87,50 @@ interface SessionRow {
   created_at_ms: number;
 }
 
+/** Rust 側 `style::StyleProfile` と対応。 */
+interface StyleProfile {
+  process: string;
+  title_contains: string | null;
+  instruction: string;
+}
+
+/**
+ * スタイルプロファイルを 1 行 1 件のテキストに変換する。
+ * `プロセス名 | 指示` または `プロセス名 | タイトル条件 | 指示`。
+ */
+function styleProfilesToText(profiles: StyleProfile[]): string {
+  return profiles
+    .map((p) =>
+      p.title_contains
+        ? `${p.process} | ${p.title_contains} | ${p.instruction}`
+        : `${p.process} | ${p.instruction}`,
+    )
+    .join("\n");
+}
+
+/** 上の逆変換。壊れた行は落とす(Rust 側でも空欄は弾かれる)。 */
+function parseStyleProfiles(text: string): StyleProfile[] {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.split("|").map((part) => part.trim()))
+    .flatMap((parts): StyleProfile[] => {
+      if (parts.length === 2 && parts[0] && parts[1]) {
+        return [{ process: parts[0], title_contains: null, instruction: parts[1] }];
+      }
+      if (parts.length >= 3 && parts[0] && parts[2]) {
+        return [
+          {
+            process: parts[0],
+            title_contains: parts[1] || null,
+            // 指示自体に「|」が入っていても失わないよう繋ぎ直す。
+            instruction: parts.slice(2).join(" | "),
+          },
+        ];
+      }
+      return [];
+    });
+}
+
 /** Rust 側 `config::ConfigView` と対応。**キーの実体は含まれない。** */
 interface ConfigView {
   groq_key_set: boolean;
@@ -99,6 +143,8 @@ interface ConfigView {
   dictionary: string[];
   formatting_enabled: boolean;
   injection_enabled: boolean;
+  deep_context: boolean;
+  style_profiles: StyleProfile[];
   history_enabled: boolean;
   history_retention_days: number;
   restore_delay_ms: number;
@@ -301,6 +347,10 @@ function renderConfig(view: ConfigView) {
   if (retention) retention.value = String(view.history_retention_days);
   const dictionary = el<HTMLTextAreaElement>("dictionary");
   if (dictionary) dictionary.value = view.dictionary.join("\n");
+  const deepContext = el<HTMLInputElement>("deep-context");
+  if (deepContext) deepContext.checked = view.deep_context;
+  const styles = el<HTMLTextAreaElement>("style-profiles");
+  if (styles) styles.value = styleProfilesToText(view.style_profiles);
   const groqState = el("groq-state");
   if (groqState) groqState.textContent = keyStateLabel(view, "groq");
   const geminiState = el("gemini-state");
@@ -319,6 +369,8 @@ async function saveSettings(event: Event) {
   const historyEnabled = el<HTMLInputElement>("history-enabled");
   const retention = el<HTMLInputElement>("history-retention");
   const dictionary = el<HTMLTextAreaElement>("dictionary");
+  const deepContext = el<HTMLInputElement>("deep-context");
+  const styles = el<HTMLTextAreaElement>("style-profiles");
 
   // 入力欄が空 = 「変更しない」。誤って既存キーを消さないため未指定で送る。
   const patch: Record<string, unknown> = {
@@ -326,11 +378,21 @@ async function saveSettings(event: Event) {
     formatting_enabled: formatting?.checked ?? true,
     injection_enabled: injection?.checked ?? true,
     history_enabled: historyEnabled?.checked ?? true,
+    deep_context: deepContext?.checked ?? false,
     // 空行は Rust 側で落とされる。
     dictionary: (dictionary?.value ?? "").split(/\r?\n/),
+    style_profiles: parseStyleProfiles(styles?.value ?? ""),
   };
   const days = Number(retention?.value);
   if (Number.isFinite(days) && days >= 0) patch.history_retention_days = days;
+
+  // 形式が違ってパースできなかった行は黙って消える。何行落としたかを伝える。
+  const styleText = styles?.value ?? "";
+  const styleLineCount = styleText
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== "").length;
+  const ignoredStyleLines =
+    styleLineCount - (patch.style_profiles as StyleProfile[]).length;
   // 数値として読めないときは送らない (Rust 側の範囲でクランプされる)。
   const delay = Number(restoreDelay?.value);
   if (Number.isFinite(delay) && delay > 0) patch.restore_delay_ms = delay;
@@ -343,13 +405,22 @@ async function saveSettings(event: Event) {
     // 入力欄には残さない (画面に平文で残る時間を最小にする)。
     if (groq) groq.value = "";
     if (gemini) gemini.value = "";
-    if (note) note.textContent = "保存しました";
+    if (note) {
+      note.textContent =
+        ignoredStyleLines > 0
+          ? `保存しました(文体の設定 ${ignoredStyleLines} 行は形式が違うため無視しました)`
+          : "保存しました";
+    }
   } catch (e) {
     if (note) note.textContent = `保存に失敗しました: ${e}`;
   }
-  window.setTimeout(() => {
-    if (note) note.textContent = "";
-  }, 2500);
+  // 無視した行があるときは、読む時間を長めに取る。
+  window.setTimeout(
+    () => {
+      if (note) note.textContent = "";
+    },
+    ignoredStyleLines > 0 ? 8000 : 2500,
+  );
 }
 
 /** 履歴の結末バッジ。 */

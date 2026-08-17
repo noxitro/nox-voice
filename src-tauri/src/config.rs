@@ -20,6 +20,9 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::dictionary::{self, DictionaryEntry};
+use crate::style::StyleProfile;
+
 /// Groq の既定エンドポイント (OpenAI 互換の transcriptions)。
 pub const DEFAULT_GROQ_ENDPOINT: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
 /// Gemini の既定エンドポイント。末尾に `/{model}:generateContent` が付く。
@@ -147,6 +150,13 @@ pub struct Config {
     /// 結果を前景アプリへ自動で貼り付けるか。
     /// false なら画面に表示するだけ (手動コピー)。
     pub injection_enabled: bool,
+    /// 画面のテキストを読んで文脈として使うか (deep context)。
+    ///
+    /// **既定は無効。** 有効にすると、挿入先の画面に表示されている文章が
+    /// STT / 整形の API へ送られる (design.md R1)。UI でその旨を明示すること。
+    pub deep_context: bool,
+    /// 挿入先アプリごとの文体プロファイル。
+    pub style_profiles: Vec<StyleProfile>,
     /// 履歴を保存するか。
     ///
     /// 履歴には発話の全文が入る。R1 の観点で「残さない」選択肢を用意する。
@@ -174,6 +184,9 @@ impl Default for Config {
             dictionary: Vec::new(),
             formatting_enabled: true,
             injection_enabled: true,
+            // 画面テキストをクラウドへ送るので、明示的に有効化させる。
+            deep_context: false,
+            style_profiles: crate::style::default_profiles(),
             history_enabled: true,
             history_retention_days: DEFAULT_HISTORY_RETENTION_DAYS,
             restore_delay_ms: crate::inject::DEFAULT_RESTORE_DELAY_MS,
@@ -219,6 +232,11 @@ impl Config {
     /// Gemini の API キーを解決する (環境変数優先)。
     pub fn gemini_key(&self) -> ResolvedKey {
         resolve_key(env_value(ENV_GEMINI_KEY), &self.gemini_api_key)
+    }
+
+    /// 辞書を構造化して返す (`表記,よみ` のパース済み)。
+    pub fn dictionary_entries(&self) -> Vec<DictionaryEntry> {
+        dictionary::parse_entries(&self.dictionary)
     }
 
     /// `{gemini_endpoint}/{model}:generateContent` を組み立てる。
@@ -268,6 +286,8 @@ pub struct ConfigView {
     pub dictionary: Vec<String>,
     pub formatting_enabled: bool,
     pub injection_enabled: bool,
+    pub deep_context: bool,
+    pub style_profiles: Vec<StyleProfile>,
     pub history_enabled: bool,
     pub history_retention_days: u32,
     pub restore_delay_ms: u64,
@@ -301,6 +321,8 @@ impl ConfigView {
             dictionary: c.dictionary.clone(),
             formatting_enabled: c.formatting_enabled,
             injection_enabled: c.injection_enabled,
+            deep_context: c.deep_context,
+            style_profiles: c.style_profiles.clone(),
             history_enabled: c.history_enabled,
             history_retention_days: c.history_retention_days,
             restore_delay_ms: c.restore_delay_ms,
@@ -331,6 +353,8 @@ pub struct ConfigPatch {
     pub dictionary: Option<Vec<String>>,
     pub formatting_enabled: Option<bool>,
     pub injection_enabled: Option<bool>,
+    pub deep_context: Option<bool>,
+    pub style_profiles: Option<Vec<StyleProfile>>,
     pub history_enabled: Option<bool>,
     pub history_retention_days: Option<u32>,
     pub restore_delay_ms: Option<u64>,
@@ -360,6 +384,11 @@ impl fmt::Debug for ConfigPatch {
             .field("dictionary", &self.dictionary)
             .field("formatting_enabled", &self.formatting_enabled)
             .field("injection_enabled", &self.injection_enabled)
+            .field("deep_context", &self.deep_context)
+            .field(
+                "style_profiles",
+                &self.style_profiles.as_ref().map(Vec::len),
+            )
             .field("history_enabled", &self.history_enabled)
             .field("history_retention_days", &self.history_retention_days)
             .field("restore_delay_ms", &self.restore_delay_ms)
@@ -410,6 +439,16 @@ impl Config {
         }
         if let Some(v) = patch.injection_enabled {
             self.injection_enabled = v;
+        }
+        if let Some(v) = patch.deep_context {
+            self.deep_context = v;
+        }
+        if let Some(v) = patch.style_profiles {
+            // 条件が空のプロファイルは全発話に効いてしまうので落とす。
+            self.style_profiles = v
+                .into_iter()
+                .filter(|p| !p.process.trim().is_empty() && !p.instruction.trim().is_empty())
+                .collect();
         }
         if let Some(v) = patch.history_enabled {
             self.history_enabled = v;
@@ -697,6 +736,94 @@ mod tests {
             ..ConfigPatch::default()
         });
         assert_eq!(cfg.dictionary, vec!["nox-voice", "Tauri"]);
+    }
+
+    #[test]
+    fn deep_context_is_off_by_default() {
+        // 画面テキストをクラウドへ送る機能なので、黙って有効にしない。
+        assert!(!Config::default().deep_context);
+    }
+
+    #[test]
+    fn style_profiles_ship_with_defaults() {
+        let cfg = Config::default();
+        assert!(!cfg.style_profiles.is_empty());
+        assert!(cfg
+            .style_profiles
+            .iter()
+            .any(|p| p.process.contains("slack")));
+    }
+
+    #[test]
+    fn patching_style_profiles_drops_incomplete_rows() {
+        let mut cfg = Config::default();
+        cfg.apply(ConfigPatch {
+            style_profiles: Some(vec![
+                StyleProfile {
+                    process: "slack.exe".into(),
+                    title_contains: None,
+                    instruction: "カジュアル".into(),
+                },
+                // 書きかけ: プロセス名が空 = 全発話に効いてしまう。
+                StyleProfile {
+                    process: "  ".into(),
+                    title_contains: None,
+                    instruction: "壊れた".into(),
+                },
+                // 指示が空 = 意味がない。
+                StyleProfile {
+                    process: "code.exe".into(),
+                    title_contains: None,
+                    instruction: "".into(),
+                },
+            ]),
+            ..ConfigPatch::default()
+        });
+        assert_eq!(cfg.style_profiles.len(), 1);
+        assert_eq!(cfg.style_profiles[0].process, "slack.exe");
+    }
+
+    #[test]
+    fn dictionary_entries_parse_readings() {
+        let mut cfg = Config::default();
+        cfg.apply(ConfigPatch {
+            dictionary: Some(vec!["nox-voice".into(), "塩谷,しおや".into()]),
+            ..ConfigPatch::default()
+        });
+        let entries = cfg.dictionary_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].written, "塩谷");
+        assert_eq!(entries[1].reading.as_deref(), Some("しおや"));
+    }
+
+    #[test]
+    fn config_round_trips_the_new_fields() {
+        let dir = std::env::temp_dir().join(format!("nox-config-q1-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = fs::remove_dir_all(&dir);
+
+        let store = ConfigStore::load(path.clone());
+        store
+            .update(ConfigPatch {
+                deep_context: Some(true),
+                style_profiles: Some(vec![StyleProfile {
+                    process: "myapp.exe".into(),
+                    title_contains: Some("編集".into()),
+                    instruction: "箇条書きにする".into(),
+                }]),
+                ..ConfigPatch::default()
+            })
+            .expect("保存できる");
+
+        let reloaded = ConfigStore::load(path).snapshot();
+        assert!(reloaded.deep_context);
+        assert_eq!(reloaded.style_profiles.len(), 1);
+        assert_eq!(
+            reloaded.style_profiles[0].title_contains.as_deref(),
+            Some("編集")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
