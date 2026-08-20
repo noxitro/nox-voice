@@ -32,6 +32,8 @@ interface ResultPayload {
   degraded: boolean;
   injected: boolean;
   inject_outcome: string;
+  /** Rust 側 `inject::ClipboardState` の snake_case 表現。 */
+  clipboard_state: string;
 }
 
 const el = <T extends HTMLElement>(id: string) =>
@@ -137,11 +139,20 @@ window.addEventListener("DOMContentLoaded", async () => {
     const r = event.payload;
     // 挿入されたテキストの先頭を見せる。何が入ったか一目で分かるように。
     const preview = r.text.replace(/\s+/g, " ").trim().slice(0, 24);
-    const timing = `転写 ${seconds(r.stt_ms)} / 整形 ${seconds(r.format_ms)}`;
+    const detail = [
+      `転写 ${seconds(r.stt_ms)} / 整形 ${seconds(r.format_ms)}` +
+        (r.degraded ? "(整形なし)" : ""),
+    ];
+    // 貼付が相手に届いていなくても Ctrl+V でやり直せることを知らせる。
+    // **トーストは増やさない** — 毎回鳴ると無意味になるので、もともと
+    // 目に入る小窓へ一言添えるだけにする (R6 の通知と同じ考え方)。
+    if (r.clipboard_state === "holds_injected_text") {
+      detail.push("クリップボードにコピー済み");
+    }
     const label = preview ? `「${preview}${r.text.length > 24 ? "…" : ""}」` : "完了";
     // 小窓を畳むのは Rust 側 (overlay::hide_after)。
     // webview に持たせると、次の録音で出した直後に前回のタイマーが消してしまう。
-    setState("done", label, r.degraded ? `${timing}(整形なし)` : timing);
+    setState("done", label, detail.join(" ・ "));
   });
 
   await listen<ErrorPayload>("nox://error", (event) => {

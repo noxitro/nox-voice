@@ -203,9 +203,16 @@ body {
 .detail {
   color: var(--text-secondary);
   font-size: var(--text-xs);
-  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  /* 1 行に収まらないときだけ 2 行目へ送る。「クリップボードにコピー済み」を
+     所要時間と並べると 320px には入りきらず、nowrap では**新しい情報のほうが
+     切り落とされる**。小窓は 72px あり、完了表示ではレベルメーターが消えるので
+     2 行分の余白がある。3 行目からは今までどおり省略記号で畳む。 */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
 }
 
 /* --- 動きを抑える設定への追従 ---------------------------------------------- */

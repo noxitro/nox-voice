@@ -185,6 +185,15 @@ pub struct Config {
     /// 短すぎると貼付が消費される前に戻して旧内容が貼られ、
     /// 長すぎるとユーザーの次のコピーを壊しうる (design.md R3-b)。
     pub restore_delay_ms: u64,
+    /// 録音結果を貼付後もクリップボードに残すか (Typeless 互換)。
+    ///
+    /// **既定は残す。** R7 のフォーカス照合は「前景ウィンドウが同じか」しか
+    /// 見られないので、同じウィンドウでキャレットが入力欄に無い / 相手が
+    /// Ctrl+V を無視した / UIPI で弾かれた、といった失敗はすり抜ける。
+    /// そこで復元すると発話が消えて言い直しになるが、残しておけば
+    /// Ctrl+V でやり直せる。代償は元のクリップボード内容が上書きされること。
+    /// 有効な間 [`restore_delay_ms`](Self::restore_delay_ms) は使われない。
+    pub keep_transcript_in_clipboard: bool,
     pub groq_endpoint: String,
     pub gemini_endpoint: String,
     pub stt_model: String,
@@ -211,6 +220,8 @@ impl Default for Config {
             history_enabled: true,
             history_retention_days: DEFAULT_HISTORY_RETENTION_DAYS,
             restore_delay_ms: crate::inject::DEFAULT_RESTORE_DELAY_MS,
+            // 貼付に失敗しても言い直さずに済むほうを既定にする。
+            keep_transcript_in_clipboard: true,
             groq_endpoint: DEFAULT_GROQ_ENDPOINT.to_string(),
             gemini_endpoint: DEFAULT_GEMINI_ENDPOINT.to_string(),
             stt_model: DEFAULT_STT_MODEL.to_string(),
@@ -340,6 +351,7 @@ pub struct ConfigView {
     pub history_enabled: bool,
     pub history_retention_days: u32,
     pub restore_delay_ms: u64,
+    pub keep_transcript_in_clipboard: bool,
     pub stt_model: String,
     pub format_model: String,
 }
@@ -380,6 +392,7 @@ impl ConfigView {
             history_enabled: c.history_enabled,
             history_retention_days: c.history_retention_days,
             restore_delay_ms: c.restore_delay_ms,
+            keep_transcript_in_clipboard: c.keep_transcript_in_clipboard,
             stt_model: c.stt_model.clone(),
             format_model: c.format_model.clone(),
         }
@@ -417,6 +430,7 @@ pub struct ConfigPatch {
     pub history_enabled: Option<bool>,
     pub history_retention_days: Option<u32>,
     pub restore_delay_ms: Option<u64>,
+    pub keep_transcript_in_clipboard: Option<bool>,
     pub stt_model: Option<String>,
     pub format_model: Option<String>,
     pub groq_endpoint: Option<String>,
@@ -455,6 +469,10 @@ impl fmt::Debug for ConfigPatch {
             .field("history_enabled", &self.history_enabled)
             .field("history_retention_days", &self.history_retention_days)
             .field("restore_delay_ms", &self.restore_delay_ms)
+            .field(
+                "keep_transcript_in_clipboard",
+                &self.keep_transcript_in_clipboard,
+            )
             .field("stt_model", &self.stt_model)
             .field("format_model", &self.format_model)
             .field("groq_endpoint", &self.groq_endpoint)
@@ -486,6 +504,21 @@ impl Config {
         if self.history_retention_days != 0 {
             self.history_retention_days =
                 self.history_retention_days.min(MAX_HISTORY_RETENTION_DAYS);
+        }
+    }
+
+    /// 貼付後にクリップボードをどう扱うか。
+    ///
+    /// 「残すなら復元ディレイは使わない」という関係は、bool と Duration を
+    /// 別々に持ち回すと呼び出し側ごとに書き直すことになる。ここで一度だけ
+    /// 型へ畳んでおく (design.md「同じ判断を 2 か所に書かない」)。
+    pub fn clipboard_policy(&self) -> crate::inject::ClipboardPolicy {
+        if self.keep_transcript_in_clipboard {
+            crate::inject::ClipboardPolicy::Keep
+        } else {
+            crate::inject::ClipboardPolicy::Restore {
+                delay: std::time::Duration::from_millis(self.restore_delay_ms),
+            }
         }
     }
 
@@ -548,6 +581,9 @@ impl Config {
             // 極端な値は事故のもと。0 は即復元 = 旧内容が貼られる、
             // 長すぎるとユーザーの次のコピーを壊す (R3-b)。
             self.restore_delay_ms = v;
+        }
+        if let Some(v) = patch.keep_transcript_in_clipboard {
+            self.keep_transcript_in_clipboard = v;
         }
         if let Some(v) = patch.stt_model {
             self.stt_model = non_empty_or(v, DEFAULT_STT_MODEL);
@@ -918,6 +954,56 @@ mod tests {
     #[test]
     fn the_overlay_is_on_by_default() {
         assert!(Config::default().overlay_enabled);
+    }
+
+    #[test]
+    fn the_transcript_stays_in_the_clipboard_by_default() {
+        // 貼付が不達でも言い直さずに済むほうを既定にする (ユーザー要求)。
+        let cfg = Config::default();
+        assert!(cfg.keep_transcript_in_clipboard);
+        assert!(ConfigView::from(&cfg).keep_transcript_in_clipboard);
+        assert_eq!(cfg.clipboard_policy(), crate::inject::ClipboardPolicy::Keep);
+    }
+
+    #[test]
+    fn turning_the_setting_off_restores_with_the_configured_delay() {
+        // 陰性コントロール: 「常に Keep」で通ってしまわないための対。
+        let cfg = Config {
+            keep_transcript_in_clipboard: false,
+            restore_delay_ms: 250,
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.clipboard_policy(),
+            crate::inject::ClipboardPolicy::Restore {
+                delay: std::time::Duration::from_millis(250),
+            }
+        );
+    }
+
+    #[test]
+    fn the_clipboard_setting_round_trips_through_disk() {
+        let dir = std::env::temp_dir().join(format!("nox-config-keep-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = fs::remove_dir_all(&dir);
+
+        let store = ConfigStore::load(path.clone());
+        store
+            .update(ConfigPatch {
+                keep_transcript_in_clipboard: Some(false),
+                ..ConfigPatch::default()
+            })
+            .expect("保存できる");
+        let reloaded = ConfigStore::load(path.clone()).snapshot();
+        assert!(!reloaded.keep_transcript_in_clipboard, "false が保存されていない");
+
+        // 既存の設定ファイル (このキーを持たない) は既定の true になる。
+        fs::write(&path, r#"{"restore_delay_ms": 400}"#).expect("書ける");
+        assert!(
+            ConfigStore::load(path).snapshot().keep_transcript_in_clipboard,
+            "古い設定ファイルを読むと既定値が効かない"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

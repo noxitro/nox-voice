@@ -1511,7 +1511,7 @@ fn apply_injection(
     let report = inject::inject(
         &payload.text,
         InjectTarget::new(recording.target_hwnd(), recording.target.process_id),
-        std::time::Duration::from_millis(cfg.restore_delay_ms),
+        cfg.clipboard_policy(),
     );
 
     log::info!(

@@ -63,6 +63,24 @@ const MODIFIER_SETTLE_DELAY: Duration = Duration::from_millis(250);
 /// 復元までの既定待ち時間。
 pub const DEFAULT_RESTORE_DELAY_MS: u64 = 300;
 
+/// 貼付を終えたあとクリップボードをどう扱うか。
+///
+/// `delay` は `Restore` のときにしか意味を持たない。bool 引数を足して
+/// 「復元しないのに待ち時間だけ渡される」呼び出しを作れる状態にするより、
+/// **関係を型で表す**ほうが後から壊れない (design.md「設定に従う分岐は型にする」)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardPolicy {
+    /// 貼付後に元の内容へ戻す。`delay` は貼付が消費されるのを待つ時間 (R3-b)。
+    Restore { delay: Duration },
+    /// 整形テキストをクリップボードに残す (Typeless 互換)。復元しない。
+    ///
+    /// R7 のフォーカス照合をすり抜けた失敗 — 同じウィンドウだがキャレットが
+    /// 入力欄に無い / 相手が Ctrl+V を無視した / UIPI で弾かれた — では
+    /// 「送出は成功したのに何も入っていない」ことが起きる。復元してしまうと
+    /// そこで発話が消え、言い直しになる。残しておけば Ctrl+V でやり直せる。
+    Keep,
+}
+
 // --- クリップボード形式の定数 -----------------------------------------------
 //
 // `windows` crate では `Win32_System_Ole` feature の下にあるが、
@@ -195,7 +213,13 @@ impl InjectReport {
     /// 常駐運用ではウィンドウが閉じていて WebView のイベントは誰も見ない。
     pub fn needs_user_action(&self) -> bool {
         // 手で貼り付けないと発話が使われないまま終わる。
-        self.clipboard_state.holds_injected_text()
+        //
+        // **`injected` の否定が要る**。`ClipboardPolicy::Keep` が既定なので、
+        // 貼付に成功した通常の完了も `HoldsInjectedText` で終わる。
+        // 状態だけで判定すると「毎回トーストが鳴る」構造になり、
+        // 通知が意味を失う (design.md R6 の「毎回鳴る通知は無意味」と同じ)。
+        // 手当てが要るのは**送出できずにクリップボードだけが残った**場合。
+        (!self.injected && self.clipboard_state.holds_injected_text())
             // 何かが失われたことは必ず知らせる。
             || !self.lost_formats.is_empty()
             || self.clipboard_state == ClipboardState::Lost
@@ -277,8 +301,8 @@ impl InjectTarget {
 /// テキストを注入する。
 ///
 /// `target` は録音開始時に保存した前景ウィンドウ (hwnd = 0 は不明)。
-/// `restore_delay` は貼付から復元までの待ち時間 (R3-b)。
-pub fn inject(text: &str, target: InjectTarget, restore_delay: Duration) -> InjectReport {
+/// `policy` は貼付後のクリップボードの扱い ([`ClipboardPolicy`])。
+pub fn inject(text: &str, target: InjectTarget, policy: ClipboardPolicy) -> InjectReport {
     if text.trim().is_empty() {
         return InjectReport::untouched(InjectOutcome::EmptyText);
     }
@@ -353,38 +377,40 @@ pub fn inject(text: &str, target: InjectTarget, restore_delay: Duration) -> Inje
     }
     log::info!("Ctrl+V を送出しました ({} 文字)", text.chars().count());
 
-    // --- R3-b: 復元 ---
+    // --- 貼付後のクリップボード ---
     //
-    // 判定と書き込みは**クリップボードを握ったまま**行う。分離すると、
-    // 「変わっていない」と判定してからガードを取り直す間 (最大 180ms) に
-    // ユーザーがコピーし、それを上書きで壊す (TOCTOU)。
-    std::thread::sleep(restore_delay);
-    let clipboard_state = match backup {
-        None => {
-            log::info!("復元するテキストが無いのでクリップボードはそのままにします");
+    // R3-b: 復元する場合、判定と書き込みは**クリップボードを握ったまま**行う。
+    // 分離すると、「変わっていない」と判定してからガードを取り直す間
+    // (最大 180ms) にユーザーがコピーし、それを上書きで壊す (TOCTOU)。
+    let clipboard_state = match post_paste_action(policy, backup) {
+        PostPasteAction::KeepInjectedText { reason } => {
+            log::info!("クリップボードは整形テキストのままにします ({reason})");
             ClipboardState::HoldsInjectedText
         }
-        Some(backup) => match restore_if_unchanged(&backup, sequence) {
-            RestoreOutcome::Restored => {
-                log::info!("クリップボードを復元しました");
-                ClipboardState::RestoredOriginal
-            }
-            RestoreOutcome::SkippedChanged => {
-                // ユーザーが新しくコピーした。上書きすればその操作を壊す。
-                // 整形テキストはもう残っていないので、そう報告する。
-                log::info!("復元中止: 貼付後にクリップボードが変更されています");
-                ClipboardState::ReplacedByUser
-            }
-            RestoreOutcome::Failed(outcome) => {
-                log::warn!("クリップボードを復元できませんでした ({outcome:?})");
-                match outcome {
-                    // 開けなかっただけなら中身は整形テキストのまま。
-                    InjectOutcome::ClipboardBusy => ClipboardState::HoldsInjectedText,
-                    // 空にした後で書けなかった = 何も残っていない。
-                    _ => ClipboardState::Lost,
+        PostPasteAction::RestoreAfter { delay, backup } => {
+            std::thread::sleep(delay);
+            match restore_if_unchanged(&backup, sequence) {
+                RestoreOutcome::Restored => {
+                    log::info!("クリップボードを復元しました");
+                    ClipboardState::RestoredOriginal
+                }
+                RestoreOutcome::SkippedChanged => {
+                    // ユーザーが新しくコピーした。上書きすればその操作を壊す。
+                    // 整形テキストはもう残っていないので、そう報告する。
+                    log::info!("復元中止: 貼付後にクリップボードが変更されています");
+                    ClipboardState::ReplacedByUser
+                }
+                RestoreOutcome::Failed(outcome) => {
+                    log::warn!("クリップボードを復元できませんでした ({outcome:?})");
+                    match outcome {
+                        // 開けなかっただけなら中身は整形テキストのまま。
+                        InjectOutcome::ClipboardBusy => ClipboardState::HoldsInjectedText,
+                        // 空にした後で書けなかった = 何も残っていない。
+                        _ => ClipboardState::Lost,
+                    }
                 }
             }
-        },
+        }
     };
 
     InjectReport {
@@ -393,6 +419,38 @@ pub fn inject(text: &str, target: InjectTarget, restore_delay: Duration) -> Inje
         clipboard_state,
         lost_formats,
         message: outcome_message(InjectOutcome::Injected, clipboard_state),
+    }
+}
+
+/// Ctrl+V を送出したあとに取る手。
+///
+/// Win32 に触れないので純関数として判定でき、
+/// 「`Keep` では復元経路へ一切入らない」ことをテストで固定できる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PostPasteAction {
+    /// 何もしない。整形テキストがクリップボードに残る。
+    KeepInjectedText { reason: &'static str },
+    /// `delay` だけ待ってから、割り込みが無ければ `backup` へ戻す。
+    RestoreAfter { delay: Duration, backup: String },
+}
+
+/// 方針と退避の有無から、貼付後の手を決める。
+fn post_paste_action(policy: ClipboardPolicy, backup: Option<String>) -> PostPasteAction {
+    match policy {
+        // 設定で「残す」を選んでいる。待ちも復元も丸ごと行わない。
+        ClipboardPolicy::Keep => PostPasteAction::KeepInjectedText {
+            reason: "設定: 録音結果をクリップボードに残す",
+        },
+        // 戻す先が無い (元が空・画像だけ) なら待つ意味も無い。
+        ClipboardPolicy::Restore { .. } if backup.is_none() => {
+            PostPasteAction::KeepInjectedText {
+                reason: "復元するテキストが無い",
+            }
+        }
+        ClipboardPolicy::Restore { delay } => PostPasteAction::RestoreAfter {
+            delay,
+            backup: backup.expect("直前のガードで None を除いてある"),
+        },
     }
 }
 
@@ -996,6 +1054,68 @@ mod tests {
         assert_eq!(restore_decision(u32::MAX, u32::MAX), RestoreDecision::Restore);
     }
 
+    // --- 貼付後の方針 (Typeless 互換の「残す」) ---
+
+    #[test]
+    fn keep_policy_never_enters_the_restore_path() {
+        // 退避があっても復元しない = sleep も restore_if_unchanged も通らない。
+        let action = post_paste_action(ClipboardPolicy::Keep, Some("元の内容".to_string()));
+        assert!(
+            matches!(action, PostPasteAction::KeepInjectedText { .. }),
+            "Keep なのに復元しようとしている: {action:?}"
+        );
+    }
+
+    #[test]
+    fn restore_policy_still_restores_the_backup() {
+        // 陰性コントロール。上のテストが「常に Keep」で通ってしまわないための対。
+        let action = post_paste_action(
+            ClipboardPolicy::Restore {
+                delay: Duration::from_millis(300),
+            },
+            Some("元の内容".to_string()),
+        );
+        assert_eq!(
+            action,
+            PostPasteAction::RestoreAfter {
+                delay: Duration::from_millis(300),
+                backup: "元の内容".to_string(),
+            },
+            "Restore の既存挙動が変わっている"
+        );
+    }
+
+    #[test]
+    fn restore_policy_without_a_backup_keeps_the_text() {
+        // 元が空・画像だけで退避できていない場合。戻す先が無いので待つ意味も無い。
+        let action = post_paste_action(
+            ClipboardPolicy::Restore {
+                delay: Duration::from_millis(300),
+            },
+            None,
+        );
+        assert!(matches!(action, PostPasteAction::KeepInjectedText { .. }));
+    }
+
+    #[test]
+    fn keep_policy_holds_the_text_even_without_a_backup() {
+        let action = post_paste_action(ClipboardPolicy::Keep, None);
+        assert!(matches!(action, PostPasteAction::KeepInjectedText { .. }));
+    }
+
+    #[test]
+    fn keeping_the_text_promises_a_manual_paste_that_is_true() {
+        // Keep の成功時は HoldsInjectedText になる。この状態の案内文
+        // (「Ctrl+V で貼り付け可」) は実際に正しい。
+        assert!(ClipboardState::HoldsInjectedText.holds_injected_text());
+        // 送出が成功していれば、たとえテキストが残っていてもトーストは出さない
+        // (メッセージが無いので notify も呼ばれない)。毎回鳴ると無意味になる。
+        assert!(
+            outcome_message(InjectOutcome::Injected, ClipboardState::HoldsInjectedText).is_none(),
+            "Keep 既定で毎回メッセージが出る"
+        );
+    }
+
     // --- m7: クリップボードの状態と案内文の整合 ---
 
     #[test]
@@ -1081,6 +1201,21 @@ mod tests {
         // 復元に失敗してクリップボードが空になった場合も同じ。
         let report = report_with(InjectOutcome::Injected, ClipboardState::Lost, &[]);
         assert!(report.needs_user_action());
+    }
+
+    #[test]
+    fn keeping_the_text_after_a_successful_paste_needs_no_toast() {
+        // `ClipboardPolicy::Keep` が既定なので、**貼付に成功した通常の完了も**
+        // HoldsInjectedText で終わる。ここでトーストを出すと毎回鳴り、
+        // 通知そのものが意味を失う。手当てが要るのは送出できなかった場合だけ
+        // (それは user_action_is_required_when_text_waits_in_the_clipboard が固定)。
+        let report = report_with(
+            InjectOutcome::Injected,
+            ClipboardState::HoldsInjectedText,
+            &[],
+        );
+        assert!(report.injected, "前提: 送出は成功している");
+        assert!(!report.needs_user_action(), "毎回トーストが鳴る構造になっている");
     }
 
     #[test]
@@ -1300,7 +1435,13 @@ mod tests {
     #[test]
     fn empty_text_is_rejected_without_touching_the_clipboard() {
         // 実クリップボードに触れないことが要点なので、実機でも安全に走る。
-        let report = inject("   \n  ", InjectTarget::new(0x1234, 42), Duration::ZERO);
+        let report = inject(
+            "   \n  ",
+            InjectTarget::new(0x1234, 42),
+            ClipboardPolicy::Restore {
+                delay: Duration::ZERO,
+            },
+        );
         assert_eq!(report.outcome, InjectOutcome::EmptyText);
         assert!(!report.injected);
         assert_eq!(report.clipboard_state, ClipboardState::Untouched);
@@ -1403,6 +1544,54 @@ mod tests {
         }
 
         // 後片付け: ユーザーのクリップボードへ戻す。
+        if let Some(text) = user_original {
+            restore_text(&text).expect("ユーザーの内容へ戻す");
+        }
+    }
+
+    /// `Keep` の貼付後処理が、実クリップボードの内容を変えないことを見る。
+    ///
+    /// **範囲の限界を正直に書いておく**: このテストは `inject()` を呼ばず、
+    /// `prepare_clipboard` + 純関数 `post_paste_action` の組で確かめる
+    /// (`inject()` は前景の奪取と実キー送出を伴い、自動テストでは成立しない
+    /// — design.md「E2Eテストハーネスの安全則」)。したがって
+    /// **`inject()` 側の `KeepInjectedText` 分岐が誤って書き込む退行は捕捉できない**。
+    /// その分岐が不活性であることは純関数テスト側で固定している。
+    #[test]
+    #[ignore = "実クリップボードを使う。--test-threads=1 で実行すること"]
+    fn clipboard_keep_policy_leaves_the_injected_text() {
+        let user_original = {
+            let _guard = ClipboardGuard::open().expect("開ける");
+            // SAFETY: クリップボードは開いている。
+            unsafe { read_unicode_text() }
+        };
+
+        let sentinel = "nox-voice テスト用の元テキスト";
+        restore_text(sentinel).expect("前準備: 元テキストを置く");
+
+        let prepared = prepare_clipboard("残すべき整形テキスト").expect("設定できる");
+        assert_eq!(
+            prepared.backup.as_deref(),
+            Some(sentinel),
+            "Keep でも退避自体は続けること (書き込み失敗時の唯一の救済)"
+        );
+
+        // Keep なら復元経路へ入らない。
+        let action = post_paste_action(ClipboardPolicy::Keep, prepared.backup);
+        assert!(matches!(action, PostPasteAction::KeepInjectedText { .. }));
+
+        let after = {
+            let _guard = ClipboardGuard::open().expect("開ける");
+            // SAFETY: クリップボードは開いている。
+            unsafe { read_unicode_text() }
+        };
+        assert_eq!(
+            after.as_deref(),
+            Some("残すべき整形テキスト"),
+            "整形テキストが残っていない (Ctrl+V でやり直せない)"
+        );
+
+        // 後片付け: ユーザーのクリップボードへ必ず戻す。
         if let Some(text) = user_original {
             restore_text(&text).expect("ユーザーの内容へ戻す");
         }
@@ -1659,7 +1848,9 @@ mod tests {
         let report = inject(
             payload,
             InjectTarget::new(target, target_pid),
-            Duration::from_millis(300),
+            ClipboardPolicy::Restore {
+                delay: Duration::from_millis(300),
+            },
         );
         let pasted = read_notepad_text(target);
 
@@ -1958,7 +2149,9 @@ mod tests {
         let report = inject(
             "中止されるテキスト",
             InjectTarget::new(0x7FFF_FFFF, 0),
-            Duration::ZERO,
+            ClipboardPolicy::Restore {
+                delay: Duration::ZERO,
+            },
         );
         assert_eq!(report.outcome, InjectOutcome::AbortedFocusChanged);
         assert!(!report.injected);

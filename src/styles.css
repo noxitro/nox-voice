@@ -506,6 +506,23 @@ button.danger:hover:not(:disabled) {
   font-weight: 600;
 }
 
+/* 設定項目の補足。既存のトーン (二次テキスト + 最小サイズ) をそのまま使う */
+.settings .field-note {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+
+/* 効かなくなった項目は、消さずに触れなくする (値は残す) */
+.settings input:disabled,
+.settings select:disabled,
+.settings textarea:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* フォーム部品の見た目は 1 か所で決める */
 .settings input[type="text"],
 .settings input[type="password"],
@@ -557,7 +574,8 @@ button.danger:hover:not(:disabled) {
   line-height: 1.5;
 }
 
-.settings label.checkbox span {
+/* 直接の子だけ。入れ子の補足 (.field-note) まで本文色にしない */
+.settings label.checkbox > span {
   color: var(--text-primary);
 }
 

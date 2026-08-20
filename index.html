@@ -191,6 +191,15 @@
               <input type="checkbox" id="injection-enabled" />
               <span>結果を前景アプリへ自動で貼り付ける</span>
             </label>
+            <label class="checkbox">
+              <input type="checkbox" id="keep-transcript" />
+              <span>
+                録音結果をクリップボードに残す
+                <span class="field-note">
+                  貼り付けに失敗しても Ctrl+V でやり直せます。元のクリップボード内容は上書きされます
+                </span>
+              </span>
+            </label>
             <label>
               <span>クリップボード復元までの待ち時間 (ms)</span>
               <input
@@ -199,7 +208,9 @@
                 min="50"
                 max="5000"
                 step="50"
+                aria-describedby="restore-delay-note"
               />
+              <span class="field-note" id="restore-delay-note" hidden></span>
             </label>
           </fieldset>
 

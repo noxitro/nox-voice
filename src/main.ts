@@ -154,6 +154,7 @@ interface ConfigView {
   history_enabled: boolean;
   history_retention_days: number;
   restore_delay_ms: number;
+  keep_transcript_in_clipboard: boolean;
   stt_model: string;
   format_model: string;
 }
@@ -338,6 +339,32 @@ function keyStateLabel(view: ConfigView, which: "groq" | "gemini"): string {
   return ` — 設定済み (${preview})`;
 }
 
+/**
+ * 復元ディレイ欄を触れなくする理由 (無ければ `null` = 有効のまま)。
+ *
+ * 判定を純関数にしておく。「クリップボードに残す」を選んでいる間、
+ * 復元そのものが行われないので待ち時間には意味が無い。値は消さない —
+ * 設定を戻したときに前の値が復活してほしい。
+ */
+function restoreDelayDisabledReason(keepTranscript: boolean): string | null {
+  return keepTranscript
+    ? "「録音結果をクリップボードに残す」がオンの間は復元しないため使われません"
+    : null;
+}
+
+/** チェック状態を見て、復元ディレイ欄の有効・無効を合わせる。 */
+function syncRestoreDelayEnabled() {
+  const keep = el<HTMLInputElement>("keep-transcript");
+  const delay = el<HTMLInputElement>("restore-delay");
+  const note = el<HTMLElement>("restore-delay-note");
+  const reason = restoreDelayDisabledReason(keep?.checked ?? true);
+  if (delay) delay.disabled = reason !== null;
+  if (note) {
+    note.textContent = reason ?? "";
+    note.hidden = reason === null;
+  }
+}
+
 function renderConfig(view: ConfigView) {
   const language = el<HTMLInputElement>("language");
   if (language) language.value = view.language;
@@ -347,6 +374,9 @@ function renderConfig(view: ConfigView) {
   if (injection) injection.checked = view.injection_enabled;
   const restoreDelay = el<HTMLInputElement>("restore-delay");
   if (restoreDelay) restoreDelay.value = String(view.restore_delay_ms);
+  const keepTranscript = el<HTMLInputElement>("keep-transcript");
+  if (keepTranscript) keepTranscript.checked = view.keep_transcript_in_clipboard;
+  syncRestoreDelayEnabled();
   const historyEnabled = el<HTMLInputElement>("history-enabled");
   if (historyEnabled) historyEnabled.checked = view.history_enabled;
   const retention = el<HTMLInputElement>("history-retention");
@@ -391,6 +421,7 @@ async function saveSettings(event: Event) {
   const startHidden = el<HTMLInputElement>("start-hidden");
   const localMode = el<HTMLSelectElement>("local-stt-mode");
   const styles = el<HTMLTextAreaElement>("style-profiles");
+  const keepTranscript = el<HTMLInputElement>("keep-transcript");
 
   // 入力欄が空 = 「変更しない」。誤って既存キーを消さないため未指定で送る。
   const patch: Record<string, unknown> = {
@@ -401,6 +432,7 @@ async function saveSettings(event: Event) {
     deep_context: deepContext?.checked ?? false,
     overlay_enabled: overlayEnabled?.checked ?? true,
     start_hidden: startHidden?.checked ?? true,
+    keep_transcript_in_clipboard: keepTranscript?.checked ?? true,
     local_stt_mode: localMode?.value ?? "fallback",
     // 空行は Rust 側で落とされる。
     dictionary: (dictionary?.value ?? "").split(/\r?\n/),
@@ -798,6 +830,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     });
   });
   el("settings-form")?.addEventListener("submit", (e) => void saveSettings(e));
+  el("keep-transcript")?.addEventListener("change", syncRestoreDelayEnabled);
   el("hotkey-capture")?.addEventListener("click", () => void toggleHotkeyCapture());
 
   // ウィンドウから離れたら捕獲をやめる。設定画面を離れたまま
