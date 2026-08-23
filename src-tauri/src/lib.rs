@@ -305,6 +305,8 @@ fn set_config(
     }
     // ホットキーはフックを設置し直さず、比較する仮想キーだけ差し替える。
     hotkey::set_hotkey_vk(updated.hotkey_vk);
+    // キャンセルキーも同じく即時反映 (0 なら無効化)。
+    hotkey::set_cancel_vk(updated.cancel_vk);
     // オーバーレイを後から有効にした場合はその場で作る。
     if updated.overlay_enabled {
         if let Err(e) = overlay::create(&app) {
@@ -773,6 +775,7 @@ pub fn run() {
             // 設定のホットキーを反映してからフックを設置する。
             let cfg = handle.state::<AppState>().config.snapshot();
             hotkey::set_hotkey_vk(cfg.hotkey_vk);
+            hotkey::set_cancel_vk(cfg.cancel_vk);
 
             if cfg.overlay_enabled {
                 if let Err(e) = overlay::create(&handle) {
@@ -949,6 +952,15 @@ fn start_hotkey_controller(app: &AppHandle) {
                                 handle_captured_key(&app, vk);
                                 continue;
                             }
+                            // 録音のキャンセルも解釈器を通さない別経路。
+                            // 破棄した時点で解釈器の押下状態は無効になるので捨てる
+                            // (開始失敗時と同じ整理)。押しっぱなしだった PTT キーの
+                            // 離しが、あとから StopRecording に化けないようにする。
+                            if event.kind == hotkey::HotkeyEventKind::Cancel {
+                                cancel_recording(&app);
+                                interpreter.reset();
+                                continue;
+                            }
                             // 判定は必ずイベントの発生時刻で行う。
                             // ここで Instant::now() を使うと、直前の処理で
                             // 詰まった分だけ短押しが長押しに化ける。
@@ -1064,6 +1076,8 @@ fn start_recording(app: &AppHandle) -> Result<(), String> {
     }
 
     set_status(app, Status::Recording, None);
+    // ここから録音中。キャンセルキーを武装する (停止系の全経路で解除する)。
+    hotkey::set_recording_active(true);
 
     // 表示とレベル送出は録音開始の後。ここで待たせると最初の一言が削れる。
     // 小窓を出さないならレベルを送る相手もいない。
@@ -1137,6 +1151,8 @@ fn request_finalize(app: &AppHandle) -> Result<(), String> {
     let Some(recorder) = recorder else {
         return Err("録音していません".to_string());
     };
+    // 通常停止の時点で録音は終わった扱い。キャンセルキーを非武装へ戻す。
+    hotkey::set_recording_active(false);
 
     let pending = state
         .pending
@@ -1161,6 +1177,63 @@ fn request_finalize(app: &AppHandle) -> Result<(), String> {
             context: pending.context,
         })))
         .map_err(|_| "後処理ワーカーが停止しています".to_string())
+}
+
+/// 録音を破棄する。WAV 化も転写も履歴記録も行わない。
+///
+/// **この関数は必ず軽いままにすること** ([`request_finalize`] と同じ制約)。
+/// 呼び出し元はホットキーのコントローラスレッドであり、ここでブロックすると
+/// 次のキー操作の反映が遅れる。行うのはロックの取得・take・drop・チャネルの
+/// 読み捨てだけ。重い後始末は何もない — 破棄なので残すものがない。
+fn cancel_recording(app: &AppHandle) {
+    // 先に非武装へ戻す。以降のキャンセルキー入力は通常のキーとして流れる。
+    hotkey::set_recording_active(false);
+
+    let state = app.state::<AppState>();
+    if !discard_recording(&state.recorder, &state.pending, &state.limit_rx) {
+        return; // 古いイベント (既に停止している)。黙って捨てる。
+    }
+
+    stop_level_emitter(app);
+    log::info!("録音をキャンセルした");
+    set_status_from(
+        app,
+        Status::Idle,
+        Some("録音をキャンセルしました".into()),
+        StatusOrigin::Recording,
+    );
+    // 小窓は idle への遷移では自分で畳まない (overlay.ts 参照)。
+    // 結果イベントも飛ばないので、エラー表示と同じ対で畳みを予約する。
+    overlay::hide_after(app, OVERLAY_ERROR_LINGER);
+}
+
+/// 録音状態を破棄する。WAV を作らずストリームだけ止める。破棄したら `true`。
+///
+/// [`AppHandle`] に触れない状態操作として分離してある。テストからは
+/// `AppState` を丸ごと組み立てずにこの単位で検証できる (テストバイナリが
+/// tauri のウィンドウ系コードをリンクすると、マニフェスト無しで起動しなくなる)。
+fn discard_recording(
+    recorder_slot: &Mutex<Option<Recorder>>,
+    pending_slot: &Mutex<Option<PendingRecording>>,
+    limit_rx: &Receiver<()>,
+) -> bool {
+    let recorder = recorder_slot.lock().ok().and_then(|mut slot| slot.take());
+    let Some(recorder) = recorder else {
+        return false; // 古いイベント (既に停止している)。
+    };
+    // drop でストリーム停止 (audio.rs の「drop で回収」パターン)。
+    // WAV を生成しないので音声はここで消える — それがキャンセルの意味。
+    drop(recorder);
+
+    // 挿入先情報も録音と一緒に捨てる。
+    if let Ok(mut slot) = pending_slot.lock() {
+        *slot = None;
+    }
+
+    // 上限監視の通知が滞留していれば捨てる。残っていると次の録音が
+    // 開始直後に「上限到達」で止められてしまう (start_recording と同じ掃除)。
+    while limit_rx.try_recv().is_ok() {}
+    true
 }
 
 /// ファイナライズワーカー本体。
@@ -2201,6 +2274,8 @@ fn finalize_on_exit(app: &AppHandle) {
     let Some(recorder) = pending else {
         return;
     };
+    // 終了処理へ引き渡した時点で録音は終わった扱い。キャンセルキーを非武装へ戻す。
+    hotkey::set_recording_active(false);
 
     log::warn!("録音中に終了が要求されました。録音の確定を試みます");
     let pending = state
@@ -2809,5 +2884,95 @@ mod tests {
         assert!(path.exists());
 
         let _ = std::fs::remove_dir_all(temp_dir("failed-nested"));
+    }
+
+    // --- 録音キャンセル ---
+    //
+    // ここでの検証は `AppState` を組み立てない。テストバイナリが tauri の
+    // ウィンドウ系コードまでリンクすると、マニフェスト (Common-Controls v6)
+    // を持たない exe はロード時に落ちるため (discard_recording の doc 参照)。
+
+    /// キャンセル経路は確定処理を通らない。履歴にも退避にも何も残らない。
+    ///
+    /// cancel_recording が行うのは Recorder の drop だけであり、
+    /// finalize_one / save_failed_recording / record_history は呼ばない。
+    /// 「破棄なのに痕跡が残る」ことが最悪の失敗モードなので、
+    /// 痕跡ゼロをここで畳んでおく。
+    #[test]
+    fn a_cancelled_recording_leaves_no_history_row_and_no_failed_wav() {
+        let (db_dir, store) = temp_store("cancel-db");
+        let failed_dir = temp_dir("cancel-wav");
+
+        // キャンセル相当: 確定させずにそのまま捨てる。
+        let recorder = Recorder::for_test(vec![0.5f32; 3_200], audio::TARGET_SAMPLE_RATE);
+        drop(recorder);
+
+        assert_eq!(store.count().expect("読める"), 0, "キャンセルが履歴行を作った");
+        let leftovers = std::fs::read_dir(&failed_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(leftovers, 0, "キャンセルが退避ファイルを作った");
+
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&failed_dir);
+    }
+
+    /// キャンセル後のホットキー離しで停止が暴発しないこと。
+    ///
+    /// PTT 長押し中に Esc を押してキャンセルしたあと、まだ押されたままの
+    /// ホットキーを離す。Cancel 分岐は解釈器を reset するので、この離しは
+    /// 何も生んではいけない (StopRecording に化けると状態表示とエラーが乱れる)。
+    #[test]
+    fn a_release_after_cancel_does_not_stop_the_next_recording() {
+        // コントローラループと同じ順序: 押下 → Cancel (破棄 + reset) → 離し。
+        let mut interpreter = PttInterpreter::new(TAP_THRESHOLD);
+        let t0 = Instant::now();
+        assert_eq!(
+            interpreter.on_press(t0),
+            Some(HotkeyAction::StartRecording)
+        );
+
+        // Esc でのキャンセル。解釈器は経由しないが、押下状態は捨てられる。
+        interpreter.reset();
+
+        // ホットキーを離しても何も起きない。
+        assert_eq!(
+            interpreter.on_release(t0 + Duration::from_millis(800)),
+            None,
+            "キャンセル後の離しが停止に化けた"
+        );
+        // 次の押下は素直に録音開始になる。
+        assert_eq!(
+            interpreter.on_press(t0 + Duration::from_secs(1)),
+            Some(HotkeyAction::StartRecording)
+        );
+    }
+
+    /// キャンセルと上限自動停止が競合しても二重処理にならないこと。
+    ///
+    /// handle_length_limit は録音スロットが空なら何もしない。キャンセルが
+    /// スロットを空にしていれば、遅れて届いた上限通知は無視される。また
+    /// discard_recording は滞留した上限通知を掃除するので、次の録音が
+    /// 開始直後に誤停止しない。
+    #[test]
+    fn a_cancelled_recording_does_not_double_stop_on_the_length_limit() {
+        let recorder_slot: Mutex<Option<Recorder>> =
+            Mutex::new(Some(Recorder::for_test(vec![0.0f32; 16], audio::TARGET_SAMPLE_RATE)));
+        let pending_slot: Mutex<Option<PendingRecording>> = Mutex::new(None);
+        let (limit_tx, limit_rx) = crossbeam_channel::bounded(1);
+
+        // 上限通知が滞留している状況でキャンセルが走る。
+        limit_tx.send(()).expect("上限通知を積める");
+        assert!(discard_recording(&recorder_slot, &pending_slot, &limit_rx));
+
+        // スロットは空 (= handle_length_limit の早期リターン条件が成立)。
+        assert!(recorder_slot.lock().expect("ロックできる").is_none());
+        assert!(pending_slot.lock().expect("ロックできる").is_none());
+        // 滞留が掃除済みで、次の録音が開始直後に止められないこと。
+        assert!(limit_rx.try_recv().is_err(), "上限通知の滞留が残っている");
+
+        // 空スロットへの再実行は古いイベントとして何もしない。
+        limit_tx.send(()).expect("上限通知を積める");
+        assert!(!discard_recording(&recorder_slot, &pending_slot, &limit_rx));
     }
 }

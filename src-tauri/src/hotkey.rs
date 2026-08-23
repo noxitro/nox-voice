@@ -60,12 +60,45 @@ static CAPTURE_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// 離すまで通常経路から締め出して、その事故を防ぐ。
 static SUPPRESS_UNTIL_RELEASE: AtomicU32 = AtomicU32::new(0);
 
+/// 録音キャンセルキーの既定。Esc。
+///
+/// ホットキーには選べないキー ([`is_allowed_hotkey`] が弾く) だが、
+/// キャンセル専用としては「取り消し」の意味がそのまま生きる。
+pub const DEFAULT_CANCEL_VK: u32 = 0x1B;
+
+/// 現在のキャンセルキー (0 = 無効)。設定から差し替えられる。
+static CANCEL_VK: AtomicU32 = AtomicU32::new(DEFAULT_CANCEL_VK);
+/// キャンセルキーの押下状態。オートリピート除去用 ([`KEY_IS_DOWN`] と同じ手法)。
+static CANCEL_IS_DOWN: AtomicBool = AtomicBool::new(false);
+/// 録音中のみ立てる。キャンセルキーは録音中しか効かない (武装フラグ)。
+static RECORDING_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// ホットキーを差し替える。フックの再設置は不要。
 pub fn set_hotkey_vk(vk: u32) {
     HOTKEY_VK.store(vk, Ordering::SeqCst);
     // 押しっぱなしの状態が残っていると、次の離しだけが届いて状態がねじれる。
     KEY_IS_DOWN.store(false, Ordering::SeqCst);
     log::info!("ホットキーを変更: {} (VK 0x{vk:02X})", key_label(vk));
+}
+
+/// キャンセルキーを差し替える (0 = 無効)。フックの再設置は不要。
+pub fn set_cancel_vk(vk: u32) {
+    CANCEL_VK.store(vk, Ordering::SeqCst);
+    // 押しっぱなしの状態が残っていると、次の離しだけが届いて状態がねじれる。
+    CANCEL_IS_DOWN.store(false, Ordering::SeqCst);
+    log::info!("キャンセルキーを変更: {} (VK 0x{vk:02X})", key_label(vk));
+}
+
+/// 録音の有無をフックへ教える。**録音中のみ**キャンセルキーが効く。
+///
+/// 非武装へ戻すときは押下状態も畳む。録音終了の瞬間にキャンセルキーが
+/// 押しっぱなしだった場合、そのままにしておくと次の録音の最初の keydown が
+/// オートリピート扱いで捨てられ、キャンセルが一度効かなくなる。
+pub fn set_recording_active(active: bool) {
+    RECORDING_ACTIVE.store(active, Ordering::SeqCst);
+    if !active {
+        CANCEL_IS_DOWN.store(false, Ordering::SeqCst);
+    }
 }
 
 /// キー捕獲モードを開始する。戻り値はこの捕獲セッションの世代。
@@ -154,6 +187,9 @@ pub enum HotkeyEventKind {
     Release,
     /// 捕獲モード中に押されたキー。PTT の解釈は行わない。
     Captured(u32),
+    /// 録音中にキャンセルキーが押された。PTT の解釈は行わない
+    /// (コントローラが録音を破棄する)。
+    Cancel,
 }
 
 /// フックが観測したキーイベント。**発生時刻を必ず伴う**。
@@ -267,6 +303,27 @@ fn handle_key_event(message: u32, lparam: LPARAM) {
         if matches!(message, WM_KEYUP | WM_SYSKEYUP) {
             SUPPRESS_UNTIL_RELEASE.store(0, Ordering::SeqCst);
         }
+        return;
+    }
+
+    // 録音中のキャンセルキー。押下で Cancel を 1 回だけ報告し、離しで状態を戻す。
+    // ホットキー経路の前に判定する (録音中は PTT の解釈より破棄が優先)。
+    let cancel_vk = CANCEL_VK.load(Ordering::SeqCst);
+    if cancel_vk != 0
+        && info.vkCode == cancel_vk
+        && !CAPTURE_MODE.load(Ordering::SeqCst)
+        && RECORDING_ACTIVE.load(Ordering::SeqCst)
+    {
+        if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+            // オートリピートの連打を 1 回の押下に畳む。
+            if !CANCEL_IS_DOWN.swap(true, Ordering::SeqCst) {
+                send(HotkeyEvent::new(HotkeyEventKind::Cancel));
+            }
+        } else if matches!(message, WM_KEYUP | WM_SYSKEYUP) {
+            CANCEL_IS_DOWN.store(false, Ordering::SeqCst);
+        }
+        // キー自体は抑制しない。Esc は挿入先アプリでも「取り消し」として
+        // 働くべきなので、そのまま流す (CallNextHookEx は呼び出し側で必ず通る)。
         return;
     }
 
@@ -441,6 +498,9 @@ impl PttInterpreter {
             HotkeyEventKind::Release => self.on_release(event.at),
             // 捕獲は設定操作であって録音操作ではない。
             HotkeyEventKind::Captured(_) => None,
+            // キャンセルも解釈器を通らない。コントローラが直接処理し、
+            // この解釈器の押下状態は reset() で捨てられる。
+            HotkeyEventKind::Cancel => None,
         }
     }
 
@@ -544,6 +604,21 @@ pub fn is_allowed_hotkey(vk: u32) -> bool {
         // かな (0x15) も、実キーが返す 0xF2 と対応が取れないので外す。
         | 0x1C | 0x1D
     )
+}
+
+/// キャンセルキーに選んでよいキーか。
+///
+/// ホットキー (`is_allowed_hotkey`) とは要件が違う。キャンセルは録音中の
+/// **1 回押し**であり押しっぱなしにしないため、`Enter` や文字キーでも
+/// 実害は 1 回きり。一方で Esc は捕獲モード脱出の専用キーとしてホットキー側では
+/// 拒否されるが、キャンセルキーの**既定**なので許さないと始まらない。
+///
+/// そこで拒否するのは次だけ:
+/// - マウスボタン (LL キーボードフックには来ない。設定ファイル経由でのみ入りうる)
+/// - 半角/全角 (0xF3 / 0xF4)・かな (0x15) (押すたびに VK が変わるため確実に発火しない)
+/// - 0 および 0xFF 超 (0 は「無効化」の意味だが呼び出し側でも弾く。範囲外は手編集の誤り)
+pub fn is_allowed_cancel_vk(vk: u32) -> bool {
+    (1..=0xFF).contains(&vk) && !matches!(vk, 0x01..=0x06 | 0xF3 | 0xF4 | 0x15)
 }
 
 /// 捕獲を始めてよいか。
@@ -739,6 +814,23 @@ mod tests {
     }
 
     #[test]
+    fn cancel_key_rules_differ_from_hotkey_rules() {
+        // 回帰: キャンセルキーの検証に is_allowed_hotkey を流用すると、
+        // 既定の Esc 自身が「不正」と判定され毎回警告が出る (実機で発覚)。
+        // キャンセルは 1 回押しなので Esc も文字キーも許す。要件が違うことをここで固定する。
+        assert!(is_allowed_cancel_vk(DEFAULT_CANCEL_VK));
+        assert!(is_allowed_cancel_vk(0x41)); // A
+        assert!(is_allowed_cancel_vk(0x0D)); // Enter
+        assert!(!is_allowed_hotkey(DEFAULT_CANCEL_VK)); // ホットキー側は従来どおり拒否
+        // 拒否側: マウス・VK が揺れる IME 系・範囲外・0。
+        assert!(!is_allowed_cancel_vk(0x01));
+        assert!(!is_allowed_cancel_vk(0xF3));
+        assert!(!is_allowed_cancel_vk(0x15));
+        assert!(!is_allowed_cancel_vk(0x100));
+        assert!(!is_allowed_cancel_vk(0));
+    }
+
+    #[test]
     fn modifier_and_function_keys_are_accepted() {
         // 押しっぱなしでも挿入先に実害が出ないキー。
         for vk in [0xA3, 0xA5, 0xA0, 0x5B, 0x5D, 0x14, 0x91, 0x13, 0x70, 0x87, 0x1C, 0x1D] {
@@ -875,5 +967,187 @@ mod tests {
             it.on_press(t0 + Duration::from_secs(2)),
             Some(HotkeyAction::StartRecording)
         );
+    }
+
+    // --- 録音キャンセルキー -----------------------------------------------------
+    //
+    // フックの共有状態 (static) を直接書き換えるため、テスト同士で
+    // 状態とイベントチャネルの奪い合いが起きないよう直列化する。
+
+    /// キャンセル系テストを直列化するロック。
+    fn hook_state_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// フック本体 (`send`) が届ける先。プロセスで 1 度だけ作る。
+    ///
+    /// 本来は [`spawn`] が設置するが、テストでは実フックを立てないため
+    /// ここで同じ型のチャネルを差し込む。
+    fn hook_events() -> Receiver<HotkeyEvent> {
+        static RX: OnceLock<Receiver<HotkeyEvent>> = OnceLock::new();
+        RX.get_or_init(|| {
+            let (tx, rx) = crossbeam_channel::bounded(EVENT_CHANNEL_CAPACITY);
+            let _ = EVENT_TX.set(tx);
+            rx
+        })
+        .clone()
+    }
+
+    /// テスト用にキーイベントをフックへ流し込む。
+    ///
+    /// `KBDLLHOOKSTRUCT` を積んで [`handle_key_event`] を直接呼ぶ。
+    /// 構造体は呼び出し内でコピーされるので、返ったあとの解放は安全。
+    fn feed_key(vk_code: i32, message: u32) {
+        let mut info = KBDLLHOOKSTRUCT::default();
+        info.vkCode = vk_code as u32;
+        let ptr = Box::into_raw(Box::new(info));
+        handle_key_event(message, LPARAM(ptr as isize));
+        // SAFETY: into_raw で渡した所有権を取り戻して解放するだけ。
+        drop(unsafe { Box::from_raw(ptr) });
+    }
+
+    /// 溜まっているイベントを読み捨てる。
+    fn drain(rx: &Receiver<HotkeyEvent>) {
+        while rx.try_recv().is_ok() {}
+    }
+
+    /// テスト後の後片付け (プロセス共有の状態を既定へ戻す)。
+    fn disarm_cancel_state() {
+        set_recording_active(false);
+        CANCEL_IS_DOWN.store(false, Ordering::SeqCst);
+        set_cancel_vk(DEFAULT_CANCEL_VK);
+    }
+
+    #[test]
+    fn the_default_cancel_key_is_escape() {
+        assert_eq!(DEFAULT_CANCEL_VK, 0x1B);
+        assert_eq!(key_label(DEFAULT_CANCEL_VK), "Esc");
+    }
+
+    #[test]
+    fn the_cancel_key_fires_only_while_recording() {
+        let _guard = hook_state_lock();
+        let rx = hook_events();
+        set_cancel_vk(DEFAULT_CANCEL_VK);
+        drain(&rx);
+
+        // 非武装では何も報告しない。
+        set_recording_active(false);
+        feed_key(DEFAULT_CANCEL_VK as i32, WM_KEYDOWN);
+        assert!(rx.try_recv().is_err(), "非武装なのに Cancel が発火した");
+
+        // 武装すると keydown 1 回で Cancel。
+        set_recording_active(true);
+        feed_key(DEFAULT_CANCEL_VK as i32, WM_KEYDOWN);
+        let event = rx.try_recv().expect("武装しているのに Cancel が届かない");
+        assert_eq!(event.kind, HotkeyEventKind::Cancel);
+
+        disarm_cancel_state();
+    }
+
+    #[test]
+    fn a_disabled_cancel_key_never_fires() {
+        let _guard = hook_state_lock();
+        let rx = hook_events();
+        set_cancel_vk(0); // 無効化
+        set_recording_active(true);
+        drain(&rx);
+
+        feed_key(DEFAULT_CANCEL_VK as i32, WM_KEYDOWN);
+        feed_key(DEFAULT_CANCEL_VK as i32, WM_KEYUP);
+        assert!(rx.try_recv().is_err(), "無効化したキーが発火した");
+
+        disarm_cancel_state();
+    }
+
+    #[test]
+    fn cancel_autorepeat_collapses_into_one_event() {
+        let _guard = hook_state_lock();
+        let rx = hook_events();
+        set_cancel_vk(DEFAULT_CANCEL_VK);
+        set_recording_active(true);
+        drain(&rx);
+
+        // 押しっぱなしによる keydown の連打は 1 回に畳まれる。
+        for _ in 0..5 {
+            feed_key(DEFAULT_CANCEL_VK as i32, WM_KEYDOWN);
+        }
+        assert_eq!(rx.try_recv().map(|e| e.kind).ok(), Some(HotkeyEventKind::Cancel));
+        assert!(rx.try_recv().is_err(), "オートリピートごとに発火した");
+
+        // 離せば再度押せる (次の録音でキャンセルできる)。
+        feed_key(DEFAULT_CANCEL_VK as i32, WM_KEYUP);
+        feed_key(DEFAULT_CANCEL_VK as i32, WM_KEYDOWN);
+        assert_eq!(rx.try_recv().map(|e| e.kind).ok(), Some(HotkeyEventKind::Cancel));
+
+        disarm_cancel_state();
+    }
+
+    #[test]
+    fn releasing_the_cancel_key_clears_the_held_flag() {
+        let _guard = hook_state_lock();
+        let rx = hook_events();
+        set_cancel_vk(DEFAULT_CANCEL_VK);
+        set_recording_active(true);
+        drain(&rx);
+
+        feed_key(DEFAULT_CANCEL_VK as i32, WM_KEYDOWN);
+        assert!(CANCEL_IS_DOWN.load(Ordering::SeqCst), "押下状態が立っていない");
+        // keyup 自体はイベントにならない (離しは報告する必要がない)。
+        feed_key(DEFAULT_CANCEL_VK as i32, WM_KEYUP);
+        assert!(!CANCEL_IS_DOWN.load(Ordering::SeqCst), "離しても状態が残った");
+
+        disarm_cancel_state();
+    }
+
+    #[test]
+    fn capture_mode_takes_priority_over_the_cancel_key() {
+        let _guard = hook_state_lock();
+        let rx = hook_events();
+        set_cancel_vk(DEFAULT_CANCEL_VK);
+        set_recording_active(true);
+        drain(&rx);
+
+        // 捕獲モード中は Esc も「押されたキー」として報告される (従来動作)。
+        // ここで Cancel として扱うと、設定中に録音が破棄されてしまう。
+        let previous = CAPTURE_MODE.swap(true, Ordering::SeqCst);
+        feed_key(DEFAULT_CANCEL_VK as i32, WM_KEYDOWN);
+        let event = rx.try_recv().expect("捕獲イベントが届かない");
+        assert_eq!(
+            event.kind,
+            HotkeyEventKind::Captured(DEFAULT_CANCEL_VK),
+            "捕獲モード中に Cancel 側へ吸われた"
+        );
+        assert!(!CANCEL_IS_DOWN.load(Ordering::SeqCst), "捕獲経路で押下状態が汚れた");
+
+        CAPTURE_MODE.store(previous, Ordering::SeqCst);
+        disarm_cancel_state();
+    }
+
+    #[test]
+    fn disarming_clears_a_stuck_cancel_key() {
+        let _guard = hook_state_lock();
+        // 録音終了の瞬間に Esc が押しっぱなしだった場合を模す。
+        RECORDING_ACTIVE.store(true, Ordering::SeqCst);
+        CANCEL_IS_DOWN.store(true, Ordering::SeqCst);
+
+        set_recording_active(false);
+        assert!(!RECORDING_ACTIVE.load(Ordering::SeqCst));
+        assert!(
+            !CANCEL_IS_DOWN.load(Ordering::SeqCst),
+            "非武装化で押下状態が残り、次の録音の最初の keydown が捨てられる"
+        );
+    }
+
+    #[test]
+    fn changing_the_cancel_key_clears_the_held_state() {
+        let _guard = hook_state_lock();
+        CANCEL_IS_DOWN.store(true, Ordering::SeqCst);
+        set_cancel_vk(0x70);
+        assert!(!CANCEL_IS_DOWN.load(Ordering::SeqCst));
+        assert_eq!(CANCEL_VK.load(Ordering::SeqCst), 0x70);
+        // 後片付け (プロセス共有の状態なので戻す)。
+        set_cancel_vk(DEFAULT_CANCEL_VK);
     }
 }

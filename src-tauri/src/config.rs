@@ -164,6 +164,10 @@ pub struct Config {
     pub start_hidden: bool,
     /// PTT に使う仮想キーコード。既定は右 Ctrl。
     pub hotkey_vk: u32,
+    /// 録音を破棄するキャンセルキー。既定は Esc。**0 で無効化**。
+    ///
+    /// ホットキーとの重複は不可 ([`Config::normalize`] が解消する)。
+    pub cancel_vk: u32,
     /// 録音中・処理中の小窓を出すか。
     pub overlay_enabled: bool,
     /// 画面のテキストを読んで文脈として使うか (deep context)。
@@ -213,6 +217,7 @@ impl Default for Config {
             local_model_sha256: String::new(),
             start_hidden: true,
             hotkey_vk: crate::hotkey::DEFAULT_HOTKEY_VK,
+            cancel_vk: crate::hotkey::DEFAULT_CANCEL_VK,
             overlay_enabled: true,
             // 画面テキストをクラウドへ送るので、明示的に有効化させる。
             deep_context: false,
@@ -347,6 +352,8 @@ pub struct ConfigView {
     pub hotkey_vk: u32,
     /// 表示用のキー名 (「右 Ctrl」など)。
     pub hotkey_label: String,
+    /// 録音キャンセルキーの表示名 (「Esc」など)。
+    pub cancel_label: String,
     pub overlay_enabled: bool,
     pub history_enabled: bool,
     pub history_retention_days: u32,
@@ -388,6 +395,7 @@ impl ConfigView {
             start_hidden: c.start_hidden,
             hotkey_vk: c.hotkey_vk,
             hotkey_label: crate::hotkey::key_label(c.hotkey_vk),
+            cancel_label: crate::hotkey::key_label(c.cancel_vk),
             overlay_enabled: c.overlay_enabled,
             history_enabled: c.history_enabled,
             history_retention_days: c.history_retention_days,
@@ -426,6 +434,7 @@ pub struct ConfigPatch {
     pub local_model_sha256: Option<String>,
     pub start_hidden: Option<bool>,
     pub hotkey_vk: Option<u32>,
+    pub cancel_vk: Option<u32>,
     pub overlay_enabled: Option<bool>,
     pub history_enabled: Option<bool>,
     pub history_retention_days: Option<u32>,
@@ -461,6 +470,7 @@ impl fmt::Debug for ConfigPatch {
             .field("local_stt_mode", &self.local_stt_mode)
             .field("start_hidden", &self.start_hidden)
             .field("hotkey_vk", &self.hotkey_vk)
+            .field("cancel_vk", &self.cancel_vk)
             .field("overlay_enabled", &self.overlay_enabled)
             .field(
                 "style_profiles",
@@ -496,6 +506,28 @@ impl Config {
                 self.hotkey_vk
             );
             self.hotkey_vk = crate::hotkey::DEFAULT_HOTKEY_VK;
+        }
+        // キャンセルキーはホットキーと要件が違う (録音中の 1 回押しなので Esc や
+        // 文字キーも可。hotkey.rs の is_allowed_cancel_vk を参照)。マウスや
+        // VK が揺れる IME 系だけ弾く。ただし **0 は「無効化」という意味の
+        // 正しい値**なので、そのまま通す。
+        if self.cancel_vk != 0 && !crate::hotkey::is_allowed_cancel_vk(self.cancel_vk) {
+            log::warn!(
+                "キャンセルキーに使えない値 (VK 0x{:02X}) が設定されていたので既定へ戻します",
+                self.cancel_vk
+            );
+            self.cancel_vk = crate::hotkey::DEFAULT_CANCEL_VK;
+        }
+        // ホットキーとの重複は禁止。押すたびに録音とキャンセルが同時に
+        // 起こってしまう。キャンセル側を既定 (Esc) へ戻して解消する —
+        // ホットキーは Esc を選べないので、これで必ず外れる。
+        if self.cancel_vk != 0 && self.cancel_vk == self.hotkey_vk {
+            log::warn!(
+                "キャンセルキーがホットキー ({}) と重複していたため、既定の {} へ戻します",
+                crate::hotkey::key_label(self.hotkey_vk),
+                crate::hotkey::key_label(crate::hotkey::DEFAULT_CANCEL_VK)
+            );
+            self.cancel_vk = crate::hotkey::DEFAULT_CANCEL_VK;
         }
         self.restore_delay_ms = self
             .restore_delay_ms
@@ -560,6 +592,9 @@ impl Config {
         }
         if let Some(v) = patch.hotkey_vk {
             self.hotkey_vk = v;
+        }
+        if let Some(v) = patch.cancel_vk {
+            self.cancel_vk = v;
         }
         if let Some(v) = patch.overlay_enabled {
             self.overlay_enabled = v;
@@ -1047,6 +1082,101 @@ mod tests {
             cfg.normalize();
             assert_eq!(cfg.hotkey_vk, ok, "VK 0x{ok:02X} が消された");
         }
+    }
+
+    #[test]
+    fn the_default_cancel_key_is_escape() {
+        let cfg = Config::default();
+        assert_eq!(cfg.cancel_vk, crate::hotkey::DEFAULT_CANCEL_VK);
+        assert_eq!(cfg.cancel_vk, 0x1B);
+        assert_eq!(ConfigView::from(&cfg).cancel_label, "Esc");
+    }
+
+    #[test]
+    fn an_invalid_cancel_key_falls_back_to_the_default() {
+        // 手編集で入りうる危険な値を弾く。基準はホットキーとは違う
+        // (is_allowed_cancel_vk を参照): 1 回押しなので Esc / 文字 / Enter は可。
+        let rejected = [
+            0x01u32, // マウス左 (キーボードフックに来ない)
+            0xF4,    // 半角/全角 (押すたびに VK が揺れる)
+            0x15,    // かな
+            0x100,   // 範囲外
+        ];
+        for broken in rejected {
+            let mut cfg = Config {
+                cancel_vk: broken,
+                ..Config::default()
+            };
+            cfg.normalize();
+            assert_eq!(
+                cfg.cancel_vk,
+                crate::hotkey::DEFAULT_CANCEL_VK,
+                "VK 0x{broken:02X} を受け入れてしまった"
+            );
+        }
+        // 文字キーや Enter、そして既定の Esc は 1 回押しなら実害がないので通す。
+        let accepted = [0x41u32, 0x0D, 0x20, crate::hotkey::DEFAULT_CANCEL_VK];
+        for ok in accepted {
+            let mut cfg = Config {
+                cancel_vk: ok,
+                ..Config::default()
+            };
+            cfg.normalize();
+            assert_eq!(cfg.cancel_vk, ok, "VK 0x{ok:02X} を潰してしまった");
+        }
+        // 0 は「無効化」という意味の正しい値なのでそのまま通す。
+        let mut disabled = Config {
+            cancel_vk: 0,
+            ..Config::default()
+        };
+        disabled.normalize();
+        assert_eq!(disabled.cancel_vk, 0, "無効化の 0 を潰した");
+    }
+
+    #[test]
+    fn a_cancel_key_clashing_with_the_hotkey_falls_back_to_the_default() {
+        // 押すたびに録音とキャンセルが同時に起こるので、衝突は必ず解消する。
+        let mut cfg = Config {
+            hotkey_vk: 0x70,
+            cancel_vk: 0x70,
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert_ne!(
+            cfg.cancel_vk, cfg.hotkey_vk,
+            "ホットキーとの衝突が残っている"
+        );
+        assert_eq!(cfg.cancel_vk, crate::hotkey::DEFAULT_CANCEL_VK);
+
+        // 無効化 (0) との比較は衝突にならない。
+        let mut disabled = Config {
+            hotkey_vk: 0x70,
+            cancel_vk: 0,
+            ..Config::default()
+        };
+        disabled.normalize();
+        assert_eq!(disabled.cancel_vk, 0);
+    }
+
+    #[test]
+    fn the_cancel_key_round_trips_through_disk() {
+        let dir = std::env::temp_dir().join(format!("nox-config-cancel-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = fs::remove_dir_all(&dir);
+
+        let store = ConfigStore::load(path.clone());
+        store
+            .update(ConfigPatch {
+                cancel_vk: Some(0x91), // ScrollLock
+                ..ConfigPatch::default()
+            })
+            .expect("保存できる");
+
+        let reloaded = ConfigStore::load(path).snapshot();
+        assert_eq!(reloaded.cancel_vk, 0x91);
+        assert_eq!(ConfigView::from(&reloaded).cancel_label, "ScrollLock");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
