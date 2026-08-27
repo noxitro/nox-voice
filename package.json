@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "release": "npm run build && cargo build --release --features tauri/custom-protocol --manifest-path src-tauri/Cargo.toml",
     "e2e:hotkey": "node e2e/hotkey.mjs",
     "e2e:single-instance": "node e2e/single-instance.mjs",
     "sim": "npm run sim:instance && npm run sim:ui",
