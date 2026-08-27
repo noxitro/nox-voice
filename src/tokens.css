@@ -20,6 +20,9 @@
   --surface-base: #f4f4f6; /* ウィンドウの地 */
   --surface-raised: #ffffff; /* パネル */
   --surface-sunken: #f0f0f3; /* 入力欄・本文表示 */
+  /* 左レール。地より一段沈める。カード (raised) と対にして
+     「ナビは奥、内容は手前」を面の明度だけで言う (罫を太らせない)。 */
+  --surface-rail: #eeeef1;
   --surface-hover: rgba(16, 16, 20, 0.045);
   --surface-active: rgba(16, 16, 20, 0.075);
 
@@ -94,6 +97,9 @@
     --surface-base: #17171a;
     --surface-raised: #202024;
     --surface-sunken: #191a1d;
+    /* 暗い側では「奥ほど暗い」が効かない (地が既に暗い) ので、
+       レールは地よりわずかに暗くして境界を面で作る。 */
+    --surface-rail: #121215;
     --surface-hover: rgba(255, 255, 255, 0.055);
     --surface-active: rgba(255, 255, 255, 0.09);
 

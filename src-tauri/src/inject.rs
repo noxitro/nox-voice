@@ -122,6 +122,8 @@ pub enum InjectOutcome {
     Injected,
     /// 設定で注入が無効。
     Disabled,
+    /// 「クリップボードのみ」モード。意図的に貼り付けていない。
+    ClipboardOnly,
     /// 挿入するテキストが空。
     EmptyText,
     /// R7: 前景ウィンドウが録音開始時と違う。
@@ -219,7 +221,11 @@ impl InjectReport {
         // 状態だけで判定すると「毎回トーストが鳴る」構造になり、
         // 通知が意味を失う (design.md R6 の「毎回鳴る通知は無意味」と同じ)。
         // 手当てが要るのは**送出できずにクリップボードだけが残った**場合。
-        (!self.injected && self.clipboard_state.holds_injected_text())
+        // 「クリップボードのみ」は貼らないのが仕様。ここを除かないと
+        // 成功のたびにトーストが鳴り、通知が意味を失う。
+        (!self.injected
+            && self.outcome != InjectOutcome::ClipboardOnly
+            && self.clipboard_state.holds_injected_text())
             // 何かが失われたことは必ず知らせる。
             || !self.lost_formats.is_empty()
             || self.clipboard_state == ClipboardState::Lost
@@ -251,6 +257,12 @@ pub fn outcome_message(outcome: InjectOutcome, clipboard: ClipboardState) -> Opt
             });
         }
         InjectOutcome::Disabled | InjectOutcome::EmptyText => return None,
+        // 貼らなかったのは仕様どおり。手当ては要らないので黙る
+        // (毎回鳴る通知は意味を失う / R6)。クリップボードが壊れたときだけ知らせる。
+        InjectOutcome::ClipboardOnly => {
+            return (clipboard != ClipboardState::HoldsInjectedText)
+                .then(|| "クリップボードへコピーできませんでした".to_string())
+        }
         InjectOutcome::AbortedFocusChanged => "挿入先が変わったため貼り付けを中止しました",
         InjectOutcome::AbortedTargetUnknown => {
             "録音開始時の挿入先を特定できなかったため貼り付けを中止しました"
@@ -295,6 +307,46 @@ impl InjectTarget {
 
     fn is_known(&self) -> bool {
         self.hwnd != 0
+    }
+}
+
+/// テキストをクリップボードへ入れるだけで終える (貼り付けない)。
+///
+/// # なぜ [`inject`] と別経路なのか
+///
+/// [`inject`] の中止経路 (`AbortedTargetUnknown` 等) でも結果的に
+/// クリップボードにはテキストが残るが、それは**失敗の副産物**として
+/// 扱われる — 通知が飛び、履歴には中止として記録される。
+/// 「クリップボードのみ」は失敗ではなく指定された動作なので、
+/// 前景の照合も修飾キーの確認も行わず、通知も出さない。
+/// フォーカスが無い状態 (デスクトップ / 入力欄に居ない) でも成立するのが
+/// この経路の存在理由なので、照合を通してはいけない。
+///
+/// 貼付後の復元 ([`ClipboardPolicy`]) も行わない。ユーザーはこの後
+/// 自分の手で Ctrl+V する — その前に元へ戻したら何も貼れない。
+pub fn copy_only(text: &str) -> InjectReport {
+    if text.trim().is_empty() {
+        return InjectReport::untouched(InjectOutcome::EmptyText);
+    }
+    match prepare_clipboard(text) {
+        Ok(prepared) => {
+            log::info!(
+                "クリップボードのみ: {} 文字を入れました (貼り付けはしません)",
+                text.chars().count()
+            );
+            InjectReport {
+                outcome: InjectOutcome::ClipboardOnly,
+                injected: false,
+                clipboard_state: ClipboardState::HoldsInjectedText,
+                lost_formats: prepared.lost_formats,
+                message: None,
+            }
+        }
+        Err(failure) => InjectReport::aborted(
+            InjectOutcome::ClipboardOnly,
+            failure.clipboard_state,
+            failure.lost_formats,
+        ),
     }
 }
 
@@ -1595,6 +1647,62 @@ mod tests {
         if let Some(text) = user_original {
             restore_text(&text).expect("ユーザーの内容へ戻す");
         }
+    }
+
+    /// クリップボードのみモード: 貼らずに、確かにテキストが入っていること。
+    ///
+    /// この経路は前景照合を通らない (フォーカスが無くても成立するのが
+    /// 存在理由)。「中止されたが副産物として残った」ではなく
+    /// **指定どおりの結末**として `ClipboardOnly` を返す必要がある。
+    #[test]
+    #[ignore = "実クリップボードを使う。--test-threads=1 で実行すること"]
+    fn copy_only_leaves_the_text_without_pasting() {
+        let user_original = {
+            let _guard = ClipboardGuard::open().expect("開ける");
+            // SAFETY: クリップボードは開いている。
+            unsafe { read_unicode_text() }
+        };
+
+        restore_text("nox-voice テスト用の元テキスト").expect("前準備");
+
+        let report = copy_only("コピーだけされるテキスト");
+        assert_eq!(report.outcome, InjectOutcome::ClipboardOnly);
+        assert!(!report.injected, "貼り付けを送出してはいけない");
+        assert_eq!(report.clipboard_state, ClipboardState::HoldsInjectedText);
+        assert!(
+            report.message.is_none(),
+            "指定どおりの結末で通知文を出してはいけない: {:?}",
+            report.message
+        );
+        assert!(
+            !report.needs_user_action(),
+            "成功のたびにトーストが鳴ると通知が意味を失う (R6)"
+        );
+
+        let after = {
+            let _guard = ClipboardGuard::open().expect("開ける");
+            // SAFETY: クリップボードは開いている。
+            unsafe { read_unicode_text() }
+        };
+        assert_eq!(
+            after.as_deref(),
+            Some("コピーだけされるテキスト"),
+            "クリップボードに入っていない (この経路の結果そのものが消えている)"
+        );
+
+        // 後片付け: ユーザーのクリップボードへ必ず戻す。
+        if let Some(text) = user_original {
+            restore_text(&text).expect("ユーザーの内容へ戻す");
+        }
+    }
+
+    /// 空文字ではクリップボードに触れない (前の内容を無意味に壊さない)。
+    #[test]
+    fn copy_only_does_not_touch_the_clipboard_for_empty_text() {
+        let report = copy_only("   
+  ");
+        assert_eq!(report.outcome, InjectOutcome::EmptyText);
+        assert_eq!(report.clipboard_state, ClipboardState::Untouched);
     }
 
     /// M1 回帰: ガードを握った状態でシーケンスを再確認し、

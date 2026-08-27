@@ -34,10 +34,13 @@ mod format;
 mod history;
 mod hotkey;
 mod inject;
+mod instance;
 mod local_stt;
 mod overlay;
 mod pipeline;
+mod screen;
 mod session;
+mod sound;
 mod stt;
 mod style;
 mod tray;
@@ -57,9 +60,9 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, Wry};
 
 use audio::Recorder;
 use config::{ConfigPatch, ConfigStore, ConfigView};
-use format::GeminiFormatter;
-use hotkey::{HookHandle, HotkeyAction, PttInterpreter, TAP_THRESHOLD};
-use history::{HistoryStore, SessionDraft, SessionRow};
+use format::{GeminiFormatter, ScreenAnswerer};
+use history::{DashboardStats, HistoryStore, SessionDraft, SessionRow};
+use hotkey::{HookHandle, HotkeyAction, HotkeyMode, PttInterpreter, HOTKEY_SLOTS, TAP_THRESHOLD};
 use inject::{ClipboardState, InjectOutcome, InjectTarget};
 use pipeline::FormatOutcome;
 use session::{
@@ -99,6 +102,14 @@ const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const OVERLAY_RESULT_LINGER: std::time::Duration = std::time::Duration::from_millis(1_600);
 /// エラー表示を残す時間 (読む時間が要る)。
 const OVERLAY_ERROR_LINGER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 画面質問モードの Gemini 呼び出しを見切る時間。
+///
+/// 整形の 20 秒 ([`format::FORMAT_TIMEOUT`]) より長い。整形は落ちても
+/// R2 の劣化モード (生転写) があるので短く見切ってよいが、**画面質問には
+/// 劣化先が無い** — 落ちれば「答えられませんでした」しか返せない。
+/// しかも入力に画像 1 枚が乗り、出力は一覧になりうるので素で遅い。
+const SCREEN_ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// 入力レベルを送る間隔。20fps。
 ///
@@ -143,6 +154,11 @@ pub struct ResultPayload {
     pub clipboard_state: ClipboardState,
     /// R6: 退避できずに失われたクリップボード形式。
     pub lost_clipboard_formats: Vec<String>,
+    /// 適用された文体プロファイルの印 ([`style::history_label`])。
+    ///
+    /// `None` は「文体の選択を通っていない経路」(画面質問モードなど)、
+    /// `Some("")` は「どれにも当たらなかった」。履歴 DB の列と同じ約束。
+    pub style_profile: Option<String>,
 }
 
 /// ファイナライズワーカーへ渡す仕事。
@@ -152,8 +168,22 @@ struct FinalizeJob {
     recorder: Recorder,
     target: TargetWindow,
     started_at: SystemTime,
+    /// 録音を始めたホットキーの用途。結果の届け方を決める。
+    mode: HotkeyMode,
     /// deep context の結果。使い捨てで、履歴には残さない。
     context: context::ScreenContext,
+    /// 画面質問モードの走査の待ち受け口 (他の用途では `None`)。
+    screen: Option<screen::ScanHandle>,
+}
+
+/// [`finalize_one`] の成果。
+///
+/// タプルで返すと、要素が増えるたびに呼び出し側の分解を書き換えることになり、
+/// **順番を取り違えても型が同じなら通ってしまう**。
+struct FinalizedRecording {
+    recording: RecordingSession,
+    context: context::ScreenContext,
+    screen: Option<screen::ScanHandle>,
 }
 
 /// ワーカーが処理する仕事。
@@ -211,6 +241,12 @@ struct AppState {
     failed_dir: PathBuf,
     /// ローカル STT のモデル置き場。
     models_dir: PathBuf,
+    /// 進行中のキー捕獲がどの用途のものか ([`HotkeyMode::slot`])。
+    ///
+    /// 捕獲の確定はコントローラスレッドで起きるが、「どのキーを設定しに
+    /// 来たのか」を知っているのは捕獲を始めたコマンド側だけ。
+    /// 捕獲は排他 (同時に 1 つ) なので 1 枠で足りる。
+    capture_slot: std::sync::atomic::AtomicUsize,
 }
 
 impl AppState {
@@ -249,6 +285,7 @@ impl AppState {
             last_result: Mutex::new(None),
             failed_dir,
             models_dir,
+            capture_slot: std::sync::atomic::AtomicUsize::new(HotkeyMode::Inject.slot()),
         }
     }
 
@@ -260,11 +297,7 @@ impl AppState {
 /// 現在の状態を返す。
 #[tauri::command]
 fn get_status(state: tauri::State<'_, AppState>) -> Status {
-    state
-        .status
-        .lock()
-        .map(|s| *s)
-        .unwrap_or(Status::Idle)
+    state.status.lock().map(|s| *s).unwrap_or(Status::Idle)
 }
 
 /// 直近の録音結果の要約を返す (WAV 本体は含まない)。
@@ -303,8 +336,8 @@ fn set_config(
     if updated.history_retention_days != previous_retention {
         enforce_retention(&app, updated.history_retention_days);
     }
-    // ホットキーはフックを設置し直さず、比較する仮想キーだけ差し替える。
-    hotkey::set_hotkey_vk(updated.hotkey_vk);
+    // ホットキーはフックを設置し直さず、比較する組み合わせだけ差し替える。
+    apply_hotkeys(&updated);
     // キャンセルキーも同じく即時反映 (0 なら無効化)。
     hotkey::set_cancel_vk(updated.cancel_vk);
     // オーバーレイを後から有効にした場合はその場で作る。
@@ -457,10 +490,17 @@ fn retranscribe_history_entry(state: tauri::State<'_, AppState>, id: i64) -> Res
 /// 押し忘れて放置されると他アプリのキーを拾ってしまうので、
 /// [`CAPTURE_TIMEOUT`] で自動的に畳む。
 #[tauri::command]
-fn start_hotkey_capture(app: AppHandle) -> Result<u64, String> {
+fn start_hotkey_capture(app: AppHandle, mode: Option<String>) -> Result<u64, String> {
     // 録音中に捕獲へ入ると、PTT の離しが捕獲側へ吸われて録音が止まらなくなる。
-    hotkey::can_begin_capture(app.state::<AppState>().is_recording())
-        .map_err(str::to_string)?;
+    hotkey::can_begin_capture(app.state::<AppState>().is_recording()).map_err(str::to_string)?;
+
+    // どの用途のキーを設定しに来たのか。確定はコントローラスレッドで
+    // 起きるので、ここで残しておかないと行き先が分からない。
+    let mode = parse_mode(mode.as_deref())?;
+    app.state::<AppState>()
+        .capture_slot
+        .store(mode.slot(), std::sync::atomic::Ordering::SeqCst);
+    log::info!("キー捕獲を開始 [{}]", mode.label());
 
     let generation = hotkey::begin_capture();
 
@@ -489,6 +529,87 @@ fn start_hotkey_capture(app: AppHandle) -> Result<u64, String> {
 #[tauri::command]
 fn cancel_hotkey_capture() {
     hotkey::end_capture(None);
+}
+
+/// フロントから来た用途名を [`HotkeyMode`] へ。既定は貼り付け。
+fn parse_mode(raw: Option<&str>) -> Result<HotkeyMode, String> {
+    match raw.unwrap_or("inject") {
+        "inject" => Ok(HotkeyMode::Inject),
+        "clipboard_only" => Ok(HotkeyMode::ClipboardOnly),
+        "screen_ask" => Ok(HotkeyMode::ScreenAsk),
+        other => Err(format!("不明なホットキー用途です: {other}")),
+    }
+}
+
+/// 用途に割り当てたホットキーを解除する。
+///
+/// 貼り付け用は解除できない — 解除すると録音を始める手段が無くなり、
+/// 設定画面を開くことでしか復旧できないアプリになる。
+#[tauri::command]
+fn clear_hotkey(app: AppHandle, mode: Option<String>) -> Result<ConfigView, String> {
+    let mode = parse_mode(mode.as_deref())?;
+    if mode == HotkeyMode::Inject {
+        return Err("録音用のホットキーは解除できません".to_string());
+    }
+    let state = app.state::<AppState>();
+    let patch = match mode {
+        HotkeyMode::ClipboardOnly => config::ConfigPatch {
+            clipboard_hotkey_vk: Some(0),
+            clipboard_hotkey_mods: Some(Vec::new()),
+            ..Default::default()
+        },
+        // 画面質問は**有効化フラグには触らない**。「キーを付け替えたい」と
+        // 「機能ごと止めたい」は別の意図で、解除のたびにトグルまで倒すと
+        // 前者のつもりの操作が後者になる。
+        HotkeyMode::ScreenAsk => config::ConfigPatch {
+            screen_ask_hotkey_vk: Some(0),
+            screen_ask_hotkey_mods: Some(Vec::new()),
+            ..Default::default()
+        },
+        // 上で弾いてある。
+        HotkeyMode::Inject => return Err("録音用のホットキーは解除できません".to_string()),
+    };
+    let updated = state.config.update(patch)?;
+    apply_hotkeys(&updated);
+    Ok(ConfigView::from(&updated))
+}
+
+/// 設定 UI の試聴。**保存前の値**で鳴らせるようにする
+/// (聞いてから決められないと、選ぶたびに保存する羽目になる)。
+#[tauri::command]
+fn preview_sound(
+    state: tauri::State<'_, AppState>,
+    preset: sound::SoundPreset,
+    path: Option<String>,
+    volume: Option<u8>,
+) -> Result<(), String> {
+    let cfg = state.config.snapshot();
+    let volume = volume.unwrap_or(cfg.sound_volume).min(100);
+    let choice = sound::SoundChoice::new(preset, path.as_deref().unwrap_or_default());
+    // 試聴だけは失敗を返す。設定 UI では「鳴らない」理由が要る
+    // (通常の再生経路はログに落とすだけで、録音を止めない)。
+    let wav = sound::render_wav(&choice, volume.max(1))?;
+    sound::play_rendered(wav);
+    Ok(())
+}
+
+/// プリセット一覧 (id と表示名)。UI の選択肢を Rust 側の定義から作る。
+#[tauri::command]
+fn list_sound_presets() -> Vec<SoundPresetInfo> {
+    sound::SoundPreset::all()
+        .iter()
+        .map(|p| SoundPresetInfo {
+            id: p.id().to_string(),
+            label: p.label().to_string(),
+        })
+        .collect()
+}
+
+/// [`list_sound_presets`] の 1 件。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SoundPresetInfo {
+    pub id: String,
+    pub label: String,
 }
 
 /// オーバーレイの webview が読み込まれたことを知らせる。
@@ -614,7 +735,10 @@ fn download_local_model(app: AppHandle) -> Result<(), String> {
                     ) {
                         log::debug!("進捗イベントの送出に失敗: {e}");
                     }
-                    emit_background_error(&app, &format!("モデルのダウンロードに失敗しました: {e}"));
+                    emit_background_error(
+                        &app,
+                        &format!("モデルのダウンロードに失敗しました: {e}"),
+                    );
                 }
             }
         });
@@ -638,6 +762,61 @@ fn get_storage_stats(state: tauri::State<'_, AppState>) -> Result<StorageStats, 
         failed_bytes,
         failed_files,
         untranscribed_rows,
+    })
+}
+
+/// ダッシュボード用の集計統計を返す。
+#[tauri::command]
+fn get_dashboard_stats(state: tauri::State<'_, AppState>) -> Result<DashboardStats, String> {
+    let cfg = state.config.snapshot();
+    let typing_speed = cfg.typing_speed_chars_per_min;
+    state
+        .history
+        .get_dashboard_stats(typing_speed)
+        .map_err(|e| e.to_string())
+}
+
+/// 「よく使っているのに文体プロファイルが無いアプリ」の提案。
+///
+/// **0 件と欠測を混同しない**ための形。`history_enabled` が偽なら
+/// そもそも数える材料が無く、`total_sessions` が 0 なら材料はあるが
+/// まだ喋っていない。どちらも「提案なし」と一緒に見せると、
+/// 利用者は「この機能は壊れている」としか受け取れない。
+#[derive(Debug, Clone, Serialize)]
+pub struct StyleSuggestions {
+    /// 履歴が有効か。偽なら以下の数字はすべて意味を持たない。
+    pub history_enabled: bool,
+    /// 集計に使えた録音の総数。
+    pub total_sessions: u64,
+    /// 提案 (多い順)。
+    pub items: Vec<style::ProcessUsage>,
+}
+
+/// 設定画面に出す提案の上限。多すぎると「作業リスト」に見えてしまう。
+const STYLE_SUGGESTION_LIMIT: usize = 5;
+
+/// 履歴を集計して、プロファイルが無い挿入先の上位を返す。
+#[tauri::command]
+fn get_style_suggestions(state: tauri::State<'_, AppState>) -> Result<StyleSuggestions, String> {
+    let cfg = state.config.snapshot();
+    if !cfg.history_enabled {
+        return Ok(StyleSuggestions {
+            history_enabled: false,
+            total_sessions: 0,
+            items: Vec::new(),
+        });
+    }
+    let total_sessions = state.history.count().map_err(|e| e.to_string())?;
+    // 上位だけを見ると、既に設定済みのアプリで枠が埋まって何も出ない。
+    // 余分に取ってから絞る。
+    let usage = state
+        .history
+        .process_usage(50)
+        .map_err(|e| e.to_string())?;
+    Ok(StyleSuggestions {
+        history_enabled: true,
+        total_sessions,
+        items: style::suggest_uncovered(&usage, &cfg.style_profiles, STYLE_SUGGESTION_LIMIT),
     })
 }
 
@@ -706,7 +885,42 @@ fn show_window(app: AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // **1 行目でやること**。Tauri のビルダーに触る前に名前付きミューテックスを取る。
+    //
+    // 下の `tauri-plugin-single-instance` は残してあるが、あれだけでは漏れる。
+    // プラグインの判定は `Builder::setup` の中 (= アプリ初期化のかなり後) で
+    // 走るうえ、「ミューテックスは在るがウィンドウがまだ無い」状態を
+    // 「起動していない」と読んで**そのまま 2 個目を起動する**。
+    // 昇格レベルが食い違う場合も同様に素通りする。詳しくは `instance` モジュール。
+    //
+    // カーネルオブジェクトの生成はアトミックで、ウィンドウ生成より桁違いに速い。
+    // ここで取り切ることで起動競合が原理的に消える。
+    // 既に起動していれば、この関数は既存インスタンスへ通知してから終了する。
+    instance::ensure_single_instance();
+
     let app = tauri::Builder::default()
+        // **多重起動を止める。他のプラグインより先に入れること** (公式の要件)。
+        //
+        // ただし多重起動を実際に止めているのは、上の `instance::ensure_single_instance()`
+        // (名前付きミューテックス) のほう。このプラグインが担うのは UX 側、
+        // すなわち「2 個目が起動されたら既存のウィンドウを前に出す」だけである。
+        // 2 個目はミューテックスの時点で終了するので、下のコールバックは
+        // 2 個目のプロセスからの `WM_COPYDATA` を**この 1 個目が受け取って**走る。
+        //
+        // 常駐トレイアプリはウィンドウが見えないので、二重に起動しても
+        // 利用者からは分からない。そして二重に起動すると:
+        //
+        // - フックが 2 本刺さり、1 回のホットキーで**録音が 2 回**始まる
+        // - 片方で設定を変えても、もう片方は古いホットキーのまま反応し続ける
+        //   (「設定は保存されるのに効かない」の正体)
+        // - 設定ファイルとログファイルを 2 プロセスで奪い合う
+        //   (実際にログが途中から切り詰められているのを観測した)
+        //
+        // 2 個目が起動されたら、既存のインスタンスのウィンドウを出して終了する。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            log::info!("既に起動しています。既存のウィンドウを表示します");
+            tray::show_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         // 常駐運用ではウィンドウが閉じているので、行動を要する通知は
         // WebView イベントではなく OS トーストで出す必要がある。
@@ -739,10 +953,15 @@ pub fn run() {
             retranscribe_history_entry,
             start_hotkey_capture,
             cancel_hotkey_capture,
+            clear_hotkey,
+            preview_sound,
+            list_sound_presets,
             overlay_ready,
             overlay_rendered,
             open_history,
             get_storage_stats,
+            get_dashboard_stats,
+            get_style_suggestions,
             delete_untranscribed,
             get_local_stt_status,
             download_local_model,
@@ -774,7 +993,7 @@ pub fn run() {
 
             // 設定のホットキーを反映してからフックを設置する。
             let cfg = handle.state::<AppState>().config.snapshot();
-            hotkey::set_hotkey_vk(cfg.hotkey_vk);
+            apply_hotkeys(&cfg);
             hotkey::set_cancel_vk(cfg.cancel_vk);
 
             if cfg.overlay_enabled {
@@ -861,11 +1080,14 @@ fn drain_pending_finalizations(rx: &Receiver<WorkerJob>, dir: &std::path::Path) 
         let WorkerJob::Finalize(job) = job else {
             continue;
         };
-        let Some(Ok((recording, _))) = guard_panic("終了時の WAV 化", || finalize_one(*job)) else {
+        let Some(Ok(FinalizedRecording { recording, .. })) =
+            guard_panic("終了時の WAV 化", || finalize_one(*job))
+        else {
             log::error!("終了時に後処理待ちの録音を WAV 化できませんでした");
             continue;
         };
-        if save_failed_recording(dir, &recording, "後処理待ちのまま終了したため未転写").is_some() {
+        if save_failed_recording(dir, &recording, "後処理待ちのまま終了したため未転写").is_some()
+        {
             recovered += 1;
         }
     }
@@ -882,7 +1104,9 @@ fn resolve_paths(app: &AppHandle) -> (PathBuf, PathBuf) {
         .app_config_dir()
         .or_else(|_| app.path().app_data_dir())
         .unwrap_or_else(|e| {
-            log::warn!("アプリのデータディレクトリを解決できません ({e})。実行ファイル隣に置きます");
+            log::warn!(
+                "アプリのデータディレクトリを解決できません ({e})。実行ファイル隣に置きます"
+            );
             std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join("nox-voice-data")
@@ -914,6 +1138,18 @@ fn start_finalize_worker(app: &AppHandle) {
     }
 }
 
+/// 設定の全ホットキーをフックへ反映する。
+///
+/// 用途を 1 つでも反映し忘れると「設定したのに効かない」になる。
+/// 反映は必ずこの 1 か所を通す (design.md「同じ判断を 2 か所に書かない」)。
+fn apply_hotkeys(cfg: &config::Config) {
+    hotkey::set_mode_hotkey(HotkeyMode::Inject, Some(cfg.hotkey_combo()));
+    hotkey::set_mode_hotkey(HotkeyMode::ClipboardOnly, cfg.clipboard_hotkey_combo());
+    // `screen_ask_hotkey_combo()` は有効化フラグも見る。設定でオフにした
+    // 瞬間にキーが死ぬ ({「オフなのに押すと画面が送られる」}を作らない)。
+    hotkey::set_mode_hotkey(HotkeyMode::ScreenAsk, cfg.screen_ask_hotkey_combo());
+}
+
 /// フックを設置し、ホットキーイベントを解釈するコントローラスレッドを起動する。
 fn start_hotkey_controller(app: &AppHandle) {
     let rx = match hotkey::spawn() {
@@ -938,8 +1174,29 @@ fn start_hotkey_controller(app: &AppHandle) {
         .name("nox-hotkey-controller".to_string())
         .spawn(move || {
             let app = worker_app;
-            let mut interpreter = PttInterpreter::new(TAP_THRESHOLD);
+            // 用途ごとに解釈器を持つ。押下パターン (長押し / トグル) は
+            // 用途ごとに独立していなければならない — 「貼り付けをトグルで
+            // 開始 → クリップボード用キーを踏む」で、片方の状態が
+            // もう片方の判定に混ざると、止まらない録音ができあがる。
+            let mut interpreters: [PttInterpreter; HOTKEY_SLOTS] =
+                std::array::from_fn(|_| PttInterpreter::new(TAP_THRESHOLD));
+            // 録音中の用途。**別用途のキーは録音中は無視する**。
+            // 二重に開始できない以上、受け付けても「すでに録音中です」の
+            // エラーを出すだけで、解釈器の状態が無駄に汚れる。
+            let mut active_mode: Option<HotkeyMode> = None;
             let mut seen_drops = 0u64;
+            // 捕獲モードの蓄積。押された順に積み、すべて離した時点で確定する。
+            // generation はフック側が各イベントに載せてくるので、捕獲のやり直し
+            // (begin_capture のたびに進む) が起きたら古い内容を捨てる。
+            //
+            // captured_keys は「今押されているキー」、session_keys は「この捕獲で
+            // 観測した全キー」。確定は最後の 1 個が離れた瞬間だが、そのときには
+            // 先に離したキーは captured から抜けている。確定対象は**観測した全キー**
+            // (Ctrl を押して Space をタップして両方離す、なら Ctrl+Space) なので、
+            // 2 本で持つ必要がある。
+            let mut capture_generation = 0u64;
+            let mut captured_keys: Vec<u32> = Vec::new();
+            let mut session_keys: Vec<u32> = Vec::new();
 
             loop {
                 crossbeam_channel::select! {
@@ -947,10 +1204,32 @@ fn start_hotkey_controller(app: &AppHandle) {
                         // フック側が落ちた = 終了。
                         Err(_) => break,
                         Ok(event) => {
-                            // 設定 UI のキー捕獲は録音とは別経路。
-                            if let hotkey::HotkeyEventKind::Captured(vk) = event.kind {
-                                handle_captured_key(&app, vk);
-                                continue;
+                            // 設定 UI のキー捕獲は録音とは別経路。押下と離しの
+                            // 両方を受け、すべて離した瞬間に組み合わせを確定させる。
+                            match event.kind {
+                                hotkey::HotkeyEventKind::CapturedDown { vk, generation } => {
+                                    handle_capture_down(
+                                        &app,
+                                        vk,
+                                        generation,
+                                        &mut capture_generation,
+                                        &mut captured_keys,
+                                        &mut session_keys,
+                                    );
+                                    continue;
+                                }
+                                hotkey::HotkeyEventKind::CapturedUp { vk, generation } => {
+                                    handle_capture_up(
+                                        &app,
+                                        vk,
+                                        generation,
+                                        &mut capture_generation,
+                                        &mut captured_keys,
+                                        &mut session_keys,
+                                    );
+                                    continue;
+                                }
+                                _ => {}
                             }
                             // 録音のキャンセルも解釈器を通さない別経路。
                             // 破棄した時点で解釈器の押下状態は無効になるので捨てる
@@ -958,22 +1237,51 @@ fn start_hotkey_controller(app: &AppHandle) {
                             // 離しが、あとから StopRecording に化けないようにする。
                             if event.kind == hotkey::HotkeyEventKind::Cancel {
                                 cancel_recording(&app);
-                                interpreter.reset();
+                                for it in interpreters.iter_mut() {
+                                    it.reset();
+                                }
+                                active_mode = None;
                                 continue;
                             }
+                            // どの用途のキーか。ここから先は用途ごとの解釈器へ。
+                            let mode = match event.kind {
+                                hotkey::HotkeyEventKind::Press { mode }
+                                | hotkey::HotkeyEventKind::Release { mode } => mode,
+                                // 上で処理済み (捕獲・キャンセル)。
+                                _ => continue,
+                            };
+                            if active_mode.is_some_and(|active| active != mode) {
+                                log::debug!(
+                                    "[{}] のキーは無視 ({} で録音中)",
+                                    mode.label(),
+                                    active_mode.map(HotkeyMode::label).unwrap_or("")
+                                );
+                                continue;
+                            }
+                            let interpreter = &mut interpreters[mode.slot()];
                             // 判定は必ずイベントの発生時刻で行う。
                             // ここで Instant::now() を使うと、直前の処理で
                             // 詰まった分だけ短押しが長押しに化ける。
                             match interpreter.on_event(event) {
                                 Some(HotkeyAction::StartRecording) => {
-                                    if let Err(e) = start_recording(&app) {
-                                        log::error!("録音を開始できません: {e}");
-                                        emit_error(&app, &e);
-                                        set_status(&app, Status::Idle, Some(e));
-                                        interpreter.reset();
+                                    match start_recording(&app, mode) {
+                                        Ok(()) => active_mode = Some(mode),
+                                        Err(e) => {
+                                            log::error!("録音を開始できません: {e}");
+                                            let cfg = app.state::<AppState>().config.snapshot();
+                                            sound::play(
+                                                &cfg.cancel_sound_choice(),
+                                                cfg.effective_sound_volume(),
+                                            );
+                                            emit_error(&app, &e);
+                                            set_status(&app, Status::Idle, Some(e));
+                                            interpreter.reset();
+                                            active_mode = None;
+                                        }
                                     }
                                 }
                                 Some(HotkeyAction::StopRecording) => {
+                                    active_mode = None;
                                     // 停止時に `reset()` は呼ばないこと。
                                     // 停止を出した時点で解釈器の状態は既に整合しており、
                                     // reset の「次の離しを捨てる」副作用が次回の
@@ -1002,7 +1310,10 @@ fn start_hotkey_controller(app: &AppHandle) {
                         if msg.is_err() {
                             continue;
                         }
-                        handle_length_limit(&app, &mut interpreter);
+                        // 上限で止めた録音の用途は問わない。走っているのは 1 本だけ。
+                        let slot = active_mode.unwrap_or(HotkeyMode::Inject).slot();
+                        handle_length_limit(&app, &mut interpreters[slot]);
+                        active_mode = None;
                     },
                 }
             }
@@ -1017,7 +1328,7 @@ fn start_hotkey_controller(app: &AppHandle) {
 }
 
 /// 録音を開始する。前景ウィンドウの確定を最優先で行う。
-fn start_recording(app: &AppHandle) -> Result<(), String> {
+fn start_recording(app: &AppHandle, mode: HotkeyMode) -> Result<(), String> {
     let state = app.state::<AppState>();
 
     let mut slot = state
@@ -1042,13 +1353,20 @@ fn start_recording(app: &AppHandle) -> Result<(), String> {
     let recorder = audio::start(state.limit_tx.clone()).map_err(|e| e.to_string())?;
     let started_at = recorder.started_at();
     let meter = recorder.meter();
+
+    // 合図は録音が実際に始まってから鳴らす。開始に失敗したのに鳴らすと、
+    // 「鳴った = 録音できている」という信頼が崩れる (ペダル運用では
+    // この音だけが唯一の手がかり)。再生は別スレッドなので待たない。
+    sound::play(&cfg.start_sound_choice(), cfg.effective_sound_volume());
+
     log::info!(
-        "録音開始 (挿入先: {} / hwnd=0x{:X} / \"{}\")",
+        "録音開始 [{}] (挿入先: {} / hwnd=0x{:X} / \"{}\")",
+        mode.label(),
         target.process_name,
         target.hwnd,
         target.window_title
     );
-    if !target.is_known() {
+    if !target.is_known() && mode == HotkeyMode::Inject {
         log::warn!("前景ウィンドウを特定できませんでした。挿入時の照合は行えません");
     }
 
@@ -1058,7 +1376,12 @@ fn start_recording(app: &AppHandle) -> Result<(), String> {
     // 画面コンテキストは録音開始の瞬間の画面を見る必要がある。
     // 取得は短命スレッド + 打ち切りつきなので、録音を待たせるのは最大 300ms。
     // 無効なら即座に空が返る。
-    let screen_context = context::capture(cfg.deep_context);
+    //
+    // **画面質問モードでは取らない。** あちらは発話を整形しないので
+    // deep context を渡す先が無く、取っても捨てるだけ。捨てる値のために
+    // 録音開始を 300ms 待たせるのは、この用途では二重に無駄になる
+    // (同じ画面をこの直後にモニタ単位で読む)。
+    let screen_context = context::capture(cfg.deep_context && mode != HotkeyMode::ScreenAsk);
     if !screen_context.is_empty() {
         log::info!(
             "画面コンテキストを取得: {} ({} 文字)",
@@ -1067,11 +1390,31 @@ fn start_recording(app: &AppHandle) -> Result<(), String> {
         );
     }
 
+    // 画面質問モードのときだけ、モニタ 1 枚分の走査を**始める**。
+    //
+    // ここで待たないのが要点。deep context は 300ms 待つが、こちらは
+    // 複数ウィンドウを読むうえスクリーンショットも撮るので、待てば秒単位に
+    // なる。ユーザーが最も嫌うのは「話し始めるまで待たされる」こと
+    // (design.md の設計原則) なので、走査は録音と並行させ、回収は
+    // 後処理ワーカー — つまり STT を待っている時間の裏 — で行う。
+    //
+    // 用途で分岐しているので、`screen_ask_enabled` が false のときは
+    // そもそもこのキーが割り当てられておらず、ここへは来ない。それでも
+    // 設定を二重に見るのは、ホットキーの反映漏れがあっても
+    // **画面が送られないほうへ倒す**ため。
+    let screen = if mode == HotkeyMode::ScreenAsk {
+        screen::start_scan(cfg.screen_ask_enabled)
+    } else {
+        None
+    };
+
     if let Ok(mut pending) = state.pending.lock() {
         *pending = Some(PendingRecording {
             target,
             started_at,
+            mode,
             context: screen_context,
+            screen,
         });
     }
 
@@ -1162,7 +1505,11 @@ fn request_finalize(app: &AppHandle) -> Result<(), String> {
         .unwrap_or_else(|| PendingRecording {
             target: TargetWindow::unknown(),
             started_at: recorder.started_at(),
+            // 開始情報を取り落とした異常系。貼り付け側に倒す
+            // (クリップボードのみへ倒すと、貼られるはずの結果が黙って消える)。
+            mode: HotkeyMode::Inject,
             context: context::ScreenContext::default(),
+            screen: None,
         });
 
     stop_level_emitter(app);
@@ -1174,7 +1521,9 @@ fn request_finalize(app: &AppHandle) -> Result<(), String> {
             recorder,
             target: pending.target,
             started_at: pending.started_at,
+            mode: pending.mode,
             context: pending.context,
+            screen: pending.screen,
         })))
         .map_err(|_| "後処理ワーカーが停止しています".to_string())
 }
@@ -1195,6 +1544,10 @@ fn cancel_recording(app: &AppHandle) {
     }
 
     stop_level_emitter(app);
+    // 破棄したことは音でも伝える。画面を見ていない運用では、
+    // 「取り消せたのか / まだ録っているのか」が音以外に分からない。
+    let cfg = app.state::<AppState>().config.snapshot();
+    sound::play(&cfg.cancel_sound_choice(), cfg.effective_sound_volume());
     log::info!("録音をキャンセルした");
     set_status_from(
         app,
@@ -1273,7 +1626,11 @@ fn finalize_worker(app: AppHandle, rx: Receiver<WorkerJob>) {
         match job {
             WorkerJob::Finalize(job) => process_job(&app, *job),
             WorkerJob::EnforceRetention => {
-                let days = app.state::<AppState>().config.snapshot().history_retention_days;
+                let days = app
+                    .state::<AppState>()
+                    .config
+                    .snapshot()
+                    .history_retention_days;
                 enforce_retention(&app, days);
             }
             WorkerJob::Retranscribe { id } => {
@@ -1309,15 +1666,22 @@ fn finalize_worker(app: AppHandle, rx: Receiver<WorkerJob>) {
 fn process_job(app: &AppHandle, job: FinalizeJob) {
     // 第 1 段: WAV 化。ここで panic すると音声は救えないので、
     // せめてワーカーを生かして次の録音を処理できるようにする。
-    let (recording, screen_context) = match guard_panic("録音の WAV 化", || finalize_one(job)) {
-        Some(Ok(pair)) => pair,
+    let FinalizedRecording {
+        recording,
+        context: screen_context,
+        screen,
+    } = match guard_panic("録音の WAV 化", || finalize_one(job)) {
+        Some(Ok(finalized)) => finalized,
         Some(Err(e)) => {
             log::error!("録音を確定できません: {e}");
             emit_error(app, &e);
             return;
         }
         None => {
-            emit_error(app, "録音の WAV 化中に内部エラーが発生しました (録音は失われました)");
+            emit_error(
+                app,
+                "録音の WAV 化中に内部エラーが発生しました (録音は失われました)",
+            );
             return;
         }
     };
@@ -1327,9 +1691,19 @@ fn process_job(app: &AppHandle, job: FinalizeJob) {
         log::warn!("録音メタ情報イベントの送出に失敗: {e}");
     }
 
-    // 第 2 段: 転写と整形。ここで panic しても WAV は手元にあるので退避できる。
-    if guard_panic("転写・整形", || {
-        transcribe_and_format(app, &recording, &screen_context)
+    // 第 2 段: 転写と整形 (画面質問モードでは転写と回答)。
+    // ここで panic しても WAV は手元にあるので退避できる。
+    let stage_name = if recording.mode == HotkeyMode::ScreenAsk {
+        "画面質問"
+    } else {
+        "転写・整形"
+    };
+    if guard_panic(stage_name, || {
+        if recording.mode == HotkeyMode::ScreenAsk {
+            answer_screen_question(app, &recording, screen);
+        } else {
+            transcribe_and_format(app, &recording, &screen_context);
+        }
     })
     .is_none()
     {
@@ -1351,12 +1725,14 @@ fn process_job(app: &AppHandle, job: FinalizeJob) {
 }
 
 /// 1 件の録音を WAV 化し、[`RecordingSession`] を確定させる。
-fn finalize_one(job: FinalizeJob) -> Result<(RecordingSession, context::ScreenContext), String> {
+fn finalize_one(job: FinalizeJob) -> Result<FinalizedRecording, String> {
     let FinalizeJob {
         recorder,
         target,
         started_at,
+        mode,
         context,
+        screen,
     } = job;
     let device_name = recorder.device_name().to_string();
     let limit_reached = recorder.limit_reached();
@@ -1369,6 +1745,7 @@ fn finalize_one(job: FinalizeJob) -> Result<(RecordingSession, context::ScreenCo
         target,
         started_at,
         duration,
+        mode,
     };
 
     log::info!(
@@ -1385,7 +1762,11 @@ fn finalize_one(job: FinalizeJob) -> Result<(RecordingSession, context::ScreenCo
             ""
         },
     );
-    Ok((recording, context))
+    Ok(FinalizedRecording {
+        recording,
+        context,
+        screen,
+    })
 }
 
 /// WAV を転写し、必要なら整形して結果を通知する。
@@ -1430,12 +1811,20 @@ fn transcribe_and_format(
         recording.target_process(),
         &recording.target.window_title,
     );
-    if let Some(profile) = profile {
-        log::info!(
-            "スタイルプロファイルを適用: {} → {}",
+    // 当たらなかったことも残す。「プロファイルが無いアプリ」を数える
+    // には、当たった記録だけでは足りない。
+    let style_label = style::history_label(profile);
+    match profile {
+        Some(profile) => log::info!(
+            "スタイルプロファイルを適用: {} ({}) → {}",
             profile.process,
+            if profile.id.is_empty() { "ユーザー" } else { &profile.id },
             profile.instruction.chars().take(30).collect::<String>()
-        );
+        ),
+        None => log::info!(
+            "スタイルプロファイルは未一致: {}",
+            recording.target_process()
+        ),
     }
 
     let entries = cfg.dictionary_entries();
@@ -1473,6 +1862,7 @@ fn transcribe_and_format(
                 inject_outcome: InjectOutcome::Disabled,
                 clipboard_state: ClipboardState::Untouched,
                 lost_clipboard_formats: Vec::new(),
+                style_profile: Some(style_label.clone()),
             };
 
             // 本文はユーザーの発話そのものなので info には出さない。
@@ -1519,7 +1909,10 @@ fn transcribe_and_format(
                 ) {
                     // 貼付が不達だった行を後から探せなくなるので黙らない。
                     log::warn!("履歴へ注入結果を書けません: {e}");
-                    emit_error(app, &format!("履歴へ貼り付け結果を記録できませんでした: {e}"));
+                    emit_error(
+                        app,
+                        &format!("履歴へ貼り付け結果を記録できませんでした: {e}"),
+                    );
                 }
             }
 
@@ -1539,6 +1932,9 @@ fn transcribe_and_format(
         Err(e) => {
             let msg = e.to_string();
             log::error!("転写に失敗しました: {msg}");
+            // 失敗も音で伝える。画面を見ていないと、結果が来ないことと
+            // 失敗したことの区別が付かない。
+            sound::play(&cfg.cancel_sound_choice(), cfg.effective_sound_volume());
             let saved = save_failed_recording(&state.failed_dir, recording, &msg);
 
             // 失敗した「その場で」履歴に未転写行を作る。起動時の取り込み任せに
@@ -1565,6 +1961,237 @@ fn transcribe_and_format(
     }
 }
 
+/// 画面についての質問に答え、答えをクリップボードへ入れる。
+///
+/// # ここは音声入力ではない
+///
+/// 他の 2 用途は「発話を整えて届ける」経路だが、この用途では
+/// **発話は届けるものではなく問い**であり、届くのは画面を読んだ答えである。
+/// 違いは全部ここから出てくる:
+///
+/// - **文体プロファイルを適用しない**。「Slack へ貼るので砕けた口調で」を
+///   答えに適用したら、一覧が挨拶付きの雑談になる。そもそも貼り付け先が
+///   決まっていない (出力はクリップボード)
+/// - **整形パイプラインを通さない**。整形の仕事は「言い直しを畳んで句読点を
+///   打つ」ことで、質問文にそれをしても意味が無いうえ 1 往復ぶん遅くなる。
+///   STT の生転写をそのまま問いとして使う
+/// - **成功した質問と回答は履歴に残さない**。回答は画面の内容そのものなので、
+///   残せば「画面の内容を履歴に残さない」という約束 ([`screen`] のモジュール
+///   doc) が破れる。質問文も画面の語を含みがちなので同じ扱いにする
+/// - **失敗してもクリップボードに触れない**。エラー文をクリップボードへ
+///   入れると、ユーザーはそれを貼り付ける。元の内容を壊さずに黙って
+///   引き下がり、理由はトーストで言う
+///
+/// # 唯一の例外: STT が失敗したときの音声
+///
+/// 質問を**聞き取れなかった**場合だけは、他の用途と同じく WAV を
+/// `failed/` へ退避する。退避 WAV は起動時に履歴の未転写行として
+/// 取り込まれるので、**再転写すれば質問の文面が履歴 DB に載る**。
+///
+/// これを承知で残しているのは、外す方が壊すものが大きいから:
+///
+/// - 取り込みだけを除外すると、**どの DB 行も所有しない WAV** が
+///   `failed/` に溜まり続ける。design.md M4 の所有権原則が名指しで
+///   戒めている状態で、「すべて削除」が嘘になりディスクは無限に増える
+/// - 退避そのものをやめると、この機能 1 つの都合で R4 (発話データ保全)
+///   という全体の不変条件を曲げることになる。しかも聞き取り失敗は
+///   環境が悪いときに起きやすく、そこで言い直しを強いるのは体験が悪い
+///
+/// 守りたかった中心は保たれている: **画面から読んだ資料も、それを元にした
+/// 回答も、履歴には一切入らない。** 入りうるのは「聞き取れなかった
+/// ユーザー自身の音声」だけで、それは画面の内容ではない。
+/// 退避メタには `hotkey_mode` を書いてあるので、方針を変えるならそこを
+/// 取り込み側で見ればよい。
+fn answer_screen_question(
+    app: &AppHandle,
+    recording: &RecordingSession,
+    scan: Option<screen::ScanHandle>,
+) {
+    let state = app.state::<AppState>();
+    let cfg = state.config.snapshot();
+    let started = Instant::now();
+
+    // --- 質問の書き起こし ---
+    //
+    // **走査の回収より先に行う。** 走査は録音開始と同時に始まっていて、
+    // 残り予算の分だけ待てる。ここで先に待つと、その待ち時間が STT と
+    // **直列**に乗る — 短い発話 (録音 1〜2 秒) では走査がまだ終わって
+    // いないので、まるまる体感待ち時間になる。STT を先に回せば、その
+    // 1 秒前後の裏で走査が進み、たいていは待ち時間ゼロで回収できる。
+    //
+    // formatter に None を渡すので整形は走らない ([`pipeline::run`])。
+    // 辞書だけは渡す — 固有名詞を取り違えると質問そのものが変わる。
+    let entries = cfg.dictionary_entries();
+    let input = pipeline::PipelineInput {
+        wav: &recording.wav_bytes,
+        language: &cfg.language,
+        dictionary: &entries,
+        style: None,
+        app: None,
+        context: None,
+    };
+    let transcript = match run_stt_pipeline(app, &cfg, &input, None) {
+        Ok(result) => result,
+        Err(e) => {
+            let msg = format!("質問を聞き取れませんでした: {e}");
+            log::error!("{msg}");
+            sound::play(&cfg.cancel_sound_choice(), cfg.effective_sound_volume());
+            // 音声だけは救う。**画面の資料はここで捨てる** — 残す先が無いし、
+            // 残してよいものでもない。
+            let saved = save_failed_recording(&state.failed_dir, recording, &msg);
+            // 「履歴に残らないはずの機能なのに録音が残っている」と読めては
+            // 困るので、残したことと理由をその場で言う (この関数の doc の
+            // 「唯一の例外」)。
+            let notice = match saved {
+                Some(_) => format!(
+                    "{msg}
+録音だけは失われないよう退避しました (画面の内容は残していません)"
+                ),
+                None => format!("{msg}
+※録音の退避にも失敗しました"),
+            };
+            notify(app, Notice::ActionRequired, &notice);
+            return;
+        }
+    };
+    // --- 資料の回収 ---
+    //
+    // STT が終わった時点で、走査はほぼ確実に終わっている。
+    // 終わっていなくても残り予算の分しか待たない。
+    let scan = match scan {
+        Some(handle) => handle.wait(),
+        None => screen::ScreenScan::failed(
+            "画面の走査を開始できませんでした (前の走査がまだ終わっていない可能性があります)",
+        ),
+    };
+
+    let question = transcript.raw_text.trim().to_string();
+    if question.is_empty() {
+        let msg = "質問が聞き取れませんでした (無音だった可能性があります)";
+        log::warn!("{msg}");
+        sound::play(&cfg.cancel_sound_choice(), cfg.effective_sound_volume());
+        notify(app, Notice::ActionRequired, msg);
+        return;
+    }
+
+    // --- 資料が無いなら、黙って空を返さない (design.md「0 件と欠測を混同しない」) ---
+    if !scan.has_material() {
+        let reason = scan
+            .failure
+            .unwrap_or_else(|| "画面から読み取れる内容がありませんでした".to_string());
+        let msg = format!("画面を読み取れなかったため質問に答えられません: {reason}");
+        log::warn!("{msg}");
+        sound::play(&cfg.cancel_sound_choice(), cfg.effective_sound_volume());
+        notify(app, Notice::ActionRequired, &msg);
+        return;
+    }
+
+    // --- 質問する ---
+    let Some(http) = state.http.clone() else {
+        let msg = "HTTP クライアントを構築できなかったため質問できません";
+        log::error!("{msg}");
+        notify(app, Notice::ActionRequired, msg);
+        return;
+    };
+    let asker = GeminiFormatter::new(
+        http,
+        cfg.gemini_url(),
+        cfg.gemini_key().secret.unwrap_or_default(),
+    )
+    .with_timeout(SCREEN_ASK_TIMEOUT);
+
+    let windows: Vec<format::AskWindow<'_>> = scan
+        .windows
+        .iter()
+        .map(|w| format::AskWindow {
+            title: &w.title,
+            process: &w.process,
+            position: &w.position,
+            text: &w.text,
+        })
+        .collect();
+    let images: Vec<format::AskImage<'_>> = scan
+        .screenshot
+        .iter()
+        .map(|shot| format::AskImage {
+            mime: "image/png",
+            bytes: &shot.png,
+        })
+        .collect();
+
+    let ask_started = Instant::now();
+    let answer = asker.ask(&format::AskRequest {
+        question: &question,
+        monitor: scan.monitor.label(),
+        windows: &windows,
+        images: &images,
+    });
+    let ask_ms = ask_started.elapsed().as_millis() as u64;
+
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(e) => {
+            // 劣化先が無い。生転写 (= 質問文) をクリップボードへ入れても
+            // ユーザーが欲しかったものではないので、何もしないで理由を言う。
+            let msg = format!("画面についての質問に答えられませんでした: {e}");
+            log::error!("{msg}");
+            sound::play(&cfg.cancel_sound_choice(), cfg.effective_sound_volume());
+            notify(app, Notice::ActionRequired, &msg);
+            return;
+        }
+    };
+
+    // --- 答えを届ける ---
+    let report = inject::copy_only(&answer);
+    log::info!(
+        "画面質問完了: 質問 {} 文字 / 回答 {} 文字 / STT {} ms / 回答 {ask_ms} ms / 計 {} ms / {:?}",
+        question.chars().count(),
+        answer.chars().count(),
+        transcript.stt_ms,
+        started.elapsed().as_millis(),
+        report.outcome,
+    );
+    if let Some(message) = inject::lost_formats_message(&report.lost_formats) {
+        log::warn!("{message}");
+        notify(app, Notice::ActionRequired, &message);
+    }
+    if let Some(message) = &report.message {
+        notify(app, Notice::ActionRequired, message);
+    }
+
+    let payload = ResultPayload {
+        // R5 の並置と同じ枠を使う。ここでの「生」は質問、「採用」は答え。
+        raw_text: question,
+        text: answer,
+        outcome: FormatOutcome::Formatted,
+        degraded: false,
+        stt_ms: transcript.stt_ms,
+        format_ms: ask_ms,
+        total_ms: started.elapsed().as_millis() as u64,
+        target_process: recording.target_process().to_string(),
+        target_hwnd: recording.target_hwnd(),
+        duration_ms: recording.duration.as_millis() as u64,
+        injected: report.injected,
+        inject_outcome: report.outcome,
+        clipboard_state: report.clipboard_state,
+        lost_clipboard_formats: report.lost_formats,
+        // 画面質問モードは文体プロファイルを通さない (答えは Gemini が
+        // 直接書く)。未一致 ("") ではなく未記録 (None) が正しい。
+        style_profile: None,
+    };
+
+    // **履歴 DB には書かない** (この関数の doc 参照)。
+    // メモリ上の直近結果には置く — 画面に出さないと「何も起きなかった」
+    // ように見えるうえ、履歴に無い以上ここが唯一の再確認手段になる。
+    if let Ok(mut slot) = state.last_result.lock() {
+        *slot = Some(payload.clone());
+    }
+    if let Err(e) = app.emit(EVENT_RESULT, &payload) {
+        log::warn!("結果イベントの送出に失敗: {e}");
+    }
+    overlay::hide_after(app, OVERLAY_RESULT_LINGER);
+}
+
 /// 採用テキストを前景アプリへ注入し、結果を `payload` に反映する。
 ///
 /// 中止・失敗はいずれも致命ではない。整形テキストはクリップボードか
@@ -1575,6 +2202,33 @@ fn apply_injection(
     recording: &RecordingSession,
     payload: &mut ResultPayload,
 ) {
+    // クリップボードのみモード: 前景の照合をせずコピーだけして終える。
+    //
+    // ここを `injection_enabled == false` と同じ扱いにしてはいけない。
+    // あちらは「画面からコピーしてください」で終わるが、こちらは
+    // **クリップボードに入っていることが結果**であり、それを payload と
+    // 履歴に残さないと UI が「何も起きなかった」ように見える。
+    if recording.mode == HotkeyMode::ClipboardOnly {
+        let report = inject::copy_only(&payload.text);
+        log::info!(
+            "クリップボードのみモード: {:?} ({:?})",
+            report.outcome,
+            report.clipboard_state
+        );
+        if let Some(message) = inject::lost_formats_message(&report.lost_formats) {
+            log::warn!("{message}");
+            notify(app, Notice::ActionRequired, &message);
+        }
+        if let Some(message) = &report.message {
+            notify(app, Notice::ActionRequired, message);
+        }
+        payload.injected = report.injected;
+        payload.inject_outcome = report.outcome;
+        payload.clipboard_state = report.clipboard_state;
+        payload.lost_clipboard_formats = report.lost_formats;
+        return;
+    }
+
     if !cfg.injection_enabled {
         log::info!("設定により自動貼り付けは無効です");
         payload.inject_outcome = InjectOutcome::Disabled;
@@ -1719,9 +2373,7 @@ fn run_with_local_stt(
         });
     }
 
-    let local = LocalStt {
-        models_dir,
-    };
+    let local = LocalStt { models_dir };
     pipeline::run(input, &local, formatter)
 }
 
@@ -1780,6 +2432,7 @@ fn record_history(
         stt_ms: Some(payload.stt_ms),
         format_ms: Some(payload.format_ms),
         wav_path: None,
+        style_profile: payload.style_profile.clone(),
     };
 
     match app.state::<AppState>().history.insert(&draft) {
@@ -1813,7 +2466,10 @@ fn record_untranscribed(
     error: &str,
 ) -> bool {
     let Some(path_str) = wav_path.to_str() else {
-        log::warn!("退避 WAV のパスを文字列にできません: {}", wav_path.display());
+        log::warn!(
+            "退避 WAV のパスを文字列にできません: {}",
+            wav_path.display()
+        );
         return false;
     };
 
@@ -1833,6 +2489,8 @@ fn record_untranscribed(
         stt_ms: None,
         format_ms: None,
         wav_path: Some(path_str.to_string()),
+        // 整形まで届いていないので「当たらなかった」ではなく未記録。
+        style_profile: None,
     };
 
     match app.state::<AppState>().history.insert_untranscribed(&draft) {
@@ -1890,51 +2548,182 @@ fn enforce_retention(app: &AppHandle, days: u32) {
     }
 }
 
-/// 設定 UI のキー捕獲を処理する。
+/// 設定 UI のキー捕獲: 押下を処理する。
 ///
-/// 捕獲は 1 回で終わる (押した時点でモードを抜ける)。押しっぱなしや
-/// 連打で何度も発火すると、UI 側の状態と食い違う。
-fn handle_captured_key(app: &AppHandle, vk: u32) {
+/// 捕獲は「押したキーをすべて離した瞬間」に確定する ([`handle_capture_up`])。
+/// 押している最中の組み合わせは都度 UI へ流して見せる。
+fn handle_capture_down(
+    app: &AppHandle,
+    vk: u32,
+    generation: u64,
+    current_generation: &mut u64,
+    captured: &mut Vec<u32>,
+    session: &mut Vec<u32>,
+) {
+    if generation != *current_generation {
+        // 捕獲のやり直し。古いセッションの残骸は捨てる。
+        *current_generation = generation;
+        captured.clear();
+        session.clear();
+    }
+    log::info!(
+        "捕獲 Down: vk=0x{vk:02X} gen={generation} (押下中={} / 観測={})",
+        captured.len(),
+        session.len()
+    );
     if !hotkey::is_capturing() {
+        log::info!("捕獲 Down 破棄: 既に捕獲モードが終わっている");
+        return; // タイムアウト等で既に畳んでいる。
+    }
+    if vk == hotkey::ESCAPE_VK {
+        hotkey::end_capture(None);
+        captured.clear();
+        session.clear();
+        log::info!("キー捕獲を取り消しました");
+        emit_hotkey_captured(app, None);
         return;
     }
-    let outcome = hotkey::decide_capture(vk);
+    if !session.contains(&vk) {
+        session.push(vk);
+    }
+    if !captured.contains(&vk) {
+        captured.push(vk);
+    }
+    emit_hotkey_captured_progress(app, session);
+}
 
-    // 使えないキーなら捕獲を続ける。押し直せばよい。
-    if let hotkey::CaptureOutcome::Rejected(label) = &outcome {
-        log::info!("ホットキーに使えないキーです: {label}");
-        emit_error(
-            app,
-            &format!(
-                "「{label}」はホットキーに使えません。押している間ずっと入力先へ流れてしまいます。\n\
-Ctrl / Alt / Shift / Win / CapsLock / F1〜F12 などから選んでください"
-            ),
+/// 設定 UI のキー捕獲: 離しを処理し、全キーが離れた時点で確定する。
+///
+/// 確定する組み合わせは「この捕獲で観測した全キー」([`handle_capture_down`] の
+/// doc 参照)。最後の 1 個が離れた時点では、先に離したキーは押下中リストから
+/// 既に抜けているため、セッション全体を見る必要がある。
+fn handle_capture_up(
+    app: &AppHandle,
+    vk: u32,
+    generation: u64,
+    current_generation: &mut u64,
+    captured: &mut Vec<u32>,
+    session: &mut Vec<u32>,
+) {
+    if generation != *current_generation {
+        // 捕獲のやり直しで世代が進んでいる。古い離しは何もしない。
+        log::info!("捕獲 Up 破棄 (世代違い): vk=0x{vk:02X} gen={generation}");
+        return;
+    }
+    // 観測していないキーの離し (捕獲開始前に押されていたキーなど) は無視する。
+    // さもないと「押してもいない Space を離した」だけで確定処理が走る。
+    // 捕獲が既に畳まれている (Esc 取り消し・タイムアウト) 場合も同様に無視。
+    if !captured.contains(&vk) || !hotkey::is_capturing() {
+        log::info!(
+            "捕獲 Up 破棄: vk=0x{vk:02X} (押下中={captured:?} / capturing={})",
+            hotkey::is_capturing()
         );
         return;
     }
 
-    hotkey::end_capture(None);
+    captured.retain(|k| *k != vk);
+    if !captured.is_empty() {
+        log::info!(
+            "捕獲 Up: vk=0x{vk:02X} を外したが未解放あり ({captured:?})"
+        );
+        return; // まだ押しているキーがある。確定しない。
+    }
+
+    // 全キーが離れた → 確定。観測した全キーを評価し、蓄積を空にする
+    // (拒否された場合は次の押し直しから再スタート)。
+    let finished: Vec<u32> = session.clone();
+    captured.clear();
+    session.clear();
+
+    let outcome = hotkey::decide_capture_combo(&finished);
+    log::info!(
+        "捕獲 確定判定: {:?} → {}",
+        finished.iter().map(|vk| format!("0x{vk:02X}")).collect::<Vec<_>>(),
+        match &outcome {
+            hotkey::CaptureOutcome::Accept(combo) => format!("Accept {}", combo.label()),
+            hotkey::CaptureOutcome::Rejected(label) => format!("Rejected {label}"),
+            hotkey::CaptureOutcome::Cancel => "Cancel".to_string(),
+        }
+    );
 
     match outcome {
-        hotkey::CaptureOutcome::Rejected(_) => unreachable!("上で返している"),
+        hotkey::CaptureOutcome::Rejected(label) => {
+            log::info!("ホットキーに使えない組み合わせです: {label}");
+            emit_error(
+                app,
+                &format!(
+                    "「{label}」はホットキーに使えません。押している間ずっと入力先へ流れてしまいます。\n\
+Ctrl / Alt / Shift / Win / CapsLock / F1〜F12 などから選んでください"
+                ),
+            );
+            // 捕獲は続ける。押し直せばよい (タイムアウトで自動的に畳む)。
+        }
         hotkey::CaptureOutcome::Cancel => {
+            hotkey::end_capture(None);
             log::info!("キー捕獲を取り消しました");
             emit_hotkey_captured(app, None);
         }
-        hotkey::CaptureOutcome::Accept(vk) => {
-            // 確定時、このキーはまだ押されたまま。離すまで通常経路から締め出す。
-            // これをしないと、設定した直後にオートリピートで録音が始まる。
-            hotkey::suppress_until_release(vk);
+        hotkey::CaptureOutcome::Accept(combo) => {
+            hotkey::end_capture(None);
+            // 確定時、これらのキーはまだ押されたまま。離すまで通常経路から
+            // 締め出す。これをしないと、設定した直後にオートリピートで録音が
+            // 始まる (M1 回帰)。
+            hotkey::suppress_until_release_keys(&finished);
             let state = app.state::<AppState>();
-            match state.config.update(config::ConfigPatch {
-                hotkey_vk: Some(vk),
-                ..Default::default()
-            }) {
+            // 捕獲を始めたコマンドが残した用途へ書く。
+            // 用途が増えるたびに if を足していくと、足し忘れた用途が黙って
+            // 貼り付け側へ書き込む (= 録音キーが勝手に変わる)。スロット番号
+            // から機械的に戻す。
+            let mode = HotkeyMode::from_slot(
+                state.capture_slot.load(std::sync::atomic::Ordering::SeqCst),
+            );
+            let patch = match mode {
+                HotkeyMode::Inject => config::ConfigPatch {
+                    hotkey_vk: Some(combo.vk),
+                    hotkey_mods: Some(combo.mods_vec()),
+                    ..Default::default()
+                },
+                HotkeyMode::ClipboardOnly => config::ConfigPatch {
+                    clipboard_hotkey_vk: Some(combo.vk),
+                    clipboard_hotkey_mods: Some(combo.mods_vec()),
+                    ..Default::default()
+                },
+                HotkeyMode::ScreenAsk => config::ConfigPatch {
+                    screen_ask_hotkey_vk: Some(combo.vk),
+                    screen_ask_hotkey_mods: Some(combo.mods_vec()),
+                    ..Default::default()
+                },
+            };
+            match state.config.update(patch) {
                 Ok(updated) => {
-                    // 設定が保存できてから実際のフックへ反映する。
-                    // 逆にすると、保存に失敗したときだけ挙動と設定がずれる。
-                    hotkey::set_hotkey_vk(updated.hotkey_vk);
-                    emit_hotkey_captured(app, Some(updated.hotkey_vk));
+                    // 正規化後の値で実際のフックへ反映する。設定が保存できてから
+                    // にするのは、保存失敗時に挙動と設定がずれるのを防ぐため。
+                    //
+                    // 正規化で弾かれることがある (貼り付け用と同じ組み合わせ)。
+                    // その場合 `clipboard_hotkey_combo()` は None を返すので、
+                    // UI には「設定されなかった」ことがそのまま伝わる。
+                    apply_hotkeys(&updated);
+                    let saved = match mode {
+                        HotkeyMode::Inject => Some(updated.hotkey_combo()),
+                        HotkeyMode::ClipboardOnly => updated.clipboard_hotkey_combo(),
+                        // 有効化フラグを見ない方で確認する。無効のまま
+                        // キーだけ先に決めるのは正しい操作順なので、
+                        // それを「保存できなかった」と報告してはいけない。
+                        HotkeyMode::ScreenAsk => hotkey::HotkeyCombo::from_parts(
+                            &updated.screen_ask_hotkey_mods,
+                            updated.screen_ask_hotkey_vk,
+                        ),
+                    };
+                    match saved {
+                        Some(combo) => emit_hotkey_captured_combo(app, &combo),
+                        None => {
+                            emit_error(
+                                app,
+                                "その組み合わせは他の用途のホットキーと同じなので設定できません",
+                            );
+                            emit_hotkey_captured(app, None);
+                        }
+                    }
                 }
                 Err(e) => {
                     log::error!("ホットキーを保存できません: {e}");
@@ -1947,11 +2736,39 @@ Ctrl / Alt / Shift / Win / CapsLock / F1〜F12 などから選んでください
 }
 
 /// 捕獲結果を UI へ返す (`None` は取り消し/失敗)。
-fn emit_hotkey_captured(app: &AppHandle, vk: Option<u32>) {
-    let payload = vk.map(|vk| serde_json::json!({
-        "vk": vk,
-        "label": hotkey::key_label(vk),
-    }));
+fn emit_hotkey_captured_combo(app: &AppHandle, combo: &hotkey::HotkeyCombo) {
+    let payload = serde_json::json!({
+        "label": combo.label(),
+        "mods": combo.mods_vec(),
+        "vk": combo.vk,
+    });
+    if let Err(e) = app.emit(EVENT_HOTKEY_CAPTURED, payload) {
+        log::warn!("キー捕獲結果の送出に失敗: {e}");
+    }
+}
+
+/// 捕獲の進行中 (押している最中) の組み合わせを UI へ流す。
+fn emit_hotkey_captured_progress(app: &AppHandle, keys: &[u32]) {
+    let payload = serde_json::json!({
+        "label": hotkey::describe_keys(keys),
+        "capturing": true,
+    });
+    if let Err(e) = app.emit(EVENT_HOTKEY_CAPTURED, payload) {
+        log::warn!("キー捕獲経過の送出に失敗: {e}");
+    }
+}
+
+/// 捕獲の終端 (取り消し・タイムアウト・保存失敗) を UI へ返す。
+///
+/// UI は現在値を取り直して表示を元に戻す。
+fn emit_hotkey_captured(app: &AppHandle, result: Option<hotkey::HotkeyCombo>) {
+    let payload = result.map(|combo| {
+        serde_json::json!({
+            "label": combo.label(),
+            "mods": combo.mods_vec(),
+            "vk": combo.vk,
+        })
+    });
     if let Err(e) = app.emit(EVENT_HOTKEY_CAPTURED, payload) {
         log::warn!("キー捕獲結果の送出に失敗: {e}");
     }
@@ -2003,8 +2820,8 @@ fn import_failed_recordings(
     if !dir.exists() {
         return Ok(0);
     }
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| format!("{} を読めません: {e}", dir.display()))?;
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("{} を読めません: {e}", dir.display()))?;
 
     let mut imported = 0;
     for entry in entries.flatten() {
@@ -2053,6 +2870,7 @@ fn import_failed_recordings(
             stt_ms: None,
             format_ms: None,
             wav_path: Some(path_str.to_string()),
+            style_profile: None,
         };
 
         match history.insert_untranscribed(&draft) {
@@ -2212,6 +3030,10 @@ fn save_failed_recording(
         "sample_rate": recording.sample_rate,
         "target_process": recording.target_process(),
         "target_hwnd": recording.target_hwnd(),
+        // どの用途の録音だったか。画面質問モードの音声だけは扱いが違う
+        // ([`answer_screen_question`] の「履歴に入るもの / 入らないもの」)
+        // ので、退避したファイル側にも根拠を残す。
+        "hotkey_mode": format!("{:?}", recording.mode),
     });
     if let Err(e) = std::fs::write(&meta_path, meta.to_string()) {
         log::warn!("退避メタ情報を書けません ({}): {e}", meta_path.display());
@@ -2286,20 +3108,29 @@ fn finalize_on_exit(app: &AppHandle) {
         .unwrap_or_else(|| PendingRecording {
             target: TargetWindow::unknown(),
             started_at: recorder.started_at(),
+            // 開始情報を取り落とした異常系。貼り付け側に倒す
+            // (クリップボードのみへ倒すと、貼られるはずの結果が黙って消える)。
+            mode: HotkeyMode::Inject,
             context: context::ScreenContext::default(),
+            screen: None,
         });
 
     match finalize_one(FinalizeJob {
         recorder,
         target: pending.target,
         started_at: pending.started_at,
+        mode: pending.mode,
         context: pending.context,
+        screen: pending.screen,
     }) {
-        Ok((recording, _)) => {
+        Ok(FinalizedRecording { recording, .. }) => {
             // 終了処理をネットワーク待ちで引き延ばさないため転写はしない。
             // 代わりに退避しておき、後から拾えるようにする。
-            let saved =
-                save_failed_recording(&state.failed_dir, &recording, "終了時に録音中だったため未転写");
+            let saved = save_failed_recording(
+                &state.failed_dir,
+                &recording,
+                "終了時に録音中だったため未転写",
+            );
             log::warn!(
                 "終了時に録音を確定しました: {} bytes / {:.2} 秒 / 挿入先={} / 退避先={}",
                 recording.wav_bytes.len(),
@@ -2320,12 +3151,7 @@ fn set_status(app: &AppHandle, status: Status, message: Option<String>) {
 }
 
 /// 出どころを明示して状態を更新する。
-fn set_status_from(
-    app: &AppHandle,
-    status: Status,
-    message: Option<String>,
-    origin: StatusOrigin,
-) {
+fn set_status_from(app: &AppHandle, status: Status, message: Option<String>, origin: StatusOrigin) {
     let state = app.state::<AppState>();
     if let Ok(mut slot) = state.status.lock() {
         *slot = status;
@@ -2404,6 +3230,7 @@ mod tests {
             },
             started_at: SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
             duration: Duration::from_millis(2_500),
+            mode: HotkeyMode::Inject,
         }
     }
 
@@ -2502,7 +3329,9 @@ mod tests {
             recorder: Recorder::for_test(samples, audio::TARGET_SAMPLE_RATE),
             target: TargetWindow::unknown(),
             started_at: SystemTime::now(),
+            mode: HotkeyMode::Inject,
             context: context::ScreenContext::default(),
+            screen: None,
         }
     }
 
@@ -2511,8 +3340,10 @@ mod tests {
     fn pending_jobs_are_recovered_on_exit() {
         let dir = temp_dir("drain");
         let (tx, rx) = crossbeam_channel::unbounded::<WorkerJob>();
-        tx.send(WorkerJob::Finalize(Box::new(test_job(0.1)))).expect("送れる");
-        tx.send(WorkerJob::Finalize(Box::new(test_job(0.2)))).expect("送れる");
+        tx.send(WorkerJob::Finalize(Box::new(test_job(0.1))))
+            .expect("送れる");
+        tx.send(WorkerJob::Finalize(Box::new(test_job(0.2))))
+            .expect("送れる");
         // 再転写待ちは WAV がディスク上にあるので退避対象外。
         tx.send(WorkerJob::Retranscribe { id: 99 }).expect("送れる");
 
@@ -2653,8 +3484,14 @@ mod tests {
         let failed_dir = temp_dir("import-idem-wav");
         save_failed_recording(&failed_dir, &sample_recording(), "失敗").expect("退避できる");
 
-        assert_eq!(import_failed_recordings(&store, &failed_dir).expect("1 回目"), 1);
-        assert_eq!(import_failed_recordings(&store, &failed_dir).expect("2 回目"), 0);
+        assert_eq!(
+            import_failed_recordings(&store, &failed_dir).expect("1 回目"),
+            1
+        );
+        assert_eq!(
+            import_failed_recordings(&store, &failed_dir).expect("2 回目"),
+            0
+        );
         assert_eq!(store.count().expect("読める"), 1);
 
         let _ = std::fs::remove_dir_all(&db_dir);
@@ -2665,7 +3502,10 @@ mod tests {
     fn importing_from_a_missing_directory_is_not_an_error() {
         let (db_dir, store) = temp_store("import-nodir");
         let missing = temp_dir("import-nodir-wav");
-        assert_eq!(import_failed_recordings(&store, &missing).expect("エラーにしない"), 0);
+        assert_eq!(
+            import_failed_recordings(&store, &missing).expect("エラーにしない"),
+            0
+        );
         let _ = std::fs::remove_dir_all(&db_dir);
     }
 
@@ -2678,7 +3518,10 @@ mod tests {
         std::fs::write(failed_dir.join("123.json"), "{}").expect("書ける");
         std::fs::write(failed_dir.join("123.wav.part"), "x").expect("書ける");
 
-        assert_eq!(import_failed_recordings(&store, &failed_dir).expect("取り込める"), 0);
+        assert_eq!(
+            import_failed_recordings(&store, &failed_dir).expect("取り込める"),
+            0
+        );
         assert_eq!(store.count().expect("読める"), 0);
 
         let _ = std::fs::remove_dir_all(&db_dir);
@@ -2711,8 +3554,12 @@ mod tests {
             stt_ms: None,
             format_ms: None,
             wav_path: Some(wav.to_string_lossy().to_string()),
+            style_profile: None,
         };
-        assert!(store.insert_untranscribed(&draft).expect("書ける").is_some());
+        assert!(store
+            .insert_untranscribed(&draft)
+            .expect("書ける")
+            .is_some());
 
         // 再起動を待たずに、再転写できる行として見えている。
         let rows = store.recent(10, None).expect("読める");
@@ -2739,7 +3586,10 @@ mod tests {
         let failed_dir = temp_dir("revive-wav");
         save_failed_recording(&failed_dir, &sample_recording(), "失敗").expect("退避できる");
 
-        assert_eq!(import_failed_recordings(&store, &failed_dir).expect("取り込める"), 1);
+        assert_eq!(
+            import_failed_recordings(&store, &failed_dir).expect("取り込める"),
+            1
+        );
         let id = store.recent(10, None).expect("読める")[0].id;
 
         // ユーザーが履歴から削除する。
@@ -2748,7 +3598,10 @@ mod tests {
         assert_eq!(removal.wavs_removed, 1, "WAV を残すと復活する");
 
         // 起動をやり直しても戻ってこない。
-        assert_eq!(import_failed_recordings(&store, &failed_dir).expect("取り込める"), 0);
+        assert_eq!(
+            import_failed_recordings(&store, &failed_dir).expect("取り込める"),
+            0
+        );
         assert_eq!(store.count().expect("読める"), 0, "削除した履歴が復活した");
 
         let _ = std::fs::remove_dir_all(&db_dir);
@@ -2765,7 +3618,10 @@ mod tests {
             r.started_at += std::time::Duration::from_secs(1);
             save_failed_recording(&failed_dir, &r, "失敗").expect("退避できる");
         }
-        assert_eq!(import_failed_recordings(&store, &failed_dir).expect("取り込める"), 2);
+        assert_eq!(
+            import_failed_recordings(&store, &failed_dir).expect("取り込める"),
+            2
+        );
 
         let removal = store.clear().expect("消せる");
         assert_eq!(removal.rows, 2);
@@ -2777,7 +3633,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert!(leftover.is_empty(), "全消去後に残骸がある: {leftover:?}");
-        assert_eq!(import_failed_recordings(&store, &failed_dir).expect("取り込める"), 0);
+        assert_eq!(
+            import_failed_recordings(&store, &failed_dir).expect("取り込める"),
+            0
+        );
 
         let _ = std::fs::remove_dir_all(&db_dir);
         let _ = std::fs::remove_dir_all(&failed_dir);
@@ -2857,14 +3716,15 @@ mod tests {
             stt_ms: Some(1),
             format_ms: Some(1),
             wav_path: None,
+            style_profile: Some(String::new()),
         };
 
         // 履歴には書けない。
         let err = store.insert(&draft).expect_err("壊れた DB では失敗する");
         // ...が、音声は退避できる。
         let failed_dir = temp_dir("broken-db-wav");
-        let saved = save_failed_recording(&failed_dir, &recording, &err.to_string())
-            .expect("退避できる");
+        let saved =
+            save_failed_recording(&failed_dir, &recording, &err.to_string()).expect("退避できる");
         assert_eq!(
             std::fs::read(&saved).expect("読める"),
             recording.wav_bytes,
@@ -2907,7 +3767,11 @@ mod tests {
         let recorder = Recorder::for_test(vec![0.5f32; 3_200], audio::TARGET_SAMPLE_RATE);
         drop(recorder);
 
-        assert_eq!(store.count().expect("読める"), 0, "キャンセルが履歴行を作った");
+        assert_eq!(
+            store.count().expect("読める"),
+            0,
+            "キャンセルが履歴行を作った"
+        );
         let leftovers = std::fs::read_dir(&failed_dir)
             .map(|entries| entries.count())
             .unwrap_or(0);
@@ -2927,10 +3791,7 @@ mod tests {
         // コントローラループと同じ順序: 押下 → Cancel (破棄 + reset) → 離し。
         let mut interpreter = PttInterpreter::new(TAP_THRESHOLD);
         let t0 = Instant::now();
-        assert_eq!(
-            interpreter.on_press(t0),
-            Some(HotkeyAction::StartRecording)
-        );
+        assert_eq!(interpreter.on_press(t0), Some(HotkeyAction::StartRecording));
 
         // Esc でのキャンセル。解釈器は経由しないが、押下状態は捨てられる。
         interpreter.reset();
@@ -2956,8 +3817,10 @@ mod tests {
     /// 開始直後に誤停止しない。
     #[test]
     fn a_cancelled_recording_does_not_double_stop_on_the_length_limit() {
-        let recorder_slot: Mutex<Option<Recorder>> =
-            Mutex::new(Some(Recorder::for_test(vec![0.0f32; 16], audio::TARGET_SAMPLE_RATE)));
+        let recorder_slot: Mutex<Option<Recorder>> = Mutex::new(Some(Recorder::for_test(
+            vec![0.0f32; 16],
+            audio::TARGET_SAMPLE_RATE,
+        )));
         let pending_slot: Mutex<Option<PendingRecording>> = Mutex::new(None);
         let (limit_tx, limit_rx) = crossbeam_channel::bounded(1);
 

@@ -205,27 +205,39 @@ fn capture_with_uia() -> ScreenContext {
     };
 
     // パスワード欄は絶対に読まない。
-    // SAFETY: element は有効。取得できなければ判定不能なので読まない側に倒す。
-    match unsafe { element.CurrentIsPassword() } {
-        Ok(is_password) if is_password.as_bool() => {
-            log::info!("フォーカスがパスワード欄なので画面コンテキストは取得しません");
-            return ScreenContext::empty(ContextSource::PasswordSkipped);
-        }
-        Ok(_) => {}
-        Err(e) => {
-            // 判定できないものを読むのは危ない。
-            log::debug!("IsPassword を判定できないため取得を見送ります: {e}");
-            return ScreenContext::empty(ContextSource::PasswordSkipped);
-        }
+    if must_not_read(&element) {
+        log::info!("フォーカスがパスワード欄なので画面コンテキストは取得しません");
+        return ScreenContext::empty(ContextSource::PasswordSkipped);
     }
 
     read_element(&element)
 }
 
+/// この要素を読んではいけないか (パスワード欄)。
+///
+/// **判定できない場合も「読まない」に倒す。** 判定不能なものを読むリスクは
+/// 取らない。
+///
+/// [`crate::screen`] の走査からも呼ぶ。deep context だけがパスワードを
+/// 避けて画面質問モードが素通し、では UI の約束 (「パスワード欄は
+/// 読み取りません」) と実装が食い違う。**同じ判断を 2 か所に書かない**。
+pub(crate) fn must_not_read(element: &IUIAutomationElement) -> bool {
+    // SAFETY: element は有効。取得できなければ判定不能。
+    match unsafe { element.CurrentIsPassword() } {
+        Ok(is_password) => is_password.as_bool(),
+        Err(e) => {
+            log::debug!("IsPassword を判定できないため読み取りを見送ります: {e}");
+            true
+        }
+    }
+}
+
 /// 要素からテキストを読む。対応パターンを上から順に試す。
 ///
-/// 診断テストからも同じ経路を通せるよう切り出してある。
-fn read_element(element: &IUIAutomationElement) -> ScreenContext {
+/// 診断テストからも、[`crate::screen`] のモニタ単位の走査からも同じ経路を
+/// 通せるよう切り出してある。**読み方を 2 か所に書かない**
+/// (design.md「同じ判断を 2 箇所で書いたら、片方は必ず更新から取り残される」)。
+pub(crate) fn read_element(element: &IUIAutomationElement) -> ScreenContext {
     if let Some(text) = text_from_text_pattern(element) {
         return ScreenContext {
             text: trim_context(&text),

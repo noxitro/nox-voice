@@ -72,12 +72,28 @@ impl TargetWindow {
 ///
 /// 画面コンテキストは**その場限り**で、[`RecordingSession`] にも履歴にも
 /// 残さない (design.md R1 / [`crate::context`] のプライバシー方針)。
-#[derive(Debug, Clone)]
+///
+/// **`Clone` は付けない。** 画面走査の待ち受け口
+/// ([`crate::screen::ScanHandle`]) を持つので、複製できると 2 か所が同じ
+/// 走査を待てることになり、結果は 1 回しか流れない以上どちらかが必ず
+/// 「タイムアウト」を受け取る。この構造体は `take()` で 1 回だけ
+/// 取り出される設計なので、複製できる必要がそもそも無い。
+#[derive(Debug)]
 pub struct PendingRecording {
     pub target: TargetWindow,
     pub started_at: SystemTime,
+    /// どのホットキーで始めた録音か。結果の届け方 (貼り付け /
+    /// クリップボードのみ) を決めるので、**開始時に固定する**。
+    /// 録音中に設定を変えても、走っている録音の扱いは変わらない。
+    pub mode: crate::hotkey::HotkeyMode,
     /// deep context で読んだ画面テキスト。無効なら空。
     pub context: crate::context::ScreenContext,
+    /// 画面質問モードの走査 (この用途以外では `None`)。
+    ///
+    /// **結果ではなく待ち受け口を持つ。** 走査は録音と並行して進み、
+    /// 回収は後処理ワーカーで行う ([`crate::screen::ScanHandle`])。
+    /// ここで結果を待つと、録音開始が数秒遅れて最初の一言が消える。
+    pub screen: Option<crate::screen::ScanHandle>,
 }
 
 /// 1 回の PTT 録音の成果物。M2 の STT はこれを入力に取る。
@@ -93,6 +109,8 @@ pub struct RecordingSession {
     pub started_at: SystemTime,
     /// 録音長 (サンプル数から算出した実尺。壁時計ではない)。
     pub duration: Duration,
+    /// 録音を始めたホットキーの用途 ([`PendingRecording::mode`])。
+    pub mode: crate::hotkey::HotkeyMode,
 }
 
 impl RecordingSession {

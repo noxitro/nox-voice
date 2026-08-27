@@ -1,12 +1,23 @@
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { defineConfig } from "vite";
+
+// サイドバーに出す版表記。ここで package.json から取らないと、
+// HTML に手打ちした版が更新されないまま残る (実際に起きる事故)。
+const pkg = JSON.parse(
+  readFileSync(resolve(import.meta.dirname, "package.json"), "utf8"),
+) as { version: string };
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
+  },
+
   build: {
     rollupOptions: {
       input: {

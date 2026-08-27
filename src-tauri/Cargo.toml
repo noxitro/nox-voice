@@ -30,10 +30,24 @@ hound = "3.5"
 # 本アプリは Windows 11 専用(WH_KEYBOARD_LL / 前景 HWND 取得に依存)。
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Media_Audio",
     "Win32_System_Com",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
+    # GetModuleHandleW。疑似 E2E (instance.rs の `sim`) が
+    # tauri-plugin-single-instance と同じ作りの受信ウィンドウを立てるのに要る。
+    "Win32_System_LibraryLoader",
+    # GetSystemTime。ロガー初期化前に出す多重起動ログの時刻に使う (instance.rs)。
+    # tauri-plugin-log の既定が UTC なので、こちらも UTC で揃える。
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    # CreateMutexW の SECURITY_ATTRIBUTES 型に必要 (値は既定の NULL を渡す)。
+    "Win32_Security",
+    # 画面質問モード (screen.rs): モニタの列挙と画面のキャプチャ。
+    "Win32_Graphics_Gdi",
+    # 同: DWMWA_CLOAKED。IsWindowVisible だけでは、別の仮想デスクトップに
+    # 置いてあるウィンドウまで「見えている」ことになってしまう。
+    "Win32_Graphics_Dwm",
     "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
@@ -43,6 +57,11 @@ tauri-plugin-notification = "2.3.3"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 whisper-rs = { version = "0.16", default-features = false, optional = true }
 sha2 = "0.11.0"
+# 画面質問モードのスクリーンショット。
+# JPEG ではなく PNG なのは、資料の主たる内容が文字だから (screen.rs 参照)。
+# どちらも tauri の依存として既に lock に載っているので、ビルド時間は増えない。
+png = "0.17"
+base64 = "0.22"
 
 [features]
 default = []
@@ -55,3 +74,6 @@ default = []
 #
 #   cargo build --features local-stt
 local-stt = ["dep:whisper-rs"]
+
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = "2.4.3"

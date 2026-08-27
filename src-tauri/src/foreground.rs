@@ -43,7 +43,9 @@ pub fn capture_foreground() -> TargetWindow {
 }
 
 /// ウィンドウタイトル。取得できなければ空文字。
-fn window_title(hwnd: HWND) -> String {
+///
+/// [`crate::screen`] のウィンドウ列挙からも使う (同じ取り方を 2 度書かない)。
+pub(crate) fn window_title(hwnd: HWND) -> String {
     let mut buf = [0u16; 512];
     // SAFETY: buf は有効なスライス。GetWindowTextW はスライス長を上限に書き込む。
     let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
@@ -58,7 +60,9 @@ fn window_title(hwnd: HWND) -> String {
 ///
 /// `PROCESS_QUERY_LIMITED_INFORMATION` を使うので、昇格プロセスに対しても
 /// 名前の取得だけは通ることが多い (完全な情報は取れない)。
-fn process_image_name(process_id: u32) -> Option<String> {
+///
+/// [`crate::screen`] のウィンドウ列挙からも使う。
+pub(crate) fn process_image_name(process_id: u32) -> Option<String> {
     // SAFETY: PID は数値、継承なし。失敗時は Err が返る。
     let handle: HANDLE =
         unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }

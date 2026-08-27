@@ -53,7 +53,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 /// スキーマのバージョン。`PRAGMA user_version` で管理する。
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// 履歴操作のエラー。
 #[derive(Debug)]
@@ -103,6 +103,13 @@ pub struct SessionDraft {
     pub format_ms: Option<u64>,
     /// 未転写行のみ。再転写に使う WAV のパス。
     pub wav_path: Option<String>,
+    /// 適用された文体プロファイルの印 ([`crate::style::history_label`])。
+    ///
+    /// `None` は「記録していない」(版 2 より前の行 / 対象外の経路)、
+    /// `Some("")` は「どれにも当たらなかった」。**この 2 つを同じにしない** —
+    /// 「プロファイルが無いアプリ」を数えたいのに、古い行まで
+    /// 未一致として混ざると、拡充の効果が測れなくなる。
+    pub style_profile: Option<String>,
 }
 
 /// 再転写の結果 (更新用のまとまり)。
@@ -135,6 +142,36 @@ pub struct SessionRow {
     /// 未転写行かどうか (再転写ボタンの出し分け)。
     pub has_audio: bool,
     pub created_at_ms: u64,
+    /// 適用された文体プロファイル ([`SessionDraft::style_profile`] と同じ意味)。
+    pub style_profile: Option<String>,
+}
+
+/// ダッシュボード用の日次集計。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DailyStat {
+    /// 日付 (YYYY-MM-DD)。
+    pub date: String,
+    /// その日の総文字数。
+    pub chars: u64,
+    /// その日のセッション数。
+    pub sessions: u64,
+    /// その日の総録音時間 (ms)。
+    pub recording_time_ms: u64,
+}
+
+/// ダッシュボード用の集計統計。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DashboardStats {
+    /// 全期間の総文字数。
+    pub total_chars: u64,
+    /// 全期間の総セッション数。
+    pub total_sessions: u64,
+    /// 全期間の総録音時間 (ms)。
+    pub total_recording_time_ms: u64,
+    /// 節約時間 (ms)。total_chars / typing_speed_chars_per_min * 60000 - total_recording_time_ms
+    pub time_saved_ms: i64,
+    /// 日次集計 (新しい順)。
+    pub daily_stats: Vec<DailyStat>,
 }
 
 impl SessionRow {
@@ -189,8 +226,8 @@ impl HistoryStore {
             "INSERT INTO sessions (
                  started_at_ms, duration_ms, target_process, target_hwnd,
                  raw_text, formatted_text, outcome, outcome_reason,
-                 stt_ms, format_ms, wav_path, created_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 stt_ms, format_ms, wav_path, created_at_ms, style_profile
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 draft.started_at_ms as i64,
                 draft.duration_ms as i64,
@@ -204,6 +241,7 @@ impl HistoryStore {
                 draft.format_ms.map(|v| v as i64),
                 draft.wav_path,
                 now_ms() as i64,
+                draft.style_profile,
             ],
         )
         .map_err(|e| HistoryError::Query(e.to_string()))?;
@@ -214,10 +252,7 @@ impl HistoryStore {
     ///
     /// 同じ `wav_path` が既にあれば何もせず `Ok(None)` を返す
     /// (起動のたびに重複行が増えないように、部分ユニークインデックスで担保)。
-    pub fn insert_untranscribed(
-        &self,
-        draft: &SessionDraft,
-    ) -> Result<Option<i64>, HistoryError> {
+    pub fn insert_untranscribed(&self, draft: &SessionDraft) -> Result<Option<i64>, HistoryError> {
         let Some(wav_path) = draft.wav_path.as_deref() else {
             return Err(HistoryError::Query(
                 "未転写行には wav_path が必要です".to_string(),
@@ -367,7 +402,7 @@ impl HistoryStore {
                 "SELECT id, started_at_ms, duration_ms, target_process, target_hwnd,
                         raw_text, formatted_text, outcome, outcome_reason,
                         stt_ms, format_ms, inject_outcome, clipboard_state,
-                        wav_path, created_at_ms
+                        wav_path, created_at_ms, style_profile
                    FROM sessions
                   WHERE (?2 IS NULL OR id < ?2)
                     AND (?3 IS NULL
@@ -462,7 +497,7 @@ impl HistoryStore {
             "SELECT id, started_at_ms, duration_ms, target_process, target_hwnd,
                     raw_text, formatted_text, outcome, outcome_reason,
                     stt_ms, format_ms, inject_outcome, clipboard_state,
-                    wav_path, created_at_ms
+                    wav_path, created_at_ms, style_profile
                FROM sessions WHERE id = ?1",
             params![id],
             row_to_session,
@@ -544,7 +579,9 @@ impl HistoryStore {
                 .prepare("SELECT id, wav_path FROM sessions WHERE wav_path IS NOT NULL")
                 .map_err(|e| HistoryError::Query(e.to_string()))?;
             let rows = stmt
-                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
                 .map_err(|e| HistoryError::Query(e.to_string()))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| HistoryError::Query(e.to_string()))?;
@@ -585,7 +622,8 @@ impl HistoryStore {
             for id in ids.into_iter().filter(|id| !stuck.contains(id)) {
                 deleted += conn
                     .execute("DELETE FROM sessions WHERE id = ?1", params![id])
-                    .map_err(|e| HistoryError::Query(e.to_string()))? as u64;
+                    .map_err(|e| HistoryError::Query(e.to_string()))?
+                    as u64;
             }
             deleted
         };
@@ -625,7 +663,119 @@ impl HistoryStore {
         .map_err(|e| HistoryError::Query(e.to_string()))
     }
 
+    /// 挿入先ごとの録音件数を多い順に数える。
+    ///
+    /// 「よく喋っているのに文体プロファイルが無いアプリ」を設定画面へ
+    /// 出すための材料。**ここでは絞り込まない** — どのプロファイルに
+    /// 覆われているかの判定は [`crate::style::suggest_uncovered`] に
+    /// 一本化してある (同じ判定を 2 か所に書かないため)。
+    ///
+    /// 未転写行 (STT が通っていない) も数える。喋った回数という意味では
+    /// 同じで、除くと「失敗が多いアプリほど提案されない」ことになる。
+    ///
+    /// 大文字小文字は畳む。`Slack.exe` と `slack.exe` が別アプリとして
+    /// 並ぶと、上位が同じアプリの表記ゆれで埋まる。
+    pub fn process_usage(&self, limit: u32) -> Result<Vec<crate::style::ProcessUsage>, HistoryError> {
+        let conn = self.connect()?;
+        let limit = limit.clamp(1, 100) as i64;
+        let mut stmt = conn
+            .prepare(
+                "SELECT LOWER(target_process) AS name, COUNT(*) AS n
+                   FROM sessions
+                  WHERE TRIM(target_process) <> ''
+                  GROUP BY name
+                  ORDER BY n DESC, name ASC
+                  LIMIT ?1",
+            )
+            .map_err(|e| HistoryError::Query(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok(crate::style::ProcessUsage {
+                    process: row.get(0)?,
+                    sessions: row.get::<_, i64>(1)? as u64,
+                })
+            })
+            .map_err(|e| HistoryError::Query(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| HistoryError::Query(e.to_string()))?;
+        Ok(rows)
+    }
 
+    /// ダッシュボード用の集計統計を取得する。
+    ///
+    /// `typing_speed_chars_per_min` は文字/分。節約時間の計算に使う。
+    /// 文字数 = LENGTH(COALESCE(formatted_text, raw_text, ''))
+    /// 節約時間 (ms) = total_chars / typing_speed_chars_per_min * 60000 - total_recording_time_ms
+    pub fn get_dashboard_stats(
+        &self,
+        typing_speed_chars_per_min: u32,
+    ) -> Result<DashboardStats, HistoryError> {
+        let conn = self.connect()?;
+
+        // 全期間の集計
+        let (total_chars, total_sessions, total_recording_time_ms): (u64, u64, u64) = conn
+            .query_row(
+                "SELECT
+                    COALESCE(SUM(LENGTH(COALESCE(formatted_text, raw_text, ''))), 0),
+                    COUNT(*),
+                    COALESCE(SUM(duration_ms), 0)
+                 FROM sessions",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u64,
+                    ))
+                },
+            )
+            .map_err(|e| HistoryError::Query(e.to_string()))?;
+
+        // 節約時間の計算 (ms)
+        // total_chars / typing_speed_chars_per_min * 60000 - total_recording_time_ms
+        let time_saved_ms = if typing_speed_chars_per_min > 0 {
+            let typing_time_ms =
+                (total_chars as f64 / typing_speed_chars_per_min as f64 * 60000.0) as i64;
+            typing_time_ms - total_recording_time_ms as i64
+        } else {
+            0
+        };
+
+        // 日次集計 (新しい順)
+        let mut stmt = conn
+            .prepare(
+                "SELECT
+                    date(started_at_ms / 1000, 'unixepoch') as day,
+                    COALESCE(SUM(LENGTH(COALESCE(formatted_text, raw_text, ''))), 0),
+                    COUNT(*),
+                    COALESCE(SUM(duration_ms), 0)
+                 FROM sessions
+                 GROUP BY day
+                 ORDER BY day DESC",
+            )
+            .map_err(|e| HistoryError::Query(e.to_string()))?;
+
+        let daily_stats = stmt
+            .query_map([], |row| {
+                Ok(DailyStat {
+                    date: row.get(0)?,
+                    chars: row.get::<_, i64>(1)? as u64,
+                    sessions: row.get::<_, i64>(2)? as u64,
+                    recording_time_ms: row.get::<_, i64>(3)? as u64,
+                })
+            })
+            .map_err(|e| HistoryError::Query(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| HistoryError::Query(e.to_string()))?;
+
+        Ok(DashboardStats {
+            total_chars,
+            total_sessions,
+            total_recording_time_ms,
+            time_saved_ms,
+            daily_stats,
+        })
+    }
 }
 
 /// 削除の結果。行とファイルの両方について報告する。
@@ -694,6 +844,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         clipboard_state: row.get(12)?,
         has_audio: wav_path.is_some(),
         created_at_ms: row.get::<_, i64>(14)? as u64,
+        style_profile: row.get(15)?,
     })
 }
 
@@ -754,6 +905,19 @@ fn migrate(conn: &Connection) -> Result<(), HistoryError> {
         .map_err(|e| HistoryError::Migrate(e.to_string()))?;
     }
 
+    if version < 2 {
+        // 版 1 で作られた既存 DB に列を足す。**作り直さない** —
+        // ここに入っているのは利用者の発話そのもので、失えば戻らない。
+        // 既存行の値は NULL のまま = 「記録していない」を表す
+        // (`SessionDraft::style_profile` の doc)。
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE sessions ADD COLUMN style_profile TEXT;
+             COMMIT;",
+        )
+        .map_err(|e| HistoryError::Migrate(e.to_string()))?;
+    }
+
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|e| HistoryError::Migrate(e.to_string()))?;
     log::info!("履歴データベースを版 {SCHEMA_VERSION} へ初期化しました");
@@ -802,6 +966,7 @@ mod tests {
             stt_ms: Some(800),
             format_ms: Some(1_200),
             wav_path: None,
+            style_profile: Some("chat.slack".to_string()),
         }
     }
 
@@ -883,6 +1048,7 @@ mod tests {
             clipboard_state: None,
             has_audio: false,
             created_at_ms: 0,
+            style_profile: None,
         };
         assert_eq!(row.text(), Some("整形"));
         row.formatted_text = None;
@@ -902,7 +1068,11 @@ mod tests {
         let db = TempDb::new("paging");
         let mut ids = Vec::new();
         for i in 0..5 {
-            ids.push(db.store.insert(&draft(1_700_000_000_000 + i)).expect("書ける"));
+            ids.push(
+                db.store
+                    .insert(&draft(1_700_000_000_000 + i))
+                    .expect("書ける"),
+            );
         }
 
         let page1 = db.store.recent(3, None).expect("読める");
@@ -967,7 +1137,11 @@ mod tests {
         assert_eq!(second, None, "同じ WAV が二重登録された");
         assert_eq!(db.store.count().expect("読める"), 1);
 
-        let row = db.store.get(first.expect("id")).expect("読める").expect("行");
+        let row = db
+            .store
+            .get(first.expect("id"))
+            .expect("読める")
+            .expect("行");
         assert!(row.has_audio, "再転写できる行として見えていない");
         assert_eq!(row.outcome, OUTCOME_UNTRANSCRIBED);
         assert_eq!(row.raw_text, None);
@@ -988,7 +1162,11 @@ mod tests {
         d.formatted_text = None;
         d.outcome = OUTCOME_UNTRANSCRIBED.to_string();
         d.wav_path = Some(r"C:\tmp\failed\a.wav".to_string());
-        let id = db.store.insert_untranscribed(&d).expect("書ける").expect("id");
+        let id = db
+            .store
+            .insert_untranscribed(&d)
+            .expect("書ける")
+            .expect("id");
 
         db.store
             .update_transcription(
@@ -1042,7 +1220,10 @@ mod tests {
         assert_eq!(hits[0].id, id_b);
 
         // 空・空白は絞り込みなし。
-        assert_eq!(db.store.search(50, None, Some("  ")).expect("読める").len(), 2);
+        assert_eq!(
+            db.store.search(50, None, Some("  ")).expect("読める").len(),
+            2
+        );
         assert_eq!(db.store.search(50, None, None).expect("読める").len(), 2);
     }
 
@@ -1052,8 +1233,20 @@ mod tests {
         let mut d = draft(1);
         d.target_process = "Slack.exe".to_string();
         db.store.insert(&d).expect("書ける");
-        assert_eq!(db.store.search(50, None, Some("slack")).expect("読める").len(), 1);
-        assert_eq!(db.store.search(50, None, Some("SLACK")).expect("読める").len(), 1);
+        assert_eq!(
+            db.store
+                .search(50, None, Some("slack"))
+                .expect("読める")
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.store
+                .search(50, None, Some("SLACK"))
+                .expect("読める")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1073,7 +1266,10 @@ mod tests {
 
         // `_` も同様 (1 文字ワイルドカードにしない)。
         let hits = db.store.search(50, None, Some("5_%")).expect("読める");
-        assert!(hits.is_empty(), "アンダースコアが 1 文字ワイルドカードになっている");
+        assert!(
+            hits.is_empty(),
+            "アンダースコアが 1 文字ワイルドカードになっている"
+        );
     }
 
     #[test]
@@ -1261,7 +1457,10 @@ mod tests {
         assert_eq!(cutoff_ms(100 * day, 30), 70 * day);
         // 現在時刻が保持期間より小さくても panic しない。
         assert_eq!(cutoff_ms(day, 30), 0);
-        assert_eq!(cutoff_ms(u64::MAX, u32::MAX), u64::MAX - (u32::MAX as u64) * day);
+        assert_eq!(
+            cutoff_ms(u64::MAX, u32::MAX),
+            u64::MAX - (u32::MAX as u64) * day
+        );
     }
 
     // --- WAV と DB 行のライフサイクル (レビュー指摘 M-1 / M-2) ---
@@ -1437,7 +1636,10 @@ mod tests {
             )
             .expect("更新できる");
         }
-        let old_plain = db.store.insert(&draft(now_ms() - 400 * day)).expect("書ける");
+        let old_plain = db
+            .store
+            .insert(&draft(now_ms() - 400 * day))
+            .expect("書ける");
 
         assert_eq!(db.store.purge_older_than(30).expect("消せる"), 1);
         assert!(
@@ -1479,6 +1681,52 @@ mod tests {
         assert!(remove_wav_files(&path.to_string_lossy()).is_ok());
     }
 
+    // --- ダッシュボード集計 ---
+
+    #[test]
+    fn get_dashboard_stats_with_empty_history_returns_zeros() {
+        let db = TempDb::new("dashboard-empty");
+        let stats = db.store.get_dashboard_stats(35).expect("集計できる");
+        assert_eq!(stats.total_chars, 0);
+        assert_eq!(stats.total_sessions, 0);
+        assert_eq!(stats.total_recording_time_ms, 0);
+        assert_eq!(stats.time_saved_ms, 0);
+        assert!(stats.daily_stats.is_empty());
+    }
+
+    #[test]
+    fn get_dashboard_stats_with_non_empty_history_calculates_correctly() {
+        let db = TempDb::new("dashboard-nonempty");
+        // Insert some sessions with known data
+        let mut d1 = draft(1_700_000_000_000);
+        d1.duration_ms = 2_000;
+        d1.raw_text = Some("こんにちは".to_string());
+        d1.formatted_text = Some("こんにちは。".to_string());
+        db.store.insert(&d1).expect("書ける");
+
+        let mut d2 = draft(1_700_000_000_100);
+        d2.duration_ms = 3_000;
+        d2.raw_text = Some("さようなら".to_string());
+        d2.formatted_text = None;
+        db.store.insert(&d2).expect("書ける");
+
+        let stats = db.store.get_dashboard_stats(35).expect("集計できる");
+
+        // total_chars: "こんにちは。" (6) + "さようなら" (5) = 11
+        assert_eq!(stats.total_chars, 11);
+        // total_sessions: 2
+        assert_eq!(stats.total_sessions, 2);
+        // total_recording_time_ms: 2000 + 3000 = 5000
+        assert_eq!(stats.total_recording_time_ms, 5_000);
+        // time_saved_ms: (11 / 35 * 60000) - 5000 = (11 * 60000 / 35) - 5000
+        // = (660000 / 35) - 5000 = 18857 - 5000 = 13857 (approximately)
+        let expected_typing_time_ms = (11_f64 / 35.0 * 60000.0) as i64;
+        let expected_time_saved = expected_typing_time_ms - 5_000;
+        assert_eq!(stats.time_saved_ms, expected_time_saved);
+        // daily_stats should have entries
+        assert!(!stats.daily_stats.is_empty());
+    }
+
     // --- マイグレーション ---
 
     #[test]
@@ -1506,13 +1754,105 @@ mod tests {
         let db = TempDb::new("migrate-fresh");
         // TempDb は initialize 済み。素の接続で版 0 から上がることを確認する。
         let conn = db.store.connect().expect("開ける");
-        conn.pragma_update(None, "user_version", 0i64).expect("戻せる");
+        conn.pragma_update(None, "user_version", 0i64)
+            .expect("戻せる");
         conn.execute_batch("DROP TABLE sessions").expect("落とせる");
         drop(conn);
 
         db.store.initialize().expect("再作成できる");
         assert_eq!(db.store.count().expect("読める"), 0);
         db.store.insert(&draft(1)).expect("書ける");
+    }
+
+    #[test]
+    fn a_version_one_database_gains_the_style_column_without_losing_rows() {
+        // 版 1 の DB (style_profile 列が無い) を作り直さずに移行する。
+        // ここに入っているのは利用者の発話そのもので、失えば戻らない。
+        let db = TempDb::new("migrate-v2");
+        let conn = db.store.connect().expect("開ける");
+        conn.execute_batch("DROP TABLE sessions").expect("落とせる");
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                 started_at_ms   INTEGER NOT NULL,
+                 duration_ms     INTEGER NOT NULL,
+                 target_process  TEXT    NOT NULL,
+                 target_hwnd     INTEGER NOT NULL,
+                 raw_text        TEXT,
+                 formatted_text  TEXT,
+                 outcome         TEXT    NOT NULL,
+                 outcome_reason  TEXT,
+                 stt_ms          INTEGER,
+                 format_ms       INTEGER,
+                 inject_outcome  TEXT,
+                 clipboard_state TEXT,
+                 wav_path        TEXT,
+                 created_at_ms   INTEGER NOT NULL
+             );
+             INSERT INTO sessions
+                 (started_at_ms, duration_ms, target_process, target_hwnd,
+                  raw_text, formatted_text, outcome, created_at_ms)
+             VALUES (1, 2, 'notepad.exe', 3, '生', '整形', 'formatted', 4);",
+        )
+        .expect("旧スキーマを作れる");
+        conn.pragma_update(None, "user_version", 1i64).expect("戻せる");
+        drop(conn);
+
+        db.store.initialize().expect("移行できる");
+        assert_eq!(db.store.count().expect("読める"), 1, "行が消えた");
+        let row = &db.store.recent(10, None).expect("読める")[0];
+        assert_eq!(row.raw_text.as_deref(), Some("生"));
+        // 既存行は「記録していない」= NULL。未一致 ("") と混ぜない。
+        assert_eq!(row.style_profile, None);
+        // 以後の行にはちゃんと入る。
+        db.store.insert(&draft(9)).expect("書ける");
+        let newest = &db.store.recent(1, None).expect("読める")[0];
+        assert_eq!(newest.style_profile.as_deref(), Some("chat.slack"));
+    }
+
+    #[test]
+    fn an_unmatched_profile_is_stored_as_empty_not_null() {
+        let db = TempDb::new("style-empty");
+        let mut d = draft(1);
+        d.style_profile = Some(String::new());
+        let id = db.store.insert(&d).expect("書ける");
+        let row = db.store.get(id).expect("読める").expect("ある");
+        assert_eq!(
+            row.style_profile.as_deref(),
+            Some(""),
+            "未一致が NULL に潰れると「古い行」と区別できない"
+        );
+    }
+
+    #[test]
+    fn process_usage_counts_targets_case_insensitively() {
+        let db = TempDb::new("usage");
+        for (process, times) in [("Slack.exe", 3), ("slack.EXE", 2), ("figma.exe", 4)] {
+            for i in 0..times {
+                let mut d = draft(i as u64 + 1);
+                d.target_process = process.to_string();
+                db.store.insert(&d).expect("書ける");
+            }
+        }
+        // 空の挿入先 (前景が取れなかった録音) は数えない。
+        let mut blank = draft(99);
+        blank.target_process = String::new();
+        db.store.insert(&blank).expect("書ける");
+
+        let usage = db.store.process_usage(10).expect("読める");
+        assert_eq!(usage.len(), 2, "{usage:?}");
+        // 表記ゆれを畳んだので slack が 5 件で首位。
+        assert_eq!(usage[0].process, "slack.exe");
+        assert_eq!(usage[0].sessions, 5);
+        assert_eq!(usage[1].process, "figma.exe");
+        assert_eq!(usage[1].sessions, 4);
+    }
+
+    #[test]
+    fn process_usage_on_an_empty_database_is_empty_not_an_error() {
+        // 0 件と「読めなかった」を混同しないための境界。
+        let db = TempDb::new("usage-empty");
+        assert!(db.store.process_usage(10).expect("読める").is_empty());
     }
 
     #[test]

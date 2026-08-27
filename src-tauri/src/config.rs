@@ -21,13 +21,13 @@ use std::sync::Mutex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::dictionary::{self, DictionaryEntry};
+use crate::sound::{SoundChoice, SoundPreset};
 use crate::style::StyleProfile;
 
 /// Groq の既定エンドポイント (OpenAI 互換の transcriptions)。
 pub const DEFAULT_GROQ_ENDPOINT: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
 /// Gemini の既定エンドポイント。末尾に `/{model}:generateContent` が付く。
-pub const DEFAULT_GEMINI_ENDPOINT: &str =
-    "https://generativelanguage.googleapis.com/v1beta/models";
+pub const DEFAULT_GEMINI_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 pub const DEFAULT_STT_MODEL: &str = "whisper-large-v3";
 
 /// 整形モデルの既定。
@@ -58,6 +58,13 @@ pub const DEFAULT_LANGUAGE: &str = "ja";
 pub const DEFAULT_HISTORY_RETENTION_DAYS: u32 = 30;
 /// 保持日数の上限 (約 10 年)。0 は「無制限」を意味するので別扱い。
 pub const MAX_HISTORY_RETENTION_DAYS: u32 = 3_650;
+
+/// 既定のタイピング速度 (文字/分)。ダッシュボードの「節約時間」計算に使う。
+pub const DEFAULT_TYPING_SPEED_CHARS_PER_MIN: u32 = 35;
+/// タイピング速度の下限 (文字/分)。
+pub const MIN_TYPING_SPEED_CHARS_PER_MIN: u32 = 10;
+/// タイピング速度の上限 (文字/分)。
+pub const MAX_TYPING_SPEED_CHARS_PER_MIN: u32 = 300;
 
 /// 復元待ちの下限。0 だと貼付が消費される前に戻してしまう。
 pub const MIN_RESTORE_DELAY_MS: u64 = 50;
@@ -95,7 +102,11 @@ impl Secret {
         if trimmed.is_empty() {
             return String::new();
         }
-        let tail: String = trimmed.chars().rev().take(4).collect::<Vec<_>>()
+        let tail: String = trimmed
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
             .into_iter()
             .rev()
             .collect();
@@ -162,12 +173,74 @@ pub struct Config {
     /// 常駐アプリなので既定は「出さない」。ただし**初回起動だけは出す** —
     /// API キーを設定しないと何もできず、窓が出ないと設定画面へ辿り着けない。
     pub start_hidden: bool,
-    /// PTT に使う仮想キーコード。既定は右 Ctrl。
+    /// PTT のトリガー仮想キーコード。既定は Space ([`crate::hotkey::DEFAULT_HOTKEY_VK`])。
+    ///
+    /// [`Self::hotkey_mods`] が空のときは単独キーとして扱う (旧形式の設定ファイル)。
     pub hotkey_vk: u32,
+    /// トリガーと一緒に押す修飾キー (VK コード、表示順に正規化される)。
+    ///
+    /// 既定は左 Ctrl 1 個 (「左 Ctrl + Space」)。空なら単独キーホットキーで、
+    /// このときトリガーは旧基準 ([`crate::hotkey::is_allowed_hotkey`]) で弾かれる。
+    /// フィールド単位の `#[serde(default)]` が重要: コンテナ側の default は
+    /// [`Config::default()`] の値を使うため、**旧形式の設定ファイル (この項目が
+    /// 無い) まで既定の左 Ctrl を拾ってしまい、ホットキーが黙って変わる**。
+    /// 空ベクタで受ければ、旧設定は単独キーのまま保たれる。
+    #[serde(default)]
+    pub hotkey_mods: Vec<u32>,
     /// 録音を破棄するキャンセルキー。既定は Esc。**0 で無効化**。
     ///
     /// ホットキーとの重複は不可 ([`Config::normalize`] が解消する)。
     pub cancel_vk: u32,
+    /// 「クリップボードへ入れるだけ」モードのトリガーキー。**0 で無効**。
+    ///
+    /// 貼り付けモード ([`Self::hotkey_vk`]) とは別のキーを割り当てる。
+    /// 既定は未設定 — 勝手にキーを 1 つ占有すると、その組み合わせを
+    /// 使っている他アプリの操作を黙って奪うため。
+    #[serde(default)]
+    pub clipboard_hotkey_vk: u32,
+    /// クリップボードのみモードの修飾キー。
+    #[serde(default)]
+    pub clipboard_hotkey_mods: Vec<u32>,
+    /// 画面質問モードを使うか。
+    ///
+    /// **既定は無効。** 有効にすると、質問したときにモニタ 1 枚分の
+    /// 画面 (ウィンドウのテキストと、必要ならスクリーンショット) が
+    /// Gemini へ送られる。deep context より踏み込んだ行為なので、
+    /// UI に明示すること (design.md「画面質問モード」)。
+    ///
+    /// **このフラグだけでは動かない。** [`Self::screen_ask_hotkey_vk`] に
+    /// 専用キーを割り当てて初めて発火する。ON/OFF ひとつで既存の録音キーに
+    /// 相乗りさせると、普通の音声入力のたびに画面が送られてしまう。
+    #[serde(default)]
+    pub screen_ask_enabled: bool,
+    /// 画面質問モードのトリガーキー。**0 で未設定**。
+    #[serde(default)]
+    pub screen_ask_hotkey_vk: u32,
+    /// 画面質問モードの修飾キー。
+    #[serde(default)]
+    pub screen_ask_hotkey_mods: Vec<u32>,
+    /// 通知音を鳴らすか。
+    ///
+    /// 旧い設定ファイル (この項目が無い) でも**有効**にする。ペダル運用で
+    /// 「踏んだのに録音が始まっていない」に気づけないのが、この機能の
+    /// そもそもの動機なので、既定を無音にすると誰も気づけない。
+    #[serde(default = "default_true")]
+    pub sound_enabled: bool,
+    /// 通知音の音量 (0〜100)。0 は無音。
+    #[serde(default = "default_sound_volume")]
+    pub sound_volume: u8,
+    /// 録音開始時に鳴らす音。
+    #[serde(default)]
+    pub start_sound: SoundPreset,
+    /// `start_sound == Custom` のときに鳴らす WAV のパス。
+    #[serde(default)]
+    pub start_sound_path: String,
+    /// キャンセル / エラー時に鳴らす音。
+    #[serde(default = "default_cancel_sound")]
+    pub cancel_sound: SoundPreset,
+    /// `cancel_sound == Custom` のときに鳴らす WAV のパス。
+    #[serde(default)]
+    pub cancel_sound_path: String,
     /// 録音中・処理中の小窓を出すか。
     pub overlay_enabled: bool,
     /// 画面のテキストを読んで文脈として使うか (deep context)。
@@ -177,6 +250,21 @@ pub struct Config {
     pub deep_context: bool,
     /// 挿入先アプリごとの文体プロファイル。
     pub style_profiles: Vec<StyleProfile>,
+    /// 取り込み済みの同梱既定の版 ([`crate::style::STYLE_DEFAULTS_VERSION`])。
+    ///
+    /// **フィールド単位の `#[serde(default)]` であることが要**。コンテナ側の
+    /// default だと [`Config::default()`] の現行版を拾ってしまい、旧い設定
+    /// ファイルが「もう最新を取り込み済み」に化けて、拡充した既定が
+    /// 永久に届かなくなる (hotkey_mods と同じ罠)。0 = 版管理より前の設定。
+    #[serde(default)]
+    pub style_defaults_version: u32,
+    /// ユーザーが削除した既定プロファイルの id。
+    ///
+    /// 「まだ取り込んでいない」と「ユーザーが消した」を区別するためだけに
+    /// 存在する。これが無いと、アプリ更新のたびに消したはずの既定が
+    /// 生き返る。**空の Vec で始まってよい** — 削除は保存時に記録される。
+    #[serde(default)]
+    pub style_removed_default_ids: Vec<String>,
     /// 履歴を保存するか。
     ///
     /// 履歴には発話の全文が入る。R1 の観点で「残さない」選択肢を用意する。
@@ -198,6 +286,8 @@ pub struct Config {
     /// Ctrl+V でやり直せる。代償は元のクリップボード内容が上書きされること。
     /// 有効な間 [`restore_delay_ms`](Self::restore_delay_ms) は使われない。
     pub keep_transcript_in_clipboard: bool,
+    /// タイピング速度 (文字/分)。ダッシュボードの「節約時間」計算に使う。
+    pub typing_speed_chars_per_min: u32,
     pub groq_endpoint: String,
     pub gemini_endpoint: String,
     pub stt_model: String,
@@ -217,16 +307,36 @@ impl Default for Config {
             local_model_sha256: String::new(),
             start_hidden: true,
             hotkey_vk: crate::hotkey::DEFAULT_HOTKEY_VK,
+            hotkey_mods: crate::hotkey::DEFAULT_HOTKEY_MODS.to_vec(),
             cancel_vk: crate::hotkey::DEFAULT_CANCEL_VK,
+            // 既定は未設定。ユーザーが設定 UI で割り当てて初めて効く。
+            clipboard_hotkey_vk: 0,
+            clipboard_hotkey_mods: Vec::new(),
+            // 画面をまるごとクラウドへ送る機能なので、
+            // 「有効化」と「キーの割り当て」の 2 つを踏ませる。
+            screen_ask_enabled: false,
+            screen_ask_hotkey_vk: 0,
+            screen_ask_hotkey_mods: Vec::new(),
+            sound_enabled: true,
+            sound_volume: crate::sound::DEFAULT_VOLUME,
+            start_sound: SoundPreset::SoftPop,
+            start_sound_path: String::new(),
+            cancel_sound: SoundPreset::Fall,
+            cancel_sound_path: String::new(),
             overlay_enabled: true,
             // 画面テキストをクラウドへ送るので、明示的に有効化させる。
             deep_context: false,
             style_profiles: crate::style::default_profiles(),
+            // 既定値から作った設定は「現行版を取り込み済み」。ここを 0 に
+            // すると、新規ユーザーの初回起動が旧形式移行の経路へ入る。
+            style_defaults_version: crate::style::STYLE_DEFAULTS_VERSION,
+            style_removed_default_ids: Vec::new(),
             history_enabled: true,
             history_retention_days: DEFAULT_HISTORY_RETENTION_DAYS,
             restore_delay_ms: crate::inject::DEFAULT_RESTORE_DELAY_MS,
             // 貼付に失敗しても言い直さずに済むほうを既定にする。
             keep_transcript_in_clipboard: true,
+            typing_speed_chars_per_min: DEFAULT_TYPING_SPEED_CHARS_PER_MIN,
             groq_endpoint: DEFAULT_GROQ_ENDPOINT.to_string(),
             gemini_endpoint: DEFAULT_GEMINI_ENDPOINT.to_string(),
             stt_model: DEFAULT_STT_MODEL.to_string(),
@@ -306,6 +416,78 @@ impl Config {
             self.format_model
         )
     }
+
+    /// ホットキーの組み合わせを返す。
+    ///
+    /// [`Self::normalize`] 済みの設定なら必ず `Some` (不正値は既定へ倒済み)。
+    /// 念のため不正値が残っていても既定に落として返す。
+    pub fn hotkey_combo(&self) -> crate::hotkey::HotkeyCombo {
+        crate::hotkey::HotkeyCombo::from_parts(&self.hotkey_mods, self.hotkey_vk)
+            .unwrap_or_default()
+    }
+
+    /// 「クリップボードのみ」モードの組み合わせ。未設定なら `None`。
+    ///
+    /// こちらは `unwrap_or_default()` してはいけない。既定へ倒すと
+    /// **設定していないのに左 Ctrl + Space が 2 つの用途に割り当たる**。
+    pub fn clipboard_hotkey_combo(&self) -> Option<crate::hotkey::HotkeyCombo> {
+        if self.clipboard_hotkey_vk == 0 {
+            return None;
+        }
+        crate::hotkey::HotkeyCombo::from_parts(
+            &self.clipboard_hotkey_mods,
+            self.clipboard_hotkey_vk,
+        )
+    }
+
+    /// 画面質問モードの組み合わせ。**無効か未設定なら `None`**。
+    ///
+    /// 有効化フラグをここで見るのが要点。フラグを外したのにキーだけ残って
+    /// いると、設定画面では「オフ」なのにキーを押すと画面が送られる、
+    /// という一番まずい食い違いが起きる。判定を 1 か所に閉じ込めておけば、
+    /// 呼び出し側 (`apply_hotkeys`) が両方を見忘れることはない。
+    pub fn screen_ask_hotkey_combo(&self) -> Option<crate::hotkey::HotkeyCombo> {
+        if !self.screen_ask_enabled || self.screen_ask_hotkey_vk == 0 {
+            return None;
+        }
+        crate::hotkey::HotkeyCombo::from_parts(
+            &self.screen_ask_hotkey_mods,
+            self.screen_ask_hotkey_vk,
+        )
+    }
+
+    /// 録音開始時に鳴らす音。
+    pub fn start_sound_choice(&self) -> SoundChoice {
+        SoundChoice::new(self.start_sound, &self.start_sound_path)
+    }
+
+    /// キャンセル / エラー時に鳴らす音。
+    pub fn cancel_sound_choice(&self) -> SoundChoice {
+        SoundChoice::new(self.cancel_sound, &self.cancel_sound_path)
+    }
+
+    /// 通知音の音量。無効なら 0 (= 鳴らさない)。
+    pub fn effective_sound_volume(&self) -> u8 {
+        if self.sound_enabled {
+            self.sound_volume.min(100)
+        } else {
+            0
+        }
+    }
+}
+
+/// serde のフィールド既定値 (旧い設定ファイルの補完用)。
+fn default_true() -> bool {
+    true
+}
+
+fn default_sound_volume() -> u8 {
+    crate::sound::DEFAULT_VOLUME
+}
+
+/// キャンセル音の既定。開始音と**別の音**にする (聞き分けが要る)。
+fn default_cancel_sound() -> SoundPreset {
+    SoundPreset::Fall
 }
 
 fn env_value(name: &str) -> Option<String> {
@@ -350,15 +532,41 @@ pub struct ConfigView {
     pub local_stt_mode: LocalSttMode,
     pub start_hidden: bool,
     pub hotkey_vk: u32,
-    /// 表示用のキー名 (「右 Ctrl」など)。
+    /// ホットキーの修飾キー (空なら単独キー)。
+    pub hotkey_mods: Vec<u32>,
+    /// 表示用のキー名 (「左 Ctrl + Space」など)。
     pub hotkey_label: String,
     /// 録音キャンセルキーの表示名 (「Esc」など)。
     pub cancel_label: String,
+    /// クリップボードのみモードのトリガー (0 = 未設定)。
+    pub clipboard_hotkey_vk: u32,
+    pub clipboard_hotkey_mods: Vec<u32>,
+    /// クリップボードのみモードの表示用ラベル (未設定なら空文字)。
+    pub clipboard_hotkey_label: String,
+    /// 画面質問モードが有効か (**キーの割り当てとは別**)。
+    pub screen_ask_enabled: bool,
+    /// 画面質問モードのトリガー (0 = 未設定)。
+    pub screen_ask_hotkey_vk: u32,
+    pub screen_ask_hotkey_mods: Vec<u32>,
+    /// 画面質問モードの表示用ラベル (未設定なら空文字)。
+    ///
+    /// **有効化フラグを見ない**。無効のときも「割り当ててあるキー」は
+    /// 見せる — 有効化した瞬間に何のキーで動くのかが分からないと、
+    /// トグルを押すのが怖い機能になる。実際に効くかどうかは
+    /// [`Self::screen_ask_enabled`] で判断すること。
+    pub screen_ask_hotkey_label: String,
+    pub sound_enabled: bool,
+    pub sound_volume: u8,
+    pub start_sound: SoundPreset,
+    pub start_sound_path: String,
+    pub cancel_sound: SoundPreset,
+    pub cancel_sound_path: String,
     pub overlay_enabled: bool,
     pub history_enabled: bool,
     pub history_retention_days: u32,
     pub restore_delay_ms: u64,
     pub keep_transcript_in_clipboard: bool,
+    pub typing_speed_chars_per_min: u32,
     pub stt_model: String,
     pub format_model: String,
 }
@@ -394,13 +602,41 @@ impl ConfigView {
             local_stt_mode: c.local_stt_mode,
             start_hidden: c.start_hidden,
             hotkey_vk: c.hotkey_vk,
-            hotkey_label: crate::hotkey::key_label(c.hotkey_vk),
+            hotkey_mods: c.hotkey_combo().mods_vec(),
+            hotkey_label: c.hotkey_combo().label(),
             cancel_label: crate::hotkey::key_label(c.cancel_vk),
+            clipboard_hotkey_vk: c.clipboard_hotkey_vk,
+            clipboard_hotkey_mods: c
+                .clipboard_hotkey_combo()
+                .map(|combo| combo.mods_vec())
+                .unwrap_or_default(),
+            clipboard_hotkey_label: c
+                .clipboard_hotkey_combo()
+                .map(|combo| combo.label())
+                .unwrap_or_default(),
+            screen_ask_enabled: c.screen_ask_enabled,
+            screen_ask_hotkey_vk: c.screen_ask_hotkey_vk,
+            screen_ask_hotkey_mods: c.screen_ask_hotkey_mods.clone(),
+            // 有効化フラグを通さない accessor をわざと使わない:
+            // 無効でも割り当て済みのキーは見せる (フィールドの doc 参照)。
+            screen_ask_hotkey_label: crate::hotkey::HotkeyCombo::from_parts(
+                &c.screen_ask_hotkey_mods,
+                c.screen_ask_hotkey_vk,
+            )
+            .map(|combo| combo.label())
+            .unwrap_or_default(),
+            sound_enabled: c.sound_enabled,
+            sound_volume: c.sound_volume,
+            start_sound: c.start_sound,
+            start_sound_path: c.start_sound_path.clone(),
+            cancel_sound: c.cancel_sound,
+            cancel_sound_path: c.cancel_sound_path.clone(),
             overlay_enabled: c.overlay_enabled,
             history_enabled: c.history_enabled,
             history_retention_days: c.history_retention_days,
             restore_delay_ms: c.restore_delay_ms,
             keep_transcript_in_clipboard: c.keep_transcript_in_clipboard,
+            typing_speed_chars_per_min: c.typing_speed_chars_per_min,
             stt_model: c.stt_model.clone(),
             format_model: c.format_model.clone(),
         }
@@ -434,12 +670,25 @@ pub struct ConfigPatch {
     pub local_model_sha256: Option<String>,
     pub start_hidden: Option<bool>,
     pub hotkey_vk: Option<u32>,
+    pub hotkey_mods: Option<Vec<u32>>,
     pub cancel_vk: Option<u32>,
+    pub clipboard_hotkey_vk: Option<u32>,
+    pub clipboard_hotkey_mods: Option<Vec<u32>>,
+    pub screen_ask_enabled: Option<bool>,
+    pub screen_ask_hotkey_vk: Option<u32>,
+    pub screen_ask_hotkey_mods: Option<Vec<u32>>,
+    pub sound_enabled: Option<bool>,
+    pub sound_volume: Option<u8>,
+    pub start_sound: Option<SoundPreset>,
+    pub start_sound_path: Option<String>,
+    pub cancel_sound: Option<SoundPreset>,
+    pub cancel_sound_path: Option<String>,
     pub overlay_enabled: Option<bool>,
     pub history_enabled: Option<bool>,
     pub history_retention_days: Option<u32>,
     pub restore_delay_ms: Option<u64>,
     pub keep_transcript_in_clipboard: Option<bool>,
+    pub typing_speed_chars_per_min: Option<u32>,
     pub stt_model: Option<String>,
     pub format_model: Option<String>,
     pub groq_endpoint: Option<String>,
@@ -457,7 +706,10 @@ impl fmt::Debug for ConfigPatch {
             }
         }
         f.debug_struct("ConfigPatch")
-            .field("groq_api_key", &format_args!("{}", presence(&self.groq_api_key)))
+            .field(
+                "groq_api_key",
+                &format_args!("{}", presence(&self.groq_api_key)),
+            )
             .field(
                 "gemini_api_key",
                 &format_args!("{}", presence(&self.gemini_api_key)),
@@ -470,7 +722,23 @@ impl fmt::Debug for ConfigPatch {
             .field("local_stt_mode", &self.local_stt_mode)
             .field("start_hidden", &self.start_hidden)
             .field("hotkey_vk", &self.hotkey_vk)
+            .field("hotkey_mods", &self.hotkey_mods.as_ref().map(Vec::len))
             .field("cancel_vk", &self.cancel_vk)
+            .field("clipboard_hotkey_vk", &self.clipboard_hotkey_vk)
+            .field(
+                "clipboard_hotkey_mods",
+                &self.clipboard_hotkey_mods.as_ref().map(Vec::len),
+            )
+            .field("screen_ask_enabled", &self.screen_ask_enabled)
+            .field("screen_ask_hotkey_vk", &self.screen_ask_hotkey_vk)
+            .field(
+                "screen_ask_hotkey_mods",
+                &self.screen_ask_hotkey_mods.as_ref().map(Vec::len),
+            )
+            .field("sound_enabled", &self.sound_enabled)
+            .field("sound_volume", &self.sound_volume)
+            .field("start_sound", &self.start_sound)
+            .field("cancel_sound", &self.cancel_sound)
             .field("overlay_enabled", &self.overlay_enabled)
             .field(
                 "style_profiles",
@@ -482,6 +750,10 @@ impl fmt::Debug for ConfigPatch {
             .field(
                 "keep_transcript_in_clipboard",
                 &self.keep_transcript_in_clipboard,
+            )
+            .field(
+                "typing_speed_chars_per_min",
+                &self.typing_speed_chars_per_min,
             )
             .field("stt_model", &self.stt_model)
             .field("format_model", &self.format_model)
@@ -500,12 +772,96 @@ impl Config {
         // 捕獲 UI と同じ不変条件をここでも守る。設定ファイルは手で編集できるので、
         // UI を通らない値 (文字キー・Enter・マウス・範囲外) が入りうる。
         // 文字キーが入ると、押している間ずっと入力先へ流れ続ける。
-        if !crate::hotkey::is_allowed_hotkey(self.hotkey_vk) {
-            log::warn!(
-                "ホットキーに使えない値 (VK 0x{:02X}) が設定されていたので既定へ戻します",
-                self.hotkey_vk
-            );
-            self.hotkey_vk = crate::hotkey::DEFAULT_HOTKEY_VK;
+        match crate::hotkey::sanitize_combo(&self.hotkey_mods, self.hotkey_vk) {
+            Some(combo) => {
+                self.hotkey_mods = combo.mods_vec();
+                self.hotkey_vk = combo.vk;
+            }
+            None => {
+                log::warn!(
+                    "ホットキーに使えない組み合わせが設定されていたので既定へ戻します \
+                     (トリガー VK 0x{:02X} / 修飾子 {:?})",
+                    self.hotkey_vk,
+                    self.hotkey_mods
+                );
+                self.hotkey_mods = crate::hotkey::DEFAULT_HOTKEY_MODS.to_vec();
+                self.hotkey_vk = crate::hotkey::DEFAULT_HOTKEY_VK;
+            }
+        }
+        // 「クリップボードのみ」モードの組み合わせ。
+        //
+        // 未設定 (vk == 0) は正しい値なのでそのまま通す。設定されている場合は
+        // 貼り付け用と同じ要件で検査し、**同じ組み合わせなら後勝ちにせず
+        // クリップボード側を無効化する**。同じキーに 2 つの用途を割り当てると、
+        // どちらが動いたのかユーザーには区別が付かない。
+        if self.clipboard_hotkey_vk != 0 {
+            match crate::hotkey::sanitize_combo(
+                &self.clipboard_hotkey_mods,
+                self.clipboard_hotkey_vk,
+            ) {
+                Some(combo) if combo == self.hotkey_combo() => {
+                    log::warn!(
+                        "クリップボードのみモードのホットキーが貼り付け用 ({}) と同じなので無効にします",
+                        combo.label()
+                    );
+                    self.clipboard_hotkey_vk = 0;
+                    self.clipboard_hotkey_mods.clear();
+                }
+                Some(combo) => {
+                    self.clipboard_hotkey_mods = combo.mods_vec();
+                    self.clipboard_hotkey_vk = combo.vk;
+                }
+                None => {
+                    log::warn!(
+                        "クリップボードのみモードに使えない組み合わせが設定されていたので無効にします                          (トリガー VK 0x{:02X} / 修飾子 {:?})",
+                        self.clipboard_hotkey_vk,
+                        self.clipboard_hotkey_mods
+                    );
+                    self.clipboard_hotkey_vk = 0;
+                    self.clipboard_hotkey_mods.clear();
+                }
+            }
+        } else {
+            // トリガーが無いのに修飾子だけ残っていると、UI の表示が嘘になる。
+            self.clipboard_hotkey_mods.clear();
+        }
+        // 画面質問モードの組み合わせ。要件は上の 2 つと同じで、
+        // **どちらとも重複してはいけない**。同じキーに 2 つの用途が乗ると、
+        // どちらが動いたかユーザーに区別が付かない — しかもこの用途は
+        // 「画面を送る」なので、取り違えの代償が他と違う。
+        // 重複時は後から足したこちらを無効化する (既存の割り当てを壊さない)。
+        if self.screen_ask_hotkey_vk != 0 {
+            match crate::hotkey::sanitize_combo(
+                &self.screen_ask_hotkey_mods,
+                self.screen_ask_hotkey_vk,
+            ) {
+                Some(combo)
+                    if combo == self.hotkey_combo()
+                        || Some(combo) == self.clipboard_hotkey_combo() =>
+                {
+                    log::warn!(
+                        "画面質問モードのホットキーが他の用途 ({}) と同じなので無効にします",
+                        combo.label()
+                    );
+                    self.screen_ask_hotkey_vk = 0;
+                    self.screen_ask_hotkey_mods.clear();
+                }
+                Some(combo) => {
+                    self.screen_ask_hotkey_mods = combo.mods_vec();
+                    self.screen_ask_hotkey_vk = combo.vk;
+                }
+                None => {
+                    log::warn!(
+                        "画面質問モードに使えない組み合わせが設定されていたので無効にします                          (トリガー VK 0x{:02X} / 修飾子 {:?})",
+                        self.screen_ask_hotkey_vk,
+                        self.screen_ask_hotkey_mods
+                    );
+                    self.screen_ask_hotkey_vk = 0;
+                    self.screen_ask_hotkey_mods.clear();
+                }
+            }
+        } else {
+            self.screen_ask_hotkey_mods.clear();
         }
         // キャンセルキーはホットキーと要件が違う (録音中の 1 回押しなので Esc や
         // 文字キーも可。hotkey.rs の is_allowed_cancel_vk を参照)。マウスや
@@ -518,13 +874,21 @@ impl Config {
             );
             self.cancel_vk = crate::hotkey::DEFAULT_CANCEL_VK;
         }
-        // ホットキーとの重複は禁止。押すたびに録音とキャンセルが同時に
-        // 起こってしまう。キャンセル側を既定 (Esc) へ戻して解消する —
-        // ホットキーは Esc を選べないので、これで必ず外れる。
-        if self.cancel_vk != 0 && self.cancel_vk == self.hotkey_vk {
+        // ホットキーとの重複は禁止。トリガーと同じキーや、組み合わせの修飾子と
+        // 同じキーをキャンセルにすると、押すたびに録音操作とキャンセルが同時に
+        // 起こってしまう。キャンセル側を既定 (Esc) へ戻して解消する — ホットキーは
+        // Esc を選べないので、これで必ず外れる。
+        if self.cancel_vk != 0
+            && (self.cancel_vk == self.hotkey_vk
+                || self.hotkey_mods.contains(&self.cancel_vk)
+                || self.cancel_vk == self.clipboard_hotkey_vk
+                || self.clipboard_hotkey_mods.contains(&self.cancel_vk)
+                || self.cancel_vk == self.screen_ask_hotkey_vk
+                || self.screen_ask_hotkey_mods.contains(&self.cancel_vk))
+        {
             log::warn!(
                 "キャンセルキーがホットキー ({}) と重複していたため、既定の {} へ戻します",
-                crate::hotkey::key_label(self.hotkey_vk),
+                self.hotkey_combo().label(),
                 crate::hotkey::key_label(crate::hotkey::DEFAULT_CANCEL_VK)
             );
             self.cancel_vk = crate::hotkey::DEFAULT_CANCEL_VK;
@@ -536,6 +900,28 @@ impl Config {
         if self.history_retention_days != 0 {
             self.history_retention_days =
                 self.history_retention_days.min(MAX_HISTORY_RETENTION_DAYS);
+        }
+        // 通知音。音量は 0..=100、カスタム音はパスが無ければ鳴らしようがない。
+        self.sound_volume = self.sound_volume.min(100);
+        self.start_sound_path = self.start_sound_path.trim().to_string();
+        self.cancel_sound_path = self.cancel_sound_path.trim().to_string();
+        for (preset, path, what) in [
+            (&mut self.start_sound, &self.start_sound_path, "録音開始音"),
+            (&mut self.cancel_sound, &self.cancel_sound_path, "キャンセル音"),
+        ] {
+            if *preset == SoundPreset::Custom && path.is_empty() {
+                log::warn!("{what}にファイルが指定されていないので無音にします");
+                *preset = SoundPreset::Silent;
+            }
+        }
+        // タイピング速度を 10..=300 文字/分にクランプする。
+        // 0 は「節約時間を計算しない」という意味の正しい値なので潰さない
+        // (get_dashboard_stats が 0 を特別扱いする)。
+        if self.typing_speed_chars_per_min != 0 {
+            self.typing_speed_chars_per_min = self.typing_speed_chars_per_min.clamp(
+                MIN_TYPING_SPEED_CHARS_PER_MIN,
+                MAX_TYPING_SPEED_CHARS_PER_MIN,
+            );
         }
     }
 
@@ -552,6 +938,110 @@ impl Config {
                 delay: std::time::Duration::from_millis(self.restore_delay_ms),
             }
         }
+    }
+
+    /// 文体プロファイルの一覧を UI から来たもので置き換える。
+    ///
+    /// ここが版管理の**書き込み側**。UI は「プロセス名 / タイトル条件 /
+    /// 指示 / id」しか送ってこないので、`user_edited` と削除済み集合は
+    /// サーバ側 (ここ) で保存前の状態と突き合わせて維持する。フロントに
+    /// 持たせると、リロードや実装の取り違えで印が消えた瞬間に、
+    /// ユーザーの編集がアプリ更新で上書きされる。
+    ///
+    /// 規則:
+    /// 1. 条件か指示が空の行は落とす (空欄は全発話に効いてしまう)。
+    /// 2. 既知の id が消えていれば「ユーザーが削除した」と記録する。
+    /// 3. 既知の id で中身が変わっていれば `user_edited` を立てる。
+    /// 4. **知らない id は空へ倒す** (= ユーザー作成扱い)。UI が既定の id を
+    ///    名乗れると、他人の項目の更新権を横取りできてしまう。
+    ///    削除済み集合には**触らない**。
+    fn replace_style_profiles(&mut self, incoming: Vec<StyleProfile>) {
+        let previous = std::mem::take(&mut self.style_profiles);
+        let mut next: Vec<StyleProfile> = Vec::with_capacity(incoming.len());
+
+        for mut profile in incoming {
+            profile.process = profile.process.trim().to_string();
+            profile.instruction = profile.instruction.trim().to_string();
+            profile.title_contains = profile
+                .title_contains
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty());
+            if profile.process.is_empty() || profile.instruction.is_empty() {
+                continue;
+            }
+            let id = profile.id.trim().to_string();
+            profile.id = id.clone();
+            // 同じ id を 2 行が名乗っていたら、2 行目以降は空へ倒す。
+            // 重複した id はマージ側で「最初に見つかった 1 行」しか更新
+            // されず、残りが更新されない幽霊として残り続ける。UI の正常系
+            // では起きないが、防ぐのは 1 行で済む。
+            if !id.is_empty() && next.iter().any(|p| p.id == id) {
+                profile.id = String::new();
+                profile.user_edited = false;
+                next.push(profile);
+                continue;
+            }
+            match previous.iter().find(|p| !p.id.is_empty() && p.id == id) {
+                Some(stored) => {
+                    // 一度でも書き換えられたら印は落とさない。戻しても
+                    // 「触った項目」であることに変わりはなく、アプリ側の
+                    // 改訂で黙って上書きされない方が驚きが少ない。
+                    profile.user_edited = stored.user_edited
+                        || stored.process != profile.process
+                        || stored.title_contains != profile.title_contains
+                        || stored.instruction != profile.instruction;
+                }
+                None => {
+                    // 保存前の一覧に無い id を名乗ってきた行。**id を空へ倒す。**
+                    //
+                    // 現行 UI では起きない (行を作り直しても id は常に空)。
+                    // つまりここに来るのは、フロントの取り違えで行と
+                    // dataset.id の対応がずれたときだけ。そのとき id を
+                    // 信じると、(i) 実体の無い「既定 (編集済み)」行が生まれ、
+                    // (ii) 削除の記録が黙って取り消され、(iii) 同じ id の
+                    // 将来の既定配信がその行に塞がれる。どれも無言で起きて
+                    // 直しようがないので、名乗りは受け付けない。
+                    //
+                    // 「消した既定を戻したい」導線は、`style_removed_default_ids`
+                    // から外す UI で正面から作るべきもので、**未知 id の受理で
+                    // 賄ってはいけない** (副作用が上の 3 つと同じになる)。
+                    profile.id = String::new();
+                    profile.user_edited = false;
+                }
+            }
+            next.push(profile);
+        }
+
+        // 消えた既定を記録する。ユーザー作成 (id 空) は記録しない —
+        // 復活させる仕組みが無いので、覚えておく意味が無い。
+        for stored in &previous {
+            if stored.is_user_made() {
+                continue;
+            }
+            let gone = !next.iter().any(|p| p.id == stored.id);
+            if gone && !self.style_removed_default_ids.contains(&stored.id) {
+                self.style_removed_default_ids.push(stored.id.clone());
+            }
+        }
+
+        self.style_profiles = next;
+    }
+
+    /// 同梱の既定を差分だけ取り込み、取り込み済みの版を進める。
+    ///
+    /// 戻り値が「何か変わったか」。呼び出し側 ([`ConfigStore::load`]) は
+    /// 変わったときだけ保存する。毎回書くと、起動のたびに設定ファイルの
+    /// mtime が動いてバックアップ差分が無意味に膨らむ。
+    fn merge_style_defaults(&mut self) -> crate::style::MergeReport {
+        let catalog = crate::style::default_profiles();
+        let report = crate::style::merge_default_profiles(
+            &mut self.style_profiles,
+            &mut self.style_removed_default_ids,
+            self.style_defaults_version,
+            &catalog,
+        );
+        self.style_defaults_version = crate::style::STYLE_DEFAULTS_VERSION;
+        report
     }
 
     /// パッチを適用する。空文字が来たフィールドは既定値へ戻す。
@@ -593,18 +1083,50 @@ impl Config {
         if let Some(v) = patch.hotkey_vk {
             self.hotkey_vk = v;
         }
+        if let Some(v) = patch.hotkey_mods {
+            self.hotkey_mods = v;
+        }
         if let Some(v) = patch.cancel_vk {
             self.cancel_vk = v;
+        }
+        if let Some(v) = patch.clipboard_hotkey_vk {
+            self.clipboard_hotkey_vk = v;
+        }
+        if let Some(v) = patch.clipboard_hotkey_mods {
+            self.clipboard_hotkey_mods = v;
+        }
+        if let Some(v) = patch.screen_ask_enabled {
+            self.screen_ask_enabled = v;
+        }
+        if let Some(v) = patch.screen_ask_hotkey_vk {
+            self.screen_ask_hotkey_vk = v;
+        }
+        if let Some(v) = patch.screen_ask_hotkey_mods {
+            self.screen_ask_hotkey_mods = v;
+        }
+        if let Some(v) = patch.sound_enabled {
+            self.sound_enabled = v;
+        }
+        if let Some(v) = patch.sound_volume {
+            self.sound_volume = v;
+        }
+        if let Some(v) = patch.start_sound {
+            self.start_sound = v;
+        }
+        if let Some(v) = patch.start_sound_path {
+            self.start_sound_path = v.trim().to_string();
+        }
+        if let Some(v) = patch.cancel_sound {
+            self.cancel_sound = v;
+        }
+        if let Some(v) = patch.cancel_sound_path {
+            self.cancel_sound_path = v.trim().to_string();
         }
         if let Some(v) = patch.overlay_enabled {
             self.overlay_enabled = v;
         }
         if let Some(v) = patch.style_profiles {
-            // 条件が空のプロファイルは全発話に効いてしまうので落とす。
-            self.style_profiles = v
-                .into_iter()
-                .filter(|p| !p.process.trim().is_empty() && !p.instruction.trim().is_empty())
-                .collect();
+            self.replace_style_profiles(v);
         }
         if let Some(v) = patch.history_enabled {
             self.history_enabled = v;
@@ -631,6 +1153,9 @@ impl Config {
         }
         if let Some(v) = patch.gemini_endpoint {
             self.gemini_endpoint = non_empty_or(v, DEFAULT_GEMINI_ENDPOINT);
+        }
+        if let Some(v) = patch.typing_speed_chars_per_min {
+            self.typing_speed_chars_per_min = v;
         }
         self.normalize();
     }
@@ -665,10 +1190,7 @@ impl ConfigStore {
                 }
                 Err(e) => {
                     // 中身はキーを含みうるのでログに出さない。原因だけ書く。
-                    log::error!(
-                        "設定ファイルを解釈できません ({}): {e}",
-                        path.display()
-                    );
+                    log::error!("設定ファイルを解釈できません ({}): {e}", path.display());
                     // 既定値で起動すると、次の保存でこのファイルが黙って
                     // 上書きされ、手で直せば救えたはずのキーが消える。
                     // 退避してから既定値へ倒す。
@@ -677,7 +1199,10 @@ impl ConfigStore {
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                log::info!("設定ファイルがありません。既定値を使います: {}", path.display());
+                log::info!(
+                    "設定ファイルがありません。既定値を使います: {}",
+                    path.display()
+                );
                 Config::default()
             }
             Err(e) => {
@@ -690,6 +1215,32 @@ impl ConfigStore {
         // 巨大値だとワーカーがその間ずっと塞がる。読み込み時にも正す。
         let mut config = config;
         config.normalize();
+
+        // 同梱の既定を差分だけ取り込む。**アプリ更新で既定を増やしても、
+        // 既存ユーザーの config.json には何も届かない**のがこの仕組みの
+        // 動機 (style.rs のモジュール doc)。
+        let version_before = config.style_defaults_version;
+        let removed_before = config.style_removed_default_ids.len();
+        let report = config.merge_style_defaults();
+        let changed = !report.is_empty()
+            || version_before != crate::style::STYLE_DEFAULTS_VERSION
+            || removed_before != config.style_removed_default_ids.len();
+        if changed {
+            log::info!(
+                "既定の文体プロファイルを取り込みました (版 {version_before} → {}): 追加 {} / 更新 {} / 旧形式の引き継ぎ {} 件",
+                crate::style::STYLE_DEFAULTS_VERSION,
+                report.added.len(),
+                report.updated.len(),
+                report.adopted,
+            );
+            // 保存できなくても起動は続ける。次回また同じ差分を取り込む
+            // だけで、ユーザーの編集や削除が壊れることはない (冪等)。
+            if existed {
+                if let Err(e) = save(&path, &config) {
+                    log::warn!("既定プロファイルの取り込みを保存できません: {e}");
+                }
+            }
+        }
 
         Self {
             path,
@@ -750,8 +1301,12 @@ fn backup_broken_config(path: &Path) {
 /// アトミックに書き出す (書きかけのファイルを残さない)。
 fn save(path: &Path, config: &Config) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("設定ディレクトリを作成できません ({}): {e}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "設定ディレクトリを作成できません ({}): {e}",
+                parent.display()
+            )
+        })?;
     }
     let json = serde_json::to_string_pretty(config)
         .map_err(|e| format!("設定をシリアライズできません: {e}"))?;
@@ -800,6 +1355,311 @@ mod tests {
         assert_eq!(Secret::new("").preview(), "");
         // 4 文字未満でも panic しない。
         assert_eq!(Secret::new("ab").preview(), "…ab");
+    }
+
+    #[test]
+    fn the_clipboard_hotkey_is_unset_by_default() {
+        let cfg = Config::default();
+        assert_eq!(cfg.clipboard_hotkey_vk, 0);
+        assert!(cfg.clipboard_hotkey_combo().is_none());
+    }
+
+    /// 同じ組み合わせを 2 用途に割り当てると、どちらが動いたか分からなくなる。
+    #[test]
+    fn a_duplicate_clipboard_hotkey_is_disabled_not_preferred() {
+        let mut cfg = Config::default();
+        cfg.clipboard_hotkey_vk = cfg.hotkey_vk;
+        cfg.clipboard_hotkey_mods = cfg.hotkey_mods.clone();
+        cfg.normalize();
+        assert_eq!(cfg.clipboard_hotkey_vk, 0, "重複が残っている");
+        assert!(cfg.clipboard_hotkey_mods.is_empty());
+        // 貼り付け側は無傷。
+        assert_eq!(cfg.hotkey_vk, Config::default().hotkey_vk);
+    }
+
+    #[test]
+    fn an_unusable_clipboard_hotkey_is_disabled_not_defaulted() {
+        // 文字キー単独は押している間ずっと入力先へ流れるので選べない。
+        let mut cfg = Config {
+            clipboard_hotkey_vk: 0x41, // A
+            clipboard_hotkey_mods: Vec::new(),
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.clipboard_hotkey_vk, 0, "既定へ倒れている");
+    }
+
+    #[test]
+    fn dangling_modifiers_are_dropped_when_the_trigger_is_unset() {
+        let mut cfg = Config {
+            clipboard_hotkey_vk: 0,
+            clipboard_hotkey_mods: vec![0xA2],
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert!(cfg.clipboard_hotkey_mods.is_empty());
+    }
+
+    /// キャンセルキーはどちらのホットキーとも重複してはいけない。
+    #[test]
+    fn the_cancel_key_may_not_collide_with_the_clipboard_hotkey() {
+        let mut cfg = Config {
+            clipboard_hotkey_vk: 0x7C, // F13
+            cancel_vk: 0x7C,
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.cancel_vk, crate::hotkey::DEFAULT_CANCEL_VK);
+        assert_eq!(cfg.clipboard_hotkey_vk, 0x7C, "先に設定した方を残す");
+    }
+
+    // --- 画面質問モード ---
+
+    #[test]
+    fn screen_ask_is_off_and_unbound_by_default() {
+        // 画面をまるごとクラウドへ送る機能なので、既定は二重に閉じている。
+        let cfg = Config::default();
+        assert!(!cfg.screen_ask_enabled);
+        assert_eq!(cfg.screen_ask_hotkey_vk, 0);
+        assert!(cfg.screen_ask_hotkey_combo().is_none());
+    }
+
+    #[test]
+    fn a_bound_key_does_nothing_while_the_feature_is_off() {
+        // 「オフなのに押すと画面が送られる」を作らない。
+        let mut cfg = Config {
+            screen_ask_enabled: false,
+            screen_ask_hotkey_vk: 0x7C, // F13
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.screen_ask_hotkey_vk, 0x7C, "キーの割り当ては保たれる");
+        assert!(
+            cfg.screen_ask_hotkey_combo().is_none(),
+            "無効なのにフックへ渡る組み合わせが返っている"
+        );
+
+        cfg.screen_ask_enabled = true;
+        assert!(cfg.screen_ask_hotkey_combo().is_some(), "有効化しても効かない");
+    }
+
+    #[test]
+    fn enabling_the_feature_without_a_key_still_does_nothing() {
+        // トグルだけでは動かない。既存の録音キーに相乗りさせない。
+        let cfg = Config {
+            screen_ask_enabled: true,
+            screen_ask_hotkey_vk: 0,
+            ..Config::default()
+        };
+        assert!(cfg.screen_ask_hotkey_combo().is_none());
+    }
+
+    #[test]
+    fn a_screen_ask_key_that_duplicates_another_mode_is_disabled() {
+        // 取り違えの代償が「画面が送られる」なので、後勝ちにしない。
+        let mut cfg = Config {
+            screen_ask_enabled: true,
+            ..Config::default()
+        };
+        cfg.screen_ask_hotkey_vk = cfg.hotkey_vk;
+        cfg.screen_ask_hotkey_mods = cfg.hotkey_mods.clone();
+        cfg.normalize();
+        assert_eq!(cfg.screen_ask_hotkey_vk, 0, "録音キーとの重複が残っている");
+        assert!(cfg.screen_ask_hotkey_mods.is_empty());
+
+        let mut cfg = Config {
+            screen_ask_enabled: true,
+            clipboard_hotkey_vk: 0x7C, // F13
+            screen_ask_hotkey_vk: 0x7C,
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.clipboard_hotkey_vk, 0x7C, "先に設定した方を残す");
+        assert_eq!(cfg.screen_ask_hotkey_vk, 0, "クリップボードとの重複が残っている");
+    }
+
+    #[test]
+    fn an_unusable_screen_ask_key_is_disabled_not_defaulted() {
+        // 既定へ倒すと、設定していないのに録音キーが画面質問にも割り当たる。
+        let mut cfg = Config {
+            screen_ask_enabled: true,
+            screen_ask_hotkey_vk: 0x41, // A
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.screen_ask_hotkey_vk, 0);
+        assert!(cfg.screen_ask_hotkey_combo().is_none());
+    }
+
+    #[test]
+    fn a_screen_ask_key_of_zero_drops_its_leftover_modifiers() {
+        let mut cfg = Config {
+            screen_ask_hotkey_vk: 0,
+            screen_ask_hotkey_mods: vec![0xA2],
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert!(cfg.screen_ask_hotkey_mods.is_empty(), "UI の表示が嘘になる");
+    }
+
+    #[test]
+    fn the_cancel_key_may_not_collide_with_the_screen_ask_hotkey() {
+        let mut cfg = Config {
+            screen_ask_enabled: true,
+            screen_ask_hotkey_vk: 0x7C, // F13
+            cancel_vk: 0x7C,
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.cancel_vk, crate::hotkey::DEFAULT_CANCEL_VK);
+        assert_eq!(cfg.screen_ask_hotkey_vk, 0x7C, "先に設定した方を残す");
+    }
+
+    #[test]
+    fn the_view_shows_the_bound_key_even_while_the_feature_is_off() {
+        // 有効化した瞬間に何のキーで動くのか分からないと、
+        // トグルを押すのが怖い機能になる。
+        let cfg = Config {
+            screen_ask_enabled: false,
+            screen_ask_hotkey_vk: 0x7C, // F13
+            ..Config::default()
+        };
+        // 環境変数に依存させないため、解決済みキーを明示して組み立てる。
+        let view = ConfigView::build(
+            &cfg,
+            resolve_key(None, &cfg.groq_api_key),
+            resolve_key(None, &cfg.gemini_api_key),
+        );
+        assert!(!view.screen_ask_enabled);
+        assert_eq!(view.screen_ask_hotkey_vk, 0x7C);
+        assert!(
+            !view.screen_ask_hotkey_label.is_empty(),
+            "割り当て済みのキーが表示されない"
+        );
+    }
+
+    #[test]
+    fn a_screen_ask_patch_survives_a_round_trip_through_the_file() {
+        let dir = std::env::temp_dir().join(format!("nox-screen-ask-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        let store = ConfigStore::load(path.clone());
+        store
+            .update(ConfigPatch {
+                screen_ask_enabled: Some(true),
+                screen_ask_hotkey_vk: Some(0x7C),
+                screen_ask_hotkey_mods: Some(vec![0xA2]),
+                ..Default::default()
+            })
+            .expect("保存できる");
+
+        let reloaded = ConfigStore::load(path).snapshot();
+        assert!(reloaded.screen_ask_enabled);
+        assert_eq!(reloaded.screen_ask_hotkey_vk, 0x7C);
+        assert_eq!(reloaded.screen_ask_hotkey_mods, vec![0xA2]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_config_file_without_screen_ask_stays_off() {
+        // 旧い設定ファイルにこの項目は無い。フィールド単位の
+        // `#[serde(default)]` が効いていないと、既定値の解釈がずれる
+        // (hotkey_mods で踏んだのと同じ罠)。
+        let json = r#"{
+            "groq_api_key": "",
+            "gemini_api_key": "",
+            "language": "ja",
+            "dictionary": [],
+            "formatting_enabled": true,
+            "injection_enabled": true,
+            "local_stt_mode": "fallback",
+            "local_model_sha256": "",
+            "start_hidden": true,
+            "hotkey_vk": 32,
+            "cancel_vk": 27,
+            "overlay_enabled": true,
+            "deep_context": false,
+            "style_profiles": [],
+            "history_enabled": true,
+            "history_retention_days": 30,
+            "restore_delay_ms": 120,
+            "keep_transcript_in_clipboard": true,
+            "typing_speed_chars_per_min": 300,
+            "groq_endpoint": "https://example.invalid",
+            "gemini_endpoint": "https://example.invalid",
+            "stt_model": "m",
+            "format_model": "m"
+        }"#;
+        let cfg: Config = serde_json::from_str(json).expect("旧形式を読める");
+        assert!(!cfg.screen_ask_enabled);
+        assert_eq!(cfg.screen_ask_hotkey_vk, 0);
+        assert!(cfg.screen_ask_hotkey_mods.is_empty());
+    }
+
+    #[test]
+    fn sound_settings_are_clamped_and_trimmed() {
+        let mut cfg = Config {
+            sound_volume: 250,
+            start_sound: SoundPreset::Custom,
+            start_sound_path: "  ".to_string(),
+            cancel_sound: SoundPreset::Custom,
+            cancel_sound_path: "  C:/beep.wav  ".to_string(),
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.sound_volume, 100);
+        // パス未指定のカスタム音は鳴らしようがないので無音へ倒す。
+        assert_eq!(cfg.start_sound, SoundPreset::Silent);
+        // 指定があるものは残す (前後の空白だけ落とす)。
+        assert_eq!(cfg.cancel_sound, SoundPreset::Custom);
+        assert_eq!(cfg.cancel_sound_path, "C:/beep.wav");
+    }
+
+    #[test]
+    fn disabling_sound_silences_every_event() {
+        let cfg = Config {
+            sound_enabled: false,
+            sound_volume: 80,
+            ..Config::default()
+        };
+        assert_eq!(cfg.effective_sound_volume(), 0);
+    }
+
+    /// 旧い設定ファイル (音の項目が無い) を読んでも通知音は有効になる。
+    #[test]
+    fn old_config_files_get_sound_enabled() {
+        let json = r#"{
+            "groq_api_key": "",
+            "gemini_api_key": "",
+            "language": "ja",
+            "dictionary": [],
+            "formatting_enabled": true,
+            "injection_enabled": true,
+            "local_stt_mode": "fallback",
+            "local_model_sha256": "",
+            "start_hidden": true,
+            "hotkey_vk": 32,
+            "cancel_vk": 27,
+            "overlay_enabled": true,
+            "deep_context": false,
+            "style_profiles": [],
+            "history_enabled": true,
+            "history_retention_days": 30,
+            "restore_delay_ms": 180,
+            "keep_transcript_in_clipboard": true,
+            "typing_speed_chars_per_min": 60,
+            "groq_endpoint": "",
+            "gemini_endpoint": "",
+            "stt_model": "",
+            "format_model": ""
+        }"#;
+        let cfg: Config = serde_json::from_str(json).expect("旧形式を読める");
+        assert!(cfg.sound_enabled, "旧設定で通知音が無効になっている");
+        assert_eq!(cfg.sound_volume, crate::sound::DEFAULT_VOLUME);
+        assert_eq!(cfg.start_sound, SoundPreset::SoftPop);
+        assert_eq!(cfg.cancel_sound, SoundPreset::Fall);
+        // 旧設定にクリップボード用ホットキーは無いので未設定のまま。
+        assert_eq!(cfg.clipboard_hotkey_vk, 0);
     }
 
     #[test]
@@ -980,10 +1840,40 @@ mod tests {
     }
 
     #[test]
-    fn the_default_hotkey_is_right_ctrl() {
+    fn the_default_hotkey_is_left_ctrl_plus_space() {
         let cfg = Config::default();
         assert_eq!(cfg.hotkey_vk, crate::hotkey::DEFAULT_HOTKEY_VK);
+        assert_eq!(cfg.hotkey_mods, crate::hotkey::DEFAULT_HOTKEY_MODS.to_vec());
+        let view = ConfigView::from(&cfg);
+        assert_eq!(view.hotkey_label, "左 Ctrl + Space");
+        assert_eq!(view.hotkey_mods, vec![0xA2]);
+    }
+
+    /// 旧形式 (hotkey_mods を持たない) の設定ファイルは単独キーを保つ。
+    ///
+    /// 既存ユーザーのホットキーが黙って「左 Ctrl + Space」に変わらないことが
+    /// 大事。serde(default) で mods が空になり、トリガーは旧基準で検証される。
+    #[test]
+    fn a_legacy_config_without_mods_keeps_its_single_key() {
+        let dir = std::env::temp_dir().join(format!("nox-config-legacy-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("テスト用ディレクトリ");
+
+        // 旧既定の右 Ctrl 単独。
+        fs::write(&path, r#"{"hotkey_vk": 163}"#).expect("書ける"); // 0xA3
+        let cfg = ConfigStore::load(path.clone()).snapshot();
+        assert_eq!(cfg.hotkey_vk, 0xA3);
+        assert!(cfg.hotkey_mods.is_empty(), "mods が勝手に付いた");
         assert_eq!(ConfigView::from(&cfg).hotkey_label, "右 Ctrl");
+
+        // F1 単独も同じ。
+        fs::write(&path, r#"{"hotkey_vk": 112}"#).expect("書ける"); // 0x70
+        let cfg = ConfigStore::load(path).snapshot();
+        assert_eq!(cfg.hotkey_vk, 0x70);
+        assert_eq!(ConfigView::from(&cfg).hotkey_label, "F1");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1030,12 +1920,17 @@ mod tests {
             })
             .expect("保存できる");
         let reloaded = ConfigStore::load(path.clone()).snapshot();
-        assert!(!reloaded.keep_transcript_in_clipboard, "false が保存されていない");
+        assert!(
+            !reloaded.keep_transcript_in_clipboard,
+            "false が保存されていない"
+        );
 
         // 既存の設定ファイル (このキーを持たない) は既定の true になる。
         fs::write(&path, r#"{"restore_delay_ms": 400}"#).expect("書ける");
         assert!(
-            ConfigStore::load(path).snapshot().keep_transcript_in_clipboard,
+            ConfigStore::load(path)
+                .snapshot()
+                .keep_transcript_in_clipboard,
             "古い設定ファイルを読むと既定値が効かない"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -1044,23 +1939,25 @@ mod tests {
     #[test]
     fn an_invalid_hotkey_falls_back_to_the_default() {
         // 手編集で入りうる危険な値を、捕獲 UI と同じ基準で弾く。
-        let rejected = [
-            0u32,    // キー無し
-            0x100,   // 範囲外
-            9_999,   // 範囲外
-            0x1B,    // Esc (取り消し用なので選べない)
-            0x01,    // マウス左
-            0x02,    // マウス右
-            0x04,    // マウス中
-            0x05,    // マウス X1
-            0x06,    // マウス X2
-            0x41,    // A (押しっぱなしで文字が入り続ける)
-            0x0D,    // Enter (送信連発)
-            0x20,    // Space
+        // 単独キー (mods 空) は旧基準 is_allowed_hotkey で判定される。
+        let rejected_singles = [
+            0u32,  // キー無し
+            0x100, // 範囲外
+            9_999, // 範囲外
+            0x1B,  // Esc (取り消し用なので選べない)
+            0x01,  // マウス左
+            0x02,  // マウス右
+            0x04,  // マウス中
+            0x05,  // マウス X1
+            0x06,  // マウス X2
+            0x41,  // A (押しっぱなしで文字が入り続ける)
+            0x0D,  // Enter (送信連発)
+            0x20,  // Space (単独では空白が入り続ける)
         ];
-        for broken in rejected {
+        for broken in rejected_singles {
             let mut cfg = Config {
                 hotkey_vk: broken,
+                hotkey_mods: Vec::new(),
                 ..Config::default()
             };
             cfg.normalize();
@@ -1069,19 +1966,63 @@ mod tests {
                 crate::hotkey::DEFAULT_HOTKEY_VK,
                 "VK 0x{broken:02X} を受け入れてしまった"
             );
+            assert!(!cfg.hotkey_mods.is_empty(), "既定の組み合わせが壊れた");
         }
+
+        // 組み合わせ (mods 非空) のトリガーは緩和基準だが、危険キーは不可。
+        for (mods, vk) in [
+            (vec![0xA2u32], 0x41u32), // Ctrl + A (文字が入り続ける)
+            (vec![0xA2], 0x0D),       // Ctrl + Enter (送信連発)
+        ] {
+            let mut cfg = Config {
+                hotkey_vk: vk,
+                hotkey_mods: mods,
+                ..Config::default()
+            };
+            cfg.normalize();
+            assert_eq!(
+                cfg.hotkey_vk,
+                crate::hotkey::DEFAULT_HOTKEY_VK,
+                "VK 0x{vk:02X} の組み合わせを受け入れてしまった"
+            );
+        }
+
+        // mods に混ざった非修飾キー・重複は落とされて正規化される。
+        // F5 単独として成立するので、トリガーごと既定へは倒さない。
+        let mut cfg = Config {
+            hotkey_vk: 0x74,
+            hotkey_mods: vec![0x41, 0xA2, 0xA2],
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.hotkey_vk, 0x74);
+        assert_eq!(cfg.hotkey_mods, vec![0xA2], "非修飾子と重複が残った");
     }
 
     #[test]
     fn a_valid_hotkey_survives_normalize() {
+        // 単独キー (mods 空) はそのまま残る。
         for ok in [0xA3u32, 0xA5, 0x14, 0x70, 0x87, 0x5B] {
             let mut cfg = Config {
                 hotkey_vk: ok,
+                hotkey_mods: Vec::new(),
                 ..Config::default()
             };
             cfg.normalize();
             assert_eq!(cfg.hotkey_vk, ok, "VK 0x{ok:02X} が消された");
+            assert!(cfg.hotkey_mods.is_empty(), "VK 0x{ok:02X} に mods が付いた");
         }
+
+        // 組み合わせも正規化を通って残る。
+        let mut cfg = Config {
+            hotkey_vk: 0x20,
+            hotkey_mods: vec![0xA2],
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.hotkey_vk, 0x20);
+        assert_eq!(cfg.hotkey_mods, vec![0xA2]);
+        assert_eq!(ConfigView::from(&cfg).hotkey_label, "左 Ctrl + Space");
     }
 
     #[test]
@@ -1115,7 +2056,7 @@ mod tests {
             );
         }
         // 文字キーや Enter、そして既定の Esc は 1 回押しなら実害がないので通す。
-        let accepted = [0x41u32, 0x0D, 0x20, crate::hotkey::DEFAULT_CANCEL_VK];
+        let accepted = [0x41u32, 0x0D, crate::hotkey::DEFAULT_CANCEL_VK];
         for ok in accepted {
             let mut cfg = Config {
                 cancel_vk: ok,
@@ -1124,6 +2065,16 @@ mod tests {
             cfg.normalize();
             assert_eq!(cfg.cancel_vk, ok, "VK 0x{ok:02X} を潰してしまった");
         }
+        // Space も 1 回押しなら可。ただし既定ホットキー (左 Ctrl + Space) の
+        // トリガーと重複するため、単独キーホットキーとの組で確かめる。
+        let mut cfg = Config {
+            hotkey_vk: 0x70,
+            hotkey_mods: Vec::new(),
+            cancel_vk: 0x20,
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.cancel_vk, 0x20, "Space を潰してしまった");
         // 0 は「無効化」という意味の正しい値なのでそのまま通す。
         let mut disabled = Config {
             cancel_vk: 0,
@@ -1138,6 +2089,7 @@ mod tests {
         // 押すたびに録音とキャンセルが同時に起こるので、衝突は必ず解消する。
         let mut cfg = Config {
             hotkey_vk: 0x70,
+            hotkey_mods: Vec::new(),
             cancel_vk: 0x70,
             ..Config::default()
         };
@@ -1148,9 +2100,41 @@ mod tests {
         );
         assert_eq!(cfg.cancel_vk, crate::hotkey::DEFAULT_CANCEL_VK);
 
+        // 組み合わせのトリガーや修飾子との衝突も解消する。
+        // (Ctrl + Space の最中に Ctrl を押す = キャンセル、では意味が壊れる)
+        for mods in [vec![0xA2u32], vec![0xA2, 0xA0]] {
+            let mut cfg = Config {
+                hotkey_vk: 0x20,
+                hotkey_mods: mods.clone(),
+                cancel_vk: 0x20,
+                ..Config::default()
+            };
+            cfg.normalize();
+            assert_ne!(
+                cfg.cancel_vk, 0x20,
+                "トリガーとの衝突が残っている (mods={mods:?})"
+            );
+
+            for mod_vk in &mods {
+                let mut cfg = Config {
+                    hotkey_vk: 0x20,
+                    hotkey_mods: mods.clone(),
+                    cancel_vk: *mod_vk,
+                    ..Config::default()
+                };
+                cfg.normalize();
+                assert_eq!(
+                    cfg.cancel_vk,
+                    crate::hotkey::DEFAULT_CANCEL_VK,
+                    "修飾子 {mod_vk:#x} との衝突が残った"
+                );
+            }
+        }
+
         // 無効化 (0) との比較は衝突にならない。
         let mut disabled = Config {
             hotkey_vk: 0x70,
+            hotkey_mods: Vec::new(),
             cancel_vk: 0,
             ..Config::default()
         };
@@ -1188,16 +2172,25 @@ mod tests {
         let store = ConfigStore::load(path.clone());
         store
             .update(ConfigPatch {
-                hotkey_vk: Some(0x70), // F1
+                hotkey_vk: Some(0x20),               // Space
+                hotkey_mods: Some(vec![0xA0, 0xA2]), // 左 Shift + 左 Ctrl
                 overlay_enabled: Some(false),
                 ..ConfigPatch::default()
             })
             .expect("保存できる");
 
         let reloaded = ConfigStore::load(path).snapshot();
-        assert_eq!(reloaded.hotkey_vk, 0x70);
+        assert_eq!(reloaded.hotkey_vk, 0x20);
+        assert_eq!(
+            reloaded.hotkey_mods,
+            vec![0xA2, 0xA0],
+            "正規化順で保存される"
+        );
         assert!(!reloaded.overlay_enabled);
-        assert_eq!(ConfigView::from(&reloaded).hotkey_label, "F1");
+        assert_eq!(
+            ConfigView::from(&reloaded).hotkey_label,
+            "左 Ctrl + 左 Shift + Space"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1216,6 +2209,230 @@ mod tests {
             .style_profiles
             .iter()
             .any(|p| p.process.contains("slack")));
+        // 新規ユーザーは「現行版を取り込み済み」から始まる。
+        assert_eq!(
+            cfg.style_defaults_version,
+            crate::style::STYLE_DEFAULTS_VERSION
+        );
+        assert!(cfg.style_removed_default_ids.is_empty());
+    }
+
+    // --- 既定プロファイルの版管理 ------------------------------------------
+    //
+    // ここで守っているのは「ユーザーが編集・削除したものを、アプリ更新で
+    // 復活させない」という約束。壊れても例外は出ず、次のリリースで
+    // 消したはずのプロファイルが静かに戻るだけなので、テストで固定する。
+
+    /// 一時ディレクトリつきの設定ファイル。
+    fn temp_config(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nox-style-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("作れる");
+        dir.join("config.json")
+    }
+
+    #[test]
+    fn deleting_a_default_profile_survives_a_restart() {
+        // シナリオ: 既定を消したユーザー。**この機能で一番壊れやすい約束**。
+        let path = temp_config("deleted");
+        let store = ConfigStore::load(path.clone());
+        let kept: Vec<StyleProfile> = store
+            .snapshot()
+            .style_profiles
+            .into_iter()
+            .filter(|p| p.id != "chat.slack")
+            .collect();
+        store
+            .update(ConfigPatch {
+                style_profiles: Some(kept.clone()),
+                ..ConfigPatch::default()
+            })
+            .expect("保存できる");
+
+        let reloaded = ConfigStore::load(path.clone()).snapshot();
+        assert!(
+            !reloaded.style_profiles.iter().any(|p| p.id == "chat.slack"),
+            "消した既定が起動で戻った"
+        );
+        assert!(reloaded
+            .style_removed_default_ids
+            .contains(&"chat.slack".to_string()));
+        // 巻き添えで他が消えていないこと。
+        assert_eq!(reloaded.style_profiles.len(), kept.len());
+        let _ = fs::remove_dir_all(path_parent(&path));
+    }
+
+    #[test]
+    fn editing_a_default_profile_marks_it_and_keeps_it() {
+        // シナリオ: 既定を編集したユーザー。
+        let path = temp_config("edited");
+        let store = ConfigStore::load(path.clone());
+        let mut profiles = store.snapshot().style_profiles;
+        let slack = profiles
+            .iter_mut()
+            .find(|p| p.id == "chat.slack")
+            .expect("既定にある");
+        slack.instruction = "自分で書いた指示".to_string();
+        store
+            .update(ConfigPatch {
+                style_profiles: Some(profiles),
+                ..ConfigPatch::default()
+            })
+            .expect("保存できる");
+
+        let reloaded = ConfigStore::load(path.clone()).snapshot();
+        let slack = reloaded
+            .style_profiles
+            .iter()
+            .find(|p| p.id == "chat.slack")
+            .expect("残っている");
+        assert_eq!(slack.instruction, "自分で書いた指示");
+        assert!(slack.user_edited, "編集の印が立っていない");
+        let _ = fs::remove_dir_all(path_parent(&path));
+    }
+
+    #[test]
+    fn a_user_made_profile_never_claims_a_default_id() {
+        // UI が既定の id を名乗ってきても、保存前の一覧に無い id は空へ倒す。
+        // ここが緩いと、フロントの取り違えで (a) 実体の無い「既定」行が
+        // 生まれ、(b) 削除の記録が黙って取り消され、(c) その id の将来の
+        // 既定配信が塞がれる。3 つとも無言で起きるのでテストで固定する。
+        let mut cfg = Config {
+            style_profiles: Vec::new(),
+            // 「ユーザーが chat.slack を消した」状態から始める。
+            style_removed_default_ids: vec!["chat.slack".to_string()],
+            ..Config::default()
+        };
+        cfg.apply(ConfigPatch {
+            style_profiles: Some(vec![StyleProfile {
+                process: "myapp.exe".into(),
+                title_contains: None,
+                instruction: "自作".into(),
+                id: "chat.slack".into(),
+                user_edited: false,
+            }]),
+            ..ConfigPatch::default()
+        });
+        assert_eq!(cfg.style_profiles.len(), 1);
+        assert_eq!(cfg.style_profiles[0].id, "", "既定の id を名乗り通り受けた");
+        assert!(!cfg.style_profiles[0].user_edited);
+        assert_eq!(
+            cfg.style_removed_default_ids,
+            vec!["chat.slack".to_string()],
+            "未知 id の受理で削除の記録が取り消された"
+        );
+
+        // 削除の記録が生きているので、次のマージでも復活しない。
+        cfg.merge_style_defaults();
+        assert!(
+            !cfg.style_profiles.iter().any(|p| p.id == "chat.slack"),
+            "消した既定が戻った"
+        );
+    }
+
+    #[test]
+    fn two_rows_cannot_share_one_default_id() {
+        // 重複した id はマージ側で最初の 1 行しか更新されず、残りが
+        // 更新されない幽霊として残る。2 行目以降はユーザー作成へ倒す。
+        let mut cfg = Config::default();
+        let slack = cfg
+            .style_profiles
+            .iter()
+            .find(|p| p.id == "chat.slack")
+            .cloned()
+            .expect("既定にある");
+        let mut twin = slack.clone();
+        twin.instruction = "二重の行".to_string();
+        cfg.apply(ConfigPatch {
+            style_profiles: Some(vec![slack, twin]),
+            ..ConfigPatch::default()
+        });
+        assert_eq!(cfg.style_profiles.len(), 2);
+        assert_eq!(cfg.style_profiles[0].id, "chat.slack");
+        assert_eq!(cfg.style_profiles[1].id, "", "2 行目まで既定を名乗った");
+    }
+
+    #[test]
+    fn an_old_config_file_receives_the_new_defaults_without_duplicates() {
+        // シナリオ: 版管理より前の設定ファイル。旧既定 7 件は id を
+        // 引き継ぎ、新しく増えた既定だけが届く。
+        let path = temp_config("legacy");
+        let legacy = r#"{
+            "groq_api_key": "",
+            "gemini_api_key": "",
+            "language": "ja",
+            "dictionary": [],
+            "formatting_enabled": true,
+            "injection_enabled": true,
+            "local_stt_mode": "fallback",
+            "local_model_sha256": "",
+            "start_hidden": true,
+            "hotkey_vk": 32,
+            "cancel_vk": 27,
+            "overlay_enabled": true,
+            "deep_context": false,
+            "style_profiles": [
+                {"process": "slack.exe", "instruction": "チャットの発言。簡潔な口語で、丁寧すぎない自然な調子にする。挨拶や定型の前置きは付けない"},
+                {"process": "outlook.exe", "instruction": "私が書き換えたメールの指示"},
+                {"process": "myapp.exe", "instruction": "自作"}
+            ],
+            "history_enabled": true,
+            "history_retention_days": 30,
+            "restore_delay_ms": 180,
+            "keep_transcript_in_clipboard": true,
+            "typing_speed_chars_per_min": 60,
+            "groq_endpoint": "",
+            "gemini_endpoint": "",
+            "stt_model": "",
+            "format_model": ""
+        }"#;
+        fs::write(&path, legacy).expect("書ける");
+
+        let cfg = ConfigStore::load(path.clone()).snapshot();
+        assert_eq!(
+            cfg.style_defaults_version,
+            crate::style::STYLE_DEFAULTS_VERSION
+        );
+        // 旧既定が二重に生えていない。
+        let slack: Vec<_> = cfg
+            .style_profiles
+            .iter()
+            .filter(|p| p.process == "slack.exe")
+            .collect();
+        assert_eq!(slack.len(), 1, "旧既定と新既定が二重になった");
+        assert_eq!(slack[0].id, "chat.slack");
+        // 書き換えていた項目は書き換えたまま。
+        let outlook = cfg
+            .style_profiles
+            .iter()
+            .find(|p| p.id == "mail.outlook")
+            .expect("引き継がれる");
+        assert_eq!(outlook.instruction, "私が書き換えたメールの指示");
+        assert!(outlook.user_edited);
+        // 旧設定に無かった既定は「消した」扱いで戻らない。
+        assert!(!cfg.style_profiles.iter().any(|p| p.id == "chat.discord"));
+        // 新カタログ分 (ブラウザ) は届く。これがこの仕組みの目的。
+        assert!(cfg.style_profiles.iter().any(|p| p.id == "web.generic"));
+        // ユーザー作成は素通し。
+        let mine = cfg
+            .style_profiles
+            .iter()
+            .find(|p| p.process == "myapp.exe")
+            .expect("残る");
+        assert!(mine.is_user_made());
+
+        // 取り込みは保存され、次の起動で同じ結果になる (冪等)。
+        let again = ConfigStore::load(path.clone()).snapshot();
+        assert_eq!(again.style_profiles, cfg.style_profiles);
+        let _ = fs::remove_dir_all(path_parent(&path));
+    }
+
+    fn path_parent(path: &Path) -> PathBuf {
+        path.parent().unwrap_or(Path::new(".")).to_path_buf()
     }
 
     #[test]
@@ -1227,18 +2444,24 @@ mod tests {
                     process: "slack.exe".into(),
                     title_contains: None,
                     instruction: "カジュアル".into(),
+                    id: String::new(),
+                    user_edited: false,
                 },
                 // 書きかけ: プロセス名が空 = 全発話に効いてしまう。
                 StyleProfile {
                     process: "  ".into(),
                     title_contains: None,
                     instruction: "壊れた".into(),
+                    id: String::new(),
+                    user_edited: false,
                 },
                 // 指示が空 = 意味がない。
                 StyleProfile {
                     process: "code.exe".into(),
                     title_contains: None,
                     instruction: "".into(),
+                    id: String::new(),
+                    user_edited: false,
                 },
             ]),
             ..ConfigPatch::default()
@@ -1274,6 +2497,8 @@ mod tests {
                     process: "myapp.exe".into(),
                     title_contains: Some("編集".into()),
                     instruction: "箇条書きにする".into(),
+                    id: String::new(),
+                    user_edited: false,
                 }]),
                 ..ConfigPatch::default()
             })
@@ -1394,6 +2619,36 @@ mod tests {
     }
 
     // --- m6 回帰: 復元待ち時間のクランプ ---
+
+    #[test]
+    fn typing_speed_chars_per_min_is_clamped_to_valid_range() {
+        // Boundary test: values below minimum (10) should be clamped to 10
+        let mut cfg = Config {
+            typing_speed_chars_per_min: 9,
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.typing_speed_chars_per_min, 10, "9 should clamp to 10");
+
+        // Boundary test: values above maximum (300) should be clamped to 300
+        let mut cfg = Config {
+            typing_speed_chars_per_min: 301,
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert_eq!(
+            cfg.typing_speed_chars_per_min, 300,
+            "301 should clamp to 300"
+        );
+
+        // Zero should remain zero (special value meaning "don't calculate")
+        let mut cfg = Config {
+            typing_speed_chars_per_min: 0,
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.typing_speed_chars_per_min, 0, "0 should remain 0");
+    }
 
     #[test]
     fn restore_delay_is_clamped_when_patched() {

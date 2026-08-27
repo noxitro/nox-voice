@@ -9,7 +9,24 @@
   </head>
 
   <body>
-    <!-- 注意アイコン。絵文字ではなく描いた図形を 1 つ定義して使い回す。 -->
+    <!--
+      THESIS: 常駐音声入力の「いま何が起きているか」と「どう振る舞うか」を 1 枚の
+        長大なフォームに積むのをやめ、左レールで区画に割った作業台にする。
+      OWN-WORLD: 無彩色の 3 層 (地/カード/沈み面) + 青のアクセント 1 色。
+        1px の淡い罫、12px の角丸、広い余白。色は状態にだけ割り当てる。
+        アイコンは 20px グリッドの線画 (絵文字は使わない)。書体は OS 標準スタック。
+      STORY: 左でどの話題かを選び、右のカードで確かめて直す。状態と入力レベルは
+        レール下端に常駐し、どの区画にいても録音中かどうかが分かる。
+      FIRST VIEWPORT: 左 216px のレール (ロゴ・版・8 項目・状態)、右にホーム。
+        見出し + 一行の補足 + 右上の主アクション、その下にカードが縦に並ぶ。
+      FORM: サイドバー型アプリシェル。依頼が参照実装 (Aqua Voice) を名指しで
+        指定しているため定石 (canon) を全力で実装する。ロールは回していない。
+      FINISH: unreviewed and undocumented is unfinished; this build ends with the
+        finish review, the verdict, and DESIGN.md
+    -->
+
+    <!-- アイコン。絵文字ではなく、20px グリッド・線幅 1.5 の線画で統一する。
+         hidden 属性は SVG に効かないので CSS 側で消している (design.md 参照)。 -->
     <svg hidden aria-hidden="true">
       <symbol id="icon-warn" viewBox="0 0 16 16">
         <path
@@ -27,288 +44,835 @@
         />
         <circle cx="8" cy="11.3" r="0.85" fill="currentColor" />
       </symbol>
+
+      <symbol id="icon-home" viewBox="0 0 20 20">
+        <path d="M2.5 10h2.2l1.9-5.2 3 11 2.4-7.3L13.5 10h4" />
+      </symbol>
+      <symbol id="icon-history" viewBox="0 0 20 20">
+        <path d="M3.4 8.2A7 7 0 1 1 3 10.5" />
+        <path d="M2.3 4.7v3.6h3.6" />
+        <path d="M10 6.2V10l2.6 1.7" />
+      </symbol>
+      <symbol id="icon-format" viewBox="0 0 20 20">
+        <path d="M9.6 3.2 11 6.8l3.6 1.4-3.6 1.4-1.4 3.6-1.4-3.6L4.6 8.2 8.2 6.8Z" />
+        <path d="M14.9 12.6l.6 1.5 1.5.6-1.5.6-.6 1.5-.6-1.5-1.5-.6 1.5-.6Z" />
+      </symbol>
+      <symbol id="icon-book" viewBox="0 0 20 20">
+        <path d="M10 5.6C9 4.6 7.6 4.1 5.9 4.1H3.2v10.3h2.7c1.7 0 3.1.5 4.1 1.5" />
+        <path d="M10 5.6c1-1 2.4-1.5 4.1-1.5h2.7v10.3h-2.7c-1.7 0-3.1.5-4.1 1.5" />
+        <path d="M10 5.6v10.3" />
+      </symbol>
+      <symbol id="icon-paste" viewBox="0 0 20 20">
+        <path d="M7.7 4.1H5.6c-.7 0-1.2.5-1.2 1.2v10c0 .7.5 1.2 1.2 1.2h8.8c.7 0 1.2-.5 1.2-1.2v-10c0-.7-.5-1.2-1.2-1.2h-2.1" />
+        <path d="M7.7 3.1h4.6v2.5H7.7Z" />
+        <path d="M7.4 9.5h5.2M7.4 12.5h3.4" />
+      </symbol>
+      <symbol id="icon-key" viewBox="0 0 20 20">
+        <path d="M2.6 5.4h14.8v9.2H2.6Z" />
+        <path d="M5.4 8.2h.9M8.2 8.2h.9M11 8.2h.9M13.7 8.2h.9M6.5 11.8h7" />
+      </symbol>
+      <symbol id="icon-sound" viewBox="0 0 20 20">
+        <path d="M4 7.6h2.6L10.4 4.3v11.4L6.6 12.4H4Z" />
+        <path d="M13.3 7.7a3.4 3.4 0 0 1 0 4.6" />
+        <path d="M15.6 5.6a6.6 6.6 0 0 1 0 8.8" />
+      </symbol>
+      <symbol id="icon-sliders" viewBox="0 0 20 20">
+        <path d="M3 6.2h10.4M16.4 6.2h.8M3 13.8h3.4M9.4 13.8h7.8" />
+        <circle cx="14.9" cy="6.2" r="1.9" />
+        <circle cx="7.9" cy="13.8" r="1.9" />
+      </symbol>
+      <symbol id="icon-mark" viewBox="0 0 20 20">
+        <path d="M4.4 8.1v3.8M7.6 5.6v8.8M10.8 3.4v13.2M14 6.8v6.4M17.2 9v2" />
+      </symbol>
     </svg>
 
-    <main class="container">
-      <h1>nox-voice</h1>
-
-      <section class="status-card" id="status-card" data-status="idle">
-        <span class="status-dot" aria-hidden="true"></span>
-        <span class="status-text" id="status-text">待機中</span>
-      </section>
-
-      <p class="hint">
-        右 Ctrl を<strong>長押し</strong>している間だけ録音(離すと確定)。<br />
-        右 Ctrl を<strong>短押し</strong>すると録音が継続し、もう一度押すと停止。
-      </p>
-
-      <p class="error" id="error" role="alert" hidden></p>
-
-      <section class="panel">
-        <div class="panel-head">
-          <h2>直近の結果</h2>
-          <span class="badge" id="outcome-badge" hidden></span>
+    <div class="app">
+      <!-- 左レール。項目はアイコン + ラベルの 1 行。選択中だけ淡い面で示す。 -->
+      <nav class="rail" aria-label="セクション">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg class="icon"><use href="#icon-mark" /></svg>
+          </span>
+          <span class="brand-text">
+            <span class="brand-name">nox-voice</span>
+            <span class="brand-version" id="app-version">v0.1.0</span>
+          </span>
         </div>
 
-        <p class="empty" id="result-empty">まだ結果がありません</p>
+        <ul class="nav" id="nav">
+          <li>
+            <button type="button" class="nav-item" data-section="home" title="ホーム">
+              <svg class="icon" aria-hidden="true"><use href="#icon-home" /></svg>
+              <span>ホーム</span>
+            </button>
+          </li>
+          <li>
+            <button type="button" class="nav-item" data-section="history" title="履歴">
+              <svg class="icon" aria-hidden="true"><use href="#icon-history" /></svg>
+              <span>履歴</span>
+            </button>
+          </li>
+          <li class="nav-sep" role="presentation"></li>
+          <li>
+            <button type="button" class="nav-item" data-section="transcribe" title="認識と整形">
+              <svg class="icon" aria-hidden="true"><use href="#icon-format" /></svg>
+              <span>認識と整形</span>
+            </button>
+          </li>
+          <li>
+            <button type="button" class="nav-item" data-section="dictionary" title="辞書と文体">
+              <svg class="icon" aria-hidden="true"><use href="#icon-book" /></svg>
+              <span>辞書と文体</span>
+            </button>
+          </li>
+          <li>
+            <button type="button" class="nav-item" data-section="paste" title="貼り付け">
+              <svg class="icon" aria-hidden="true"><use href="#icon-paste" /></svg>
+              <span>貼り付け</span>
+            </button>
+          </li>
+          <li>
+            <button type="button" class="nav-item" data-section="hotkeys" title="ホットキー">
+              <svg class="icon" aria-hidden="true"><use href="#icon-key" /></svg>
+              <span>ホットキー</span>
+            </button>
+          </li>
+          <li>
+            <button type="button" class="nav-item" data-section="sound" title="通知音">
+              <svg class="icon" aria-hidden="true"><use href="#icon-sound" /></svg>
+              <span>通知音</span>
+            </button>
+          </li>
+          <li>
+            <button type="button" class="nav-item" data-section="app" title="アプリの動作">
+              <svg class="icon" aria-hidden="true"><use href="#icon-sliders" /></svg>
+              <span>アプリの動作</span>
+            </button>
+          </li>
+        </ul>
 
-        <div id="result" hidden>
-          <p class="degraded-note" id="degraded-note" hidden></p>
-          <p class="inject-note" id="inject-note" hidden></p>
-
-          <div class="text-block">
-            <div class="text-head">
-              <h3>整形後</h3>
-              <button type="button" class="copy" data-copy="formatted">
-                コピー
-              </button>
-            </div>
-            <pre class="text" id="text-formatted"></pre>
-          </div>
-
-          <div class="text-block">
-            <div class="text-head">
-              <h3>生転写</h3>
-              <button type="button" class="copy" data-copy="raw">
-                コピー
-              </button>
-            </div>
-            <pre class="text" id="text-raw"></pre>
-          </div>
-
-          <p class="timings" id="timings"></p>
+        <!-- レール下端の常駐表示。どの区画を見ていても録音中かどうかが分かる。
+             区画の中に置くと、設定を触っている最中に状態を見失う。
+             role="status" は目で見ない利用者向け。常時見せることが今回の要なのに、
+             読み上げには一切届かない、では筋が通らない。 -->
+        <div class="rail-status" id="status-card" data-status="idle" role="status">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span class="status-text" id="status-text">待機中</span>
+          <span class="level" id="level" aria-hidden="true">
+            <span class="level-fill" id="level-fill"></span>
+          </span>
         </div>
-      </section>
+      </nav>
 
-      <section class="panel">
-        <div class="panel-head">
-          <h2>録音</h2>
-        </div>
-        <dl class="kv" id="session">
-          <dt>状態</dt>
-          <dd>まだ録音していません</dd>
-        </dl>
-      </section>
+      <main class="content" id="content">
+        <!-- 全区画に共通のエラー帯。区画の中に置くと、別の区画へ移った瞬間に
+             失敗の報せが消える。 -->
+        <p class="error" id="error" role="alert" hidden></p>
 
-      <section class="panel">
-        <div class="panel-head">
-          <h2>履歴</h2>
-          <button type="button" id="history-clear" class="danger">
-            すべて削除
-          </button>
-        </div>
-
-        <input
-          type="search"
-          id="history-search"
-          class="search"
-          aria-label="履歴を検索"
-          placeholder="本文・挿入先アプリで検索"
-          autocomplete="off"
-        />
-
-        <p class="empty" id="history-empty">履歴はまだありません</p>
-        <p class="error" id="history-error" role="alert" hidden></p>
-
-        <ul class="history" id="history-list"></ul>
-
-        <div class="history-actions">
-          <button type="button" id="history-more" hidden>もっと読む</button>
-        </div>
-      </section>
-
-      <details class="panel settings">
-        <summary>設定</summary>
         <form id="settings-form">
-          <fieldset class="field-group">
-            <legend>API キー</legend>
-            <label>
-              <span>Groq API キー<em id="groq-state"></em></span>
-              <input
-                type="password"
-                id="groq-key"
-                autocomplete="off"
-                placeholder="変更するときだけ入力"
-              />
-            </label>
-            <label>
-              <span>Gemini API キー<em id="gemini-state"></em></span>
-              <input
-                type="password"
-                id="gemini-key"
-                autocomplete="off"
-                placeholder="変更するときだけ入力"
-              />
-            </label>
-            <label>
-              <span>言語 (空欄で自動判定)</span>
-              <input type="text" id="language" autocomplete="off" />
-            </label>
-          </fieldset>
+          <!-- ===== ホーム ===================================================== -->
+          <section
+            class="section"
+            id="section-home"
+            data-section="home"
+            aria-labelledby="title-home"
+          >
+            <header class="section-head">
+              <div class="section-title">
+                <h1 id="title-home" tabindex="-1">ホーム</h1>
+                <p class="section-sub">
+                  ホットキーで話すと、整形された文章が前景アプリへ入ります
+                </p>
+              </div>
+            </header>
 
-          <fieldset class="field-group">
-            <legend>認識と整形</legend>
-            <label class="checkbox">
-              <input type="checkbox" id="formatting-enabled" />
-              <span>LLM で整形する(オフなら生転写をそのまま使う)</span>
-            </label>
-            <label>
-              <span>
-                辞書(1 行に 1 語。<code>表記,よみ</code> で読みも指定できます)
-              </span>
-              <textarea
-                id="dictionary"
-                rows="5"
-                autocomplete="off"
-                placeholder="nox-voice&#10;塩谷,しおや"
-              ></textarea>
-            </label>
-            <label>
-              <span>
-                アプリ別の文体(1 行に <code>プロセス名 | 指示</code>。
-                <code>プロセス名 | タイトル条件 | 指示</code> で絞り込み)
-              </span>
-              <textarea
-                id="style-profiles"
-                rows="6"
-                autocomplete="off"
-                placeholder="slack.exe | チャットの発言。簡潔な口語にする&#10;chrome.exe | Gmail | メール本文。ですます調にする"
-              ></textarea>
-            </label>
-            <p class="warn">
-              <svg class="warn-icon" aria-hidden="true"><use href="#icon-warn" /></svg>
-              <span>
-                整形は Gemini 無料枠では送信内容が Google の製品改善・モデル訓練に
-                利用されます。機密を扱う場合は整形をオフにするか有料ティアの
-                キーを使ってください。
-              </span>
-            </p>
-          </fieldset>
-
-          <fieldset class="field-group">
-            <legend>貼り付け</legend>
-            <label class="checkbox">
-              <input type="checkbox" id="injection-enabled" />
-              <span>結果を前景アプリへ自動で貼り付ける</span>
-            </label>
-            <label class="checkbox">
-              <input type="checkbox" id="keep-transcript" />
-              <span>
-                録音結果をクリップボードに残す
-                <span class="field-note">
-                  貼り付けに失敗しても Ctrl+V でやり直せます。元のクリップボード内容は上書きされます
-                </span>
-              </span>
-            </label>
-            <label>
-              <span>クリップボード復元までの待ち時間 (ms)</span>
-              <input
-                type="number"
-                id="restore-delay"
-                min="50"
-                max="5000"
-                step="50"
-                aria-describedby="restore-delay-note"
-              />
-              <span class="field-note" id="restore-delay-note" hidden></span>
-            </label>
-          </fieldset>
-
-          <fieldset class="field-group">
-            <legend>画面コンテキスト</legend>
-            <label class="checkbox">
-              <input type="checkbox" id="deep-context" />
-              <span>
-                画面のテキストを文脈として使う(deep context)
-              </span>
-            </label>
-            <p class="warn" id="deep-context-warning">
-              <svg class="warn-icon" aria-hidden="true"><use href="#icon-warn" /></svg>
-              <span>
-                オンにすると、録音開始時に<strong>前景アプリの画面に表示されている
-                文章</strong>が読み取られ、認識・整形のためクラウド(Groq / Gemini)へ
-                送信されます。パスワード欄は読み取りません。読み取った内容は履歴には
-                保存されません。
-              </span>
-            </p>
-          </fieldset>
-
-          <fieldset class="field-group">
-            <legend>ローカル認識</legend>
-            <label>
-              <span>ローカル認識(クラウドが使えないときの代替)</span>
-              <select id="local-stt-mode">
-                <option value="off">使わない</option>
-                <option value="fallback">クラウドが失敗したときだけ使う</option>
-                <option value="only">常にローカルで認識(音声を外へ送らない)</option>
-              </select>
-            </label>
-            <div class="storage" id="local-stt">
-              <span id="local-stt-text">確認中…</span>
-              <button type="button" id="local-stt-download">モデルをダウンロード</button>
+            <div class="card">
+              <p class="hint">
+                <strong id="home-hotkey">左 Ctrl + Space</strong>
+                を<strong>長押し</strong>している間だけ録音(離すと確定)。<br />
+                <strong>短押し</strong>すると録音が継続し、もう一度押すと停止。
+                録音中に <strong id="home-cancel">Esc</strong> で取り消せます。
+              </p>
+              <p class="hint" id="home-clipboard-hint" hidden>
+                <strong id="home-clipboard-hotkey">未設定</strong>
+                で録音すると、貼り付けずにクリップボードへ入れて終わります。
+              </p>
             </div>
-            <p class="warn" id="local-stt-note">
-              <svg class="warn-icon" aria-hidden="true"><use href="#icon-warn" /></svg>
-              <span>
-                モデルは約 1GB です。CPU のみで動くため、認識には
-                <strong>録音時間の数倍</strong>かかります(1 分の録音で数分が目安)。
-                クラウドが使えるときはそちらの方が速く正確です。
-              </span>
-            </p>
-          </fieldset>
 
-          <fieldset class="field-group">
-            <legend>履歴</legend>
-            <label class="checkbox">
-              <input type="checkbox" id="history-enabled" />
-              <span>履歴を保存する(発話の全文が保存されます)</span>
-            </label>
-            <label>
-              <span>履歴の保持日数(0 で無制限)</span>
-              <input type="number" id="history-retention" min="0" max="3650" />
-            </label>
-            <div class="storage" id="storage">
-              <span id="storage-text">退避した録音: 集計中…</span>
-              <button type="button" id="storage-clear" class="danger">
-                未転写の録音をすべて削除
+            <div class="card">
+              <div class="card-head">
+                <h2>直近の結果</h2>
+                <span class="badge" id="outcome-badge" hidden></span>
+              </div>
+
+              <p class="empty" id="result-empty">まだ結果がありません</p>
+
+              <div id="result" hidden>
+                <p class="degraded-note" id="degraded-note" hidden></p>
+                <p class="inject-note" id="inject-note" hidden></p>
+
+                <div class="text-block">
+                  <div class="text-head">
+                    <h3>整形後</h3>
+                    <button type="button" class="copy" data-copy="formatted">
+                      コピー
+                    </button>
+                  </div>
+                  <pre class="text" id="text-formatted"></pre>
+                </div>
+
+                <div class="text-block">
+                  <div class="text-head">
+                    <h3>生転写</h3>
+                    <button type="button" class="copy" data-copy="raw">
+                      コピー
+                    </button>
+                  </div>
+                  <pre class="text" id="text-raw"></pre>
+                </div>
+
+                <p class="timings" id="timings"></p>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2>録音の詳細</h2>
+              </div>
+              <dl class="kv" id="session">
+                <dt>状態</dt>
+                <dd>まだ録音していません</dd>
+              </dl>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2>これまでの累計</h2>
+              </div>
+              <dl class="kv stats" id="stats">
+                <dt>集計</dt>
+                <dd>読み込み中…</dd>
+              </dl>
+              <p class="field-note">
+                節約時間は「同じ文字数を自分で打った場合」との差の見積もりです。
+                打鍵速度は<strong>アプリの動作</strong>で変えられます。
+              </p>
+            </div>
+          </section>
+
+          <!-- ===== 履歴 ======================================================= -->
+          <section
+            class="section"
+            id="section-history"
+            data-section="history"
+            aria-labelledby="title-history"
+            hidden
+          >
+            <header class="section-head">
+              <div class="section-title">
+                <h1 id="title-history" tabindex="-1">履歴</h1>
+                <p class="section-sub">
+                  生転写と整形結果を並べて残しています。行を押すと開きます
+                </p>
+              </div>
+              <button type="button" id="history-clear" class="danger">
+                すべて削除
               </button>
+            </header>
+
+            <div class="card">
+              <input
+                type="search"
+                id="history-search"
+                class="search"
+                aria-label="履歴を検索"
+                placeholder="本文・挿入先アプリで検索"
+                autocomplete="off"
+              />
+
+              <p class="empty" id="history-empty">履歴はまだありません</p>
+              <p class="error" id="history-error" role="alert" hidden></p>
+
+              <ul class="history" id="history-list"></ul>
+
+              <div class="history-actions">
+                <button type="button" id="history-more" hidden>もっと読む</button>
+              </div>
             </div>
-          </fieldset>
 
-          <fieldset class="field-group">
-            <legend>操作と表示</legend>
-            <label>
-              <span>ホットキー(押している間だけ録音 / 短押しでトグル)</span>
-              <span class="hotkey-row">
-                <output class="hotkey-value" id="hotkey-label">右 Ctrl</output>
-                <button type="button" id="hotkey-capture">キーを押して設定</button>
-              </span>
-            </label>
-            <p class="warn">
-              <svg class="warn-icon" aria-hidden="true"><use href="#icon-warn" /></svg>
-              <span>
-                押している間そのキーは入力先アプリにも流れます。文字キーや Enter は
-                選べません(長押しで連続入力されるため)。
-                <strong>Ctrl / Alt / Shift / Win / CapsLock / F1〜F12</strong>
-                などから選んでください。Esc で取り消せます。
-              </span>
-            </p>
-            <label class="checkbox">
-              <input type="checkbox" id="start-hidden" />
-              <span>起動時はウィンドウを出さない(トレイに常駐)</span>
-            </label>
-            <label class="checkbox">
-              <input type="checkbox" id="overlay-enabled" />
-              <span>録音中に小窓を表示する(クリックは下のアプリへ抜けます)</span>
-            </label>
-          </fieldset>
+            <div class="card">
+              <div class="card-head">
+                <h2>保存</h2>
+              </div>
+              <div class="fields">
+                <label class="checkbox">
+                  <input type="checkbox" id="history-enabled" />
+                  <span>履歴を保存する(発話の全文が保存されます)</span>
+                </label>
+                <label class="field">
+                  <span>履歴の保持日数(0 で無制限)</span>
+                  <input type="number" id="history-retention" min="0" max="3650" />
+                </label>
+                <div class="statline" id="storage">
+                  <span id="storage-text">退避した録音: 集計中…</span>
+                  <button type="button" id="storage-clear" class="danger">
+                    未転写の録音をすべて削除
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
 
-          <div class="form-actions">
-            <button type="submit">保存</button>
+          <!-- ===== 認識と整形 ================================================= -->
+          <section
+            class="section"
+            id="section-transcribe"
+            data-section="transcribe"
+            aria-labelledby="title-transcribe"
+            hidden
+          >
+            <header class="section-head">
+              <div class="section-title">
+                <h1 id="title-transcribe" tabindex="-1">認識と整形</h1>
+                <p class="section-sub">
+                  音声を文字にする経路と、文字を整える経路の設定
+                </p>
+              </div>
+            </header>
+
+            <div class="card">
+              <div class="card-head">
+                <h2>API キー</h2>
+              </div>
+              <div class="fields">
+                <label class="field">
+                  <span>Groq API キー<em id="groq-state"></em></span>
+                  <input
+                    type="password"
+                    id="groq-key"
+                    autocomplete="off"
+                    placeholder="変更するときだけ入力"
+                  />
+                </label>
+                <label class="field">
+                  <span>Gemini API キー<em id="gemini-state"></em></span>
+                  <input
+                    type="password"
+                    id="gemini-key"
+                    autocomplete="off"
+                    placeholder="変更するときだけ入力"
+                  />
+                </label>
+                <label class="field">
+                  <span>言語 (空欄で自動判定)</span>
+                  <input type="text" id="language" autocomplete="off" />
+                </label>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2>整形</h2>
+              </div>
+              <div class="fields">
+                <!-- R1 のユーザー受容済みリスク。整形のトグルのすぐ上に、
+                     独立した枠で置く。畳んだり小さくしたりしない。 -->
+                <p class="warn warn-block">
+                  <svg class="warn-icon" aria-hidden="true"><use href="#icon-warn" /></svg>
+                  <span>
+                    整形は Gemini 無料枠では送信内容が Google の製品改善・モデル訓練に
+                    利用されます。機密を扱う場合は整形をオフにするか有料ティアの
+                    キーを使ってください。
+                  </span>
+                </p>
+                <label class="checkbox">
+                  <input type="checkbox" id="formatting-enabled" />
+                  <span>LLM で整形する(オフなら生転写をそのまま使う)</span>
+                </label>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2>画面コンテキスト</h2>
+              </div>
+              <div class="fields">
+                <p class="warn warn-block" id="deep-context-warning">
+                  <svg class="warn-icon" aria-hidden="true"><use href="#icon-warn" /></svg>
+                  <span>
+                    オンにすると、録音開始時に<strong>前景アプリの画面に表示されている
+                    文章</strong>が読み取られ、認識・整形のためクラウド(Groq / Gemini)へ
+                    送信されます。パスワード欄は読み取りません。読み取った内容は履歴には
+                    保存されません。
+                  </span>
+                </p>
+                <label class="checkbox">
+                  <input type="checkbox" id="deep-context" />
+                  <span>画面のテキストを文脈として使う(deep context)</span>
+                </label>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2>画面質問モード</h2>
+              </div>
+              <div class="fields">
+                <p class="warn warn-block" id="screen-ask-warning">
+                  <svg class="warn-icon" aria-hidden="true"><use href="#icon-warn" /></svg>
+                  <span>
+                    これは上の画面コンテキストより<strong>踏み込んだ機能</strong>です。
+                    専用キーで録音すると、発話は「書き取る文章」ではなく
+                    <strong>画面についての質問</strong>として扱われ、
+                    そのとき見ていた<strong>モニタ 1 枚に写っているウィンドウの内容が
+                    まとめて Gemini へ送信されます</strong>。ウィンドウのテキストが
+                    読み取れない場合は<strong>モニタのスクリーンショットも送られます</strong>。
+                    最小化・別モニタ・別の仮想デスクトップのウィンドウ、および
+                    nox-voice 自身のウィンドウは読みません。パスワード欄のテキストは
+                    読み取りませんが、<strong>画面に表示されている状態のパスワードは
+                    スクリーンショットに写ります</strong>(仕組み上、防げません)。
+                    <strong>読み取った画面の内容と回答は履歴に保存されません</strong>
+                    (回答は画面の内容そのものであるため)。ただし
+                    <strong>質問を聞き取れなかったときだけは、録音を失わないよう音声を
+                    退避します</strong> — 履歴から再転写すると質問の文面が残ります。
+                    回答はクリップボードに入るだけで、貼り付けは行いません。
+                  </span>
+                </p>
+                <label class="checkbox">
+                  <input type="checkbox" id="screen-ask-enabled" />
+                  <span>画面についての質問に答える(画面質問モード)</span>
+                </label>
+                <p class="hint">
+                  <strong>これだけでは動きません。</strong>「ホットキー」区画で
+                  <strong>専用のキー</strong>を割り当てて初めて発火します。
+                  既存の録音キーには相乗りしません(普通の音声入力のたびに画面が
+                  送られてしまうため)。
+                </p>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2>ローカル認識</h2>
+              </div>
+              <div class="fields">
+                <label class="field">
+                  <span>ローカル認識(クラウドが使えないときの代替)</span>
+                  <select id="local-stt-mode">
+                    <option value="off">使わない</option>
+                    <option value="fallback">クラウドが失敗したときだけ使う</option>
+                    <option value="only">常にローカルで認識(音声を外へ送らない)</option>
+                  </select>
+                </label>
+                <div class="statline" id="local-stt">
+                  <span id="local-stt-text">確認中…</span>
+                  <button type="button" id="local-stt-download">
+                    モデルをダウンロード
+                  </button>
+                </div>
+                <p class="warn" id="local-stt-note">
+                  <svg class="warn-icon" aria-hidden="true"><use href="#icon-warn" /></svg>
+                  <span>
+                    モデルは約 1GB です。CPU のみで動くため、認識には
+                    <strong>録音時間の数倍</strong>かかります(1 分の録音で数分が目安)。
+                    クラウドが使えるときはそちらの方が速く正確です。
+                  </span>
+                </p>
+              </div>
+            </div>
+          </section>
+
+          <!-- ===== 辞書と文体 ================================================= -->
+          <section
+            class="section"
+            id="section-dictionary"
+            data-section="dictionary"
+            aria-labelledby="title-dictionary"
+            hidden
+          >
+            <header class="section-head">
+              <div class="section-title">
+                <h1 id="title-dictionary" tabindex="-1">辞書と文体</h1>
+                <p class="section-sub">
+                  固有名詞の取りこぼしと、アプリごとの言い回しを補正します
+                </p>
+              </div>
+            </header>
+
+            <div class="card">
+              <div class="card-head">
+                <h2>辞書</h2>
+              </div>
+              <div class="fields">
+                <label class="field">
+                  <span>
+                    1 行に 1 語。<code>表記,よみ</code> で読みも指定できます
+                  </span>
+                  <textarea
+                    id="dictionary"
+                    rows="5"
+                    autocomplete="off"
+                    placeholder="nox-voice&#10;塩谷,しおや"
+                  ></textarea>
+                </label>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2>アプリ別の文体</h2>
+                <button type="button" id="style-add">行を追加</button>
+              </div>
+              <p class="hint">
+                前景アプリの<strong>プロセス名</strong>で選ばれます。<code>|</code>
+                で区切るといずれかに一致
+                (<code>chrome|msedge</code>)。タイトル条件はブラウザの用途分け
+                (<code>Gmail</code> など) に使います。条件が重なったときは、より具体的な行が勝ちます
+              </p>
+              <!--
+                行単位の編集 UI。区画は DOM から消さず、行だけを差し替える。
+                26 件規模になるので一覧側にスクロールを持たせる (ページ全体を
+                延々スクロールさせない)。行の中身は src/main.ts が組み立てる。
+              -->
+              <div
+                id="style-list"
+                class="style-list"
+                role="group"
+                aria-label="アプリ別の文体の一覧"
+              ></div>
+              <p class="empty" id="style-empty" hidden>
+                1 件もありません。「行を追加」で作れます
+              </p>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2>よく使うアプリの提案</h2>
+              </div>
+              <!--
+                履歴の挿入先を数えて「よく喋っているのに文体の指定が無い
+                アプリ」を出す。0 件・履歴オフ・履歴が空をそれぞれ別の文で
+                言い分ける (同じ「提案なし」にすると壊れて見える)。
+              -->
+              <p class="hint" id="style-suggest-note">読み込み中…</p>
+              <ul class="suggest-list" id="style-suggest-list"></ul>
+            </div>
+          </section>
+
+          <!-- ===== 貼り付け =================================================== -->
+          <section
+            class="section"
+            id="section-paste"
+            data-section="paste"
+            aria-labelledby="title-paste"
+            hidden
+          >
+            <header class="section-head">
+              <div class="section-title">
+                <h1 id="title-paste" tabindex="-1">貼り付け</h1>
+                <p class="section-sub">
+                  結果を前景アプリへ入れる方法と、クリップボードの扱い
+                </p>
+              </div>
+            </header>
+
+            <div class="card">
+              <div class="fields">
+                <label class="checkbox">
+                  <input type="checkbox" id="injection-enabled" />
+                  <span>結果を前景アプリへ自動で貼り付ける</span>
+                </label>
+                <label class="checkbox">
+                  <input type="checkbox" id="keep-transcript" />
+                  <span>
+                    録音結果をクリップボードに残す
+                    <span class="field-note">
+                      貼り付けに失敗しても Ctrl+V でやり直せます。元のクリップボード内容は上書きされます
+                    </span>
+                  </span>
+                </label>
+                <label class="field">
+                  <span>クリップボード復元までの待ち時間 (ms)</span>
+                  <input
+                    type="number"
+                    id="restore-delay"
+                    min="50"
+                    max="5000"
+                    step="50"
+                    aria-describedby="restore-delay-note"
+                  />
+                  <span class="field-note" id="restore-delay-note" hidden></span>
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <!-- ===== ホットキー ================================================= -->
+          <section
+            class="section"
+            id="section-hotkeys"
+            data-section="hotkeys"
+            aria-labelledby="title-hotkeys"
+            hidden
+          >
+            <header class="section-head">
+              <div class="section-title">
+                <h1 id="title-hotkeys" tabindex="-1">ホットキー</h1>
+                <p class="section-sub">
+                  押している間だけ録音。短押しでトグル。設定は押した瞬間に保存されます
+                </p>
+              </div>
+            </header>
+
+            <div class="card">
+              <div class="card-head">
+                <h2>録音</h2>
+              </div>
+              <div class="fields">
+                <div class="field">
+                  <span class="field-label" id="hotkey-desc">
+                    録音して前景アプリへ貼り付けるキー
+                  </span>
+                  <span class="hotkey-row">
+                    <output
+                      class="hotkey-value"
+                      id="hotkey-label"
+                      aria-describedby="hotkey-desc"
+                      >左 Ctrl + Space</output
+                    >
+                    <button type="button" id="hotkey-capture">キーを押して設定</button>
+                  </span>
+                </div>
+                <p class="warn">
+                  <svg class="warn-icon" aria-hidden="true"><use href="#icon-warn" /></svg>
+                  <span>
+                    組み合わせで設定できます(例: 左 Ctrl + Space)。押している間それらのキーは
+                    入力先アプリにも流れます。単独では文字キー・Enter・Space は選べず、
+                    <strong>Ctrl / Alt / Shift / Win / CapsLock / F1〜F12</strong>
+                    などから選びます。修飾キーと組み合わせると Space も使えます。
+                    Esc で取り消せます。
+                  </span>
+                </p>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2>クリップボードのみ</h2>
+              </div>
+              <div class="fields">
+                <div class="field">
+                  <span class="field-label" id="clipboard-hotkey-desc">
+                    貼り付けずにコピーだけするキー
+                  </span>
+                  <span class="hotkey-row">
+                    <output
+                      class="hotkey-value"
+                      id="clipboard-hotkey-label"
+                      aria-describedby="clipboard-hotkey-desc"
+                      >未設定</output
+                    >
+                    <button type="button" id="clipboard-hotkey-capture">
+                      キーを押して設定
+                    </button>
+                    <button type="button" id="clipboard-hotkey-clear">解除</button>
+                  </span>
+                </div>
+                <p class="hint">
+                  こちらのキーで録音すると、結果は<strong>クリップボードに入るだけ</strong>で
+                  貼り付けは行いません。どこにもフォーカスが無い状態(デスクトップ・
+                  作業中に手を止めたくないとき)でも使えます。ペダルの 2 つ目のボタンなどに
+                  割り当ててください。貼り付け用と同じ組み合わせは設定できません。
+                </p>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2>画面に質問</h2>
+              </div>
+              <div class="fields">
+                <div class="field">
+                  <span class="field-label" id="screen-ask-hotkey-desc">
+                    画面について質問するキー
+                  </span>
+                  <span class="hotkey-row">
+                    <output
+                      class="hotkey-value"
+                      id="screen-ask-hotkey-label"
+                      aria-describedby="screen-ask-hotkey-desc"
+                      >未設定</output
+                    >
+                    <button type="button" id="screen-ask-hotkey-capture">
+                      キーを押して設定
+                    </button>
+                    <button type="button" id="screen-ask-hotkey-clear">解除</button>
+                  </span>
+                </div>
+                <p class="warn warn-block" id="screen-ask-hotkey-state" hidden>
+                  <svg class="warn-icon" aria-hidden="true"><use href="#icon-warn" /></svg>
+                  <span id="screen-ask-hotkey-state-text"></span>
+                </p>
+                <p class="hint">
+                  このキーで録音すると、発話は<strong>画面についての質問</strong>として
+                  扱われ、答えが<strong>クリップボードに入ります</strong>(貼り付けは
+                  しません)。例:「左の画面に出ているセッション一覧を出して」。
+                  <strong>質問したモニタの内容が Gemini へ送信されます</strong> —
+                  詳しくは「認識と整形」の画面質問モードを参照してください。
+                  他の用途と同じ組み合わせは設定できません。
+                </p>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2>取り消し</h2>
+              </div>
+              <div class="fields">
+                <div class="field">
+                  <span class="field-label" id="cancel-key-desc">
+                    録音中に押すと、その録音を破棄するキー
+                  </span>
+                  <span class="hotkey-row">
+                    <output
+                      class="hotkey-value"
+                      id="cancel-key-label"
+                      aria-describedby="cancel-key-desc"
+                      >Esc</output
+                    >
+                  </span>
+                </div>
+                <p class="hint">
+                  取り消しキーは設定ファイル (<code>cancel_vk</code>) で変更します。
+                  録音していない間は素通しなので、他アプリの Esc は奪いません。
+                </p>
+              </div>
+            </div>
+          </section>
+
+          <!-- ===== 通知音 ===================================================== -->
+          <section
+            class="section"
+            id="section-sound"
+            data-section="sound"
+            aria-labelledby="title-sound"
+            hidden
+          >
+            <header class="section-head">
+              <div class="section-title">
+                <h1 id="title-sound" tabindex="-1">通知音</h1>
+                <p class="section-sub">
+                  画面を見ずに使うとき、踏めたかどうかを確かめる唯一の手段です
+                </p>
+              </div>
+            </header>
+
+            <div class="card">
+              <div class="fields">
+                <label class="checkbox">
+                  <input type="checkbox" id="sound-enabled" />
+                  <span>録音の開始・取り消しを音で知らせる</span>
+                </label>
+                <p class="hint">
+                  マイクが音を拾うことがあるので、音量は控えめから試してください。
+                </p>
+                <label class="field">
+                  <span>音量 <output id="sound-volume-value">60</output>%</span>
+                  <!-- 名前は固定する。ラベル文字列に現在値が入っているため、
+                       aria-label が無いと動かすたびに読み上げ名が変わる -->
+                  <input
+                    type="range"
+                    id="sound-volume"
+                    min="0"
+                    max="100"
+                    step="5"
+                    aria-label="通知音の音量"
+                  />
+                </label>
+                <label class="field">
+                  <span>録音開始の音</span>
+                  <span class="hotkey-row">
+                    <select id="start-sound"></select>
+                    <button type="button" id="start-sound-preview">試聴</button>
+                  </span>
+                </label>
+                <label class="field sound-custom" id="start-sound-custom" hidden>
+                  <span>録音開始に使う WAV ファイルのパス</span>
+                  <input
+                    type="text"
+                    id="start-sound-path"
+                    placeholder="C:\sounds\start.wav"
+                  />
+                </label>
+                <label class="field">
+                  <span>取り消し・エラーの音</span>
+                  <span class="hotkey-row">
+                    <select id="cancel-sound"></select>
+                    <button type="button" id="cancel-sound-preview">試聴</button>
+                  </span>
+                </label>
+                <label class="field sound-custom" id="cancel-sound-custom" hidden>
+                  <span>取り消し・エラーに使う WAV ファイルのパス</span>
+                  <input
+                    type="text"
+                    id="cancel-sound-path"
+                    placeholder="C:\sounds\cancel.wav"
+                  />
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <!-- ===== アプリの動作 =============================================== -->
+          <section
+            class="section"
+            id="section-app"
+            data-section="app"
+            aria-labelledby="title-app"
+            hidden
+          >
+            <header class="section-head">
+              <div class="section-title">
+                <h1 id="title-app" tabindex="-1">アプリの動作</h1>
+                <p class="section-sub">起動のしかたと、録音中の見せかた</p>
+              </div>
+            </header>
+
+            <div class="card">
+              <div class="fields">
+                <label class="checkbox">
+                  <input type="checkbox" id="start-hidden" />
+                  <span>起動時はウィンドウを出さない(トレイに常駐)</span>
+                </label>
+                <label class="checkbox">
+                  <input type="checkbox" id="overlay-enabled" />
+                  <span>録音中に小窓を表示する(クリックは下のアプリへ抜けます)</span>
+                </label>
+                <label class="field">
+                  <span>自分の打鍵速度(文字 / 分)</span>
+                  <input
+                    type="number"
+                    id="typing-speed"
+                    min="10"
+                    max="2000"
+                    step="10"
+                    aria-describedby="typing-speed-note"
+                  />
+                  <span class="field-note" id="typing-speed-note">
+                    ホームの「節約時間」の計算に使います
+                  </span>
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <!-- 保存バーは区画をまたいで 1 つ。入力欄のある区画でだけ出す。 -->
+          <div class="savebar" id="savebar">
             <span class="form-note" id="settings-note" aria-live="polite"></span>
+            <button type="submit">保存</button>
           </div>
         </form>
-      </details>
-    </main>
+      </main>
+    </div>
   </body>
 </html>

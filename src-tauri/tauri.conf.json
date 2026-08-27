@@ -16,10 +16,10 @@
         "label": "main",
         "title": "nox-voice",
         "visible": false,
-        "width": 560,
-        "height": 460,
-        "minWidth": 360,
-        "minHeight": 320,
+        "width": 940,
+        "height": 660,
+        "minWidth": 420,
+        "minHeight": 420,
         "resizable": true
       }
     ],

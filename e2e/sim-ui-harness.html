@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <title>nox-voice 疑似 E2E ハーネス</title>
+    <!--
+      メインウィンドウの疑似 E2E 用の器。**アプリを起動せずに** vite dev サーバへ
+      ブラウザで入り、`index.html` の DOM と `src/main.ts` をそのまま動かす。
+
+      # 実機 E2E (e2e/hotkey.mjs) との違い
+
+      あちらは nox-voice.exe を起こし、WebView2 の CDP からメインウィンドウの
+      DOM を叩き、**本物の Rust コマンドと本物のグローバルフック**を通す。
+      こちらが通すのは DOM とフロントエンドのロジックだけで、Rust 側は
+      `window.__TAURI_INTERNALS__` の差し替えで模擬する。
+
+      - 確かめられる: 区画の出し分け、捕獲 UI の表示遷移、保存パッチの中身、
+        欠測時のフォールバック、無効化の連動、デバウンスとページング、
+        エラー帯の残留、狭い窓での横あふれ。
+      - 確かめられない: invoke が本当に Rust へ届くか、コマンド名・引数名が
+        Rust 側と合っているか (ここは模擬なので**綴りを間違えても通る**)、
+        グローバルホットキーの捕獲、WebView2 固有の描画差、実ウィンドウの
+        最小サイズ制約 (tauri.conf.json)。**モックの戻り値を Rust の型に
+        合わせること**が、この器の価値をかろうじて支えている唯一の綱。
+
+      # なぜ index.html を写経しないのか
+
+      DOM を丸ごとコピーすると、本体を直した日からテストは別物を見始める
+      (静かに腐るテストは、無いより悪い)。ここでは実行時に `/index.html` を
+      fetch して body をそのまま移植し、`/src/main.ts` を後から import する。
+      import の前にモックを置けるので、`invoke` が本物を掴む隙が無い。
+    -->
+    <script>
+      // ---- Rust 側の模擬 -------------------------------------------------
+      //
+      // 戻り値は `src-tauri/src/config.rs` の ConfigView と
+      // `src-tauri/src/lib.rs` の各 #[tauri::command] の戻り値に合わせてある。
+      // ここを適当な形にすると「通るが何も保証しないテスト」になる。
+      (() => {
+        const params = new URLSearchParams(location.search);
+        /** 失敗させたいコマンド (`?fail=list_sound_presets`)。 */
+        const failing = new Set((params.get("fail") ?? "").split(",").filter(Boolean));
+
+        /** ConfigView (src-tauri/src/config.rs)。SoundPreset は snake_case。 */
+        const config = {
+          groq_key_set: true,
+          groq_key_source: "config",
+          groq_key_preview: "gsk_…9f2a",
+          gemini_key_set: false,
+          gemini_key_source: "none",
+          gemini_key_preview: "",
+          language: "ja",
+          dictionary: ["nox-voice", "塩谷,しおや"],
+          formatting_enabled: true,
+          injection_enabled: true,
+          deep_context: false,
+          // 由来の 3 通り (既定 / 既定を編集 / ユーザー作成) をそろえる。
+          // 1 種類だけにすると、バッジの出し分けが検査できない。
+          style_profiles: [
+            {
+              process: "slack.exe",
+              title_contains: null,
+              instruction: "簡潔な口語にする",
+              id: "chat.slack",
+              user_edited: false,
+            },
+            {
+              process: "chrome|msedge",
+              title_contains: "Gmail",
+              instruction: "ですます調にする",
+              id: "web.gmail",
+              user_edited: true,
+            },
+            {
+              process: "myapp.exe",
+              title_contains: null,
+              instruction: "自作の指示",
+              id: "",
+              user_edited: false,
+            },
+          ],
+          local_stt_mode: "fallback",
+          start_hidden: true,
+          hotkey_vk: 0x20,
+          hotkey_mods: [0xa2],
+          hotkey_label: "左 Ctrl + Space",
+          cancel_label: "Esc",
+          clipboard_hotkey_vk: 0,
+          clipboard_hotkey_mods: [],
+          clipboard_hotkey_label: "",
+          sound_enabled: true,
+          sound_volume: 60,
+          start_sound: "soft_pop",
+          start_sound_path: "",
+          cancel_sound: "fall",
+          cancel_sound_path: "",
+          overlay_enabled: true,
+          history_enabled: true,
+          history_retention_days: 30,
+          restore_delay_ms: 400,
+          keep_transcript_in_clipboard: true,
+          typing_speed_chars_per_min: 300,
+          stt_model: "whisper-large-v3-turbo",
+          format_model: "gemini-2.5-flash",
+        };
+
+        /** SoundPreset::id() / label() と同じ並び (src-tauri/src/sound.rs)。 */
+        const presets = [
+          ["silent", "鳴らさない"],
+          ["soft_pop", "ソフトポップ"],
+          ["chime", "チャイム"],
+          ["marimba", "マリンバ"],
+          ["bell", "ベル"],
+          ["blip", "ブリップ"],
+          ["rise", "上昇"],
+          ["fall", "下降"],
+          ["ding", "ディン"],
+          ["knock", "ノック"],
+          ["sonar", "ソナー"],
+          ["whoosh", "ウーッシュ"],
+          ["buzz", "ブザー"],
+          ["custom", "ファイルを指定"],
+        ].map(([id, label]) => ({ id, label }));
+
+        /** history::SessionRow を模した 1 行。 */
+        const historyRow = (id) => ({
+          id,
+          started_at_ms: 1756200000000 - id * 60000,
+          duration_ms: 3200,
+          target_process: "code.exe",
+          target_hwnd: 0x12345,
+          raw_text: `生転写 ${id}`,
+          formatted_text: `整形後 ${id}`,
+          outcome: "formatted",
+          outcome_reason: null,
+          stt_ms: 420,
+          format_ms: 310,
+          inject_outcome: "injected",
+          clipboard_state: "restored_original",
+          has_audio: false,
+          created_at_ms: 1756200000000 - id * 60000,
+        });
+
+        const mock = {
+          ready: false,
+          /** 呼ばれた invoke の記録。テストはこれを読んで往復を確かめる。 */
+          invokes: [],
+          /** 直近の set_config パッチ。 */
+          lastPatch: null,
+          /** get_history が返す件数。50 でページング条件を満たす。 */
+          historyReturn: 50,
+          /** window.confirm の答え。headless ではダイアログが出せないので固定する。 */
+          confirmAnswer: true,
+          /** lib::StyleSuggestions。テストから差し替えて欠測表示も見る。 */
+          styleSuggestions: {
+            history_enabled: true,
+            total_sessions: 87,
+            items: [
+              { process: "figma.exe", sessions: 40 },
+              { process: "notepad.exe", sessions: 12 },
+            ],
+          },
+          config,
+          failing,
+          /** 登録済みリスナ: event 名 -> handler id の配列。 */
+          listeners: new Map(),
+          callbacks: new Map(),
+          nextCallbackId: 1,
+          nextEventId: 1,
+          /** Rust 側の `app.emit(...)` に相当。 */
+          emit(name, payload) {
+            const ids = mock.listeners.get(name) ?? [];
+            for (const id of ids) {
+              const cb = mock.callbacks.get(id);
+              if (cb) cb({ event: name, id, payload });
+            }
+            return ids.length;
+          },
+          /** そのコマンドが何回呼ばれたか。 */
+          count(cmd) {
+            return mock.invokes.filter((i) => i.cmd === cmd).length;
+          },
+          /** 直近の引数。 */
+          lastArgs(cmd) {
+            const hit = [...mock.invokes].reverse().find((i) => i.cmd === cmd);
+            return hit ? hit.args : null;
+          },
+          reset() {
+            mock.invokes = [];
+          },
+        };
+
+        function handle(cmd, args) {
+          if (failing.has(cmd)) {
+            // Rust 側の `Result::Err(String)` は文字列として reject される。
+            return Promise.reject(`模擬エラー: ${cmd}`);
+          }
+          switch (cmd) {
+            case "plugin:event|listen": {
+              const ids = mock.listeners.get(args.event) ?? [];
+              ids.push(args.handler);
+              mock.listeners.set(args.event, ids);
+              return Promise.resolve(mock.nextEventId++);
+            }
+            case "plugin:event|unlisten":
+              return Promise.resolve();
+            case "get_status":
+              return Promise.resolve("idle");
+            case "get_last_session":
+              return Promise.resolve(null);
+            case "get_last_result":
+              return Promise.resolve(null);
+            case "get_config":
+              return Promise.resolve(structuredClone(mock.config));
+            case "set_config":
+              mock.lastPatch = structuredClone(args.patch);
+              return Promise.resolve(structuredClone(mock.config));
+            case "get_history": {
+              const start = args.beforeId == null ? 1000 : args.beforeId - 1;
+              const rows = [];
+              for (let i = 0; i < mock.historyReturn; i += 1) rows.push(historyRow(start - i));
+              return Promise.resolve(rows);
+            }
+            case "get_storage_stats":
+              return Promise.resolve({
+                failed_bytes: 0,
+                failed_files: 0,
+                untranscribed_rows: 0,
+              });
+            case "get_local_stt_status":
+              // local_stt::Availability は `#[serde(tag = "state")]` の内部タグ表現。
+              return Promise.resolve({ state: "model_missing", expected_path: "C:\\models\\x.bin" });
+            case "get_style_suggestions":
+              // lib::StyleSuggestions。0 件と欠測を言い分けられるよう、
+              // 履歴の有効・無効と総件数も返す形にしてある。
+              return Promise.resolve(structuredClone(mock.styleSuggestions));
+            case "get_dashboard_stats":
+              return Promise.resolve({
+                total_chars: 12345,
+                total_sessions: 87,
+                total_recording_time_ms: 930000,
+                time_saved_ms: 1540000,
+                daily_stats: [],
+              });
+            case "list_sound_presets":
+              return Promise.resolve(structuredClone(presets));
+            case "start_hotkey_capture":
+              return Promise.resolve(10);
+            case "cancel_hotkey_capture":
+              return Promise.resolve();
+            case "clear_hotkey":
+              mock.config.clipboard_hotkey_vk = 0;
+              mock.config.clipboard_hotkey_mods = [];
+              mock.config.clipboard_hotkey_label = "";
+              return Promise.resolve(structuredClone(mock.config));
+            default:
+              // 未知のコマンドは黙って成功させない。Rust 側に無い名前を
+              // 呼んでいたら、そこで気づけるようにする。
+              return Promise.resolve(null);
+          }
+        }
+
+        window.__TAURI_INTERNALS__ = {
+          transformCallback(callback) {
+            const id = mock.nextCallbackId++;
+            mock.callbacks.set(id, callback);
+            return id;
+          },
+          invoke(cmd, args = {}) {
+            mock.invokes.push({ cmd, args: structuredClone(args ?? {}) });
+            return handle(cmd, args ?? {});
+          },
+        };
+        // listen() の unlisten 経路が触る。無いと unlisten で例外になる。
+        window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
+        window.confirm = () => mock.confirmAnswer;
+        window.__NOX_MOCK__ = mock;
+      })();
+    </script>
+
+    <script type="module">
+      // index.html の本文をそのまま移植してから main.ts を読み込む。
+      const html = await (await fetch("/index.html")).text();
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      for (const link of doc.querySelectorAll('head link[rel="stylesheet"]')) {
+        document.head.append(link.cloneNode(true));
+      }
+      // head の module script (= /src/main.ts) は移さない。移すと二重に走り、
+      // イベントリスナが 2 本ずつ付いて、押していないボタンが 2 回発火する。
+      document.body.replaceChildren(...Array.from(doc.body.childNodes));
+
+      await import("/src/main.ts");
+      // main.ts は window の DOMContentLoaded で初期化する。動的 import の
+      // 時点では既に発火済みなので、こちらから同じ形で起こす。
+      window.dispatchEvent(new Event("DOMContentLoaded"));
+      // 初期化は非同期 (invoke の往復がある)。get_config まで終わったことを
+      // 目印にする — 早すぎる時点で読むと、空欄を「壊れている」と誤判定する。
+      const deadline = Date.now() + 10000;
+      while (Date.now() < deadline && window.__NOX_MOCK__.count("get_dashboard_stats") === 0) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      window.__NOX_MOCK__.ready = true;
+    </script>
+  </head>
+  <body></body>
+</html>
