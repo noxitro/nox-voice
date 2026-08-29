@@ -126,6 +126,32 @@ interface StyleProfile {
   user_edited?: boolean;
 }
 
+/**
+ * Rust 側 `dictionary::DictionaryEntry` と対応。
+ *
+ * `added_at_ms` は**表示しないが往復させる**。ここを捨てると、保存の
+ * たびに全語が「今登録した語」になり、新しさによる優先度が意味を失う
+ * (登録日時は Rust 側が 0 のときだけ埋める)。
+ */
+interface DictionaryEntry {
+  written: string;
+  reading: string | null;
+  /** ★。ユーザーが手で握れる唯一の優先度。 */
+  pinned: boolean;
+  /** 追加日時 (epoch ms)。新規行は 0 で送り、Rust 側が現在時刻を入れる。 */
+  added_at_ms: number;
+  origin: "manual" | "auto";
+}
+
+/** Rust 側 `dictionary::DictionaryStatus` と対応。`in_prompt` は行と 1 対 1。 */
+interface DictionaryStatus {
+  max_terms: number;
+  max_chars: number;
+  used_terms: number;
+  used_chars: number;
+  in_prompt: boolean[];
+}
+
 /** 提案から作る行の初期指示。空のまま保存すると Rust 側で落とされる。 */
 const SUGGESTED_INSTRUCTION = "言いよどみと言い直しを取り除き、読みやすく整える";
 
@@ -138,7 +164,8 @@ interface ConfigView {
   gemini_key_source: "env" | "config" | "none";
   gemini_key_preview: string;
   language: string;
-  dictionary: string[];
+  dictionary: DictionaryEntry[];
+  dictionary_status: DictionaryStatus;
   formatting_enabled: boolean;
   injection_enabled: boolean;
   deep_context: boolean;
@@ -631,8 +658,7 @@ function renderConfig(view: ConfigView) {
   if (historyEnabled) historyEnabled.checked = view.history_enabled;
   const retention = el<HTMLInputElement>("history-retention");
   if (retention) retention.value = String(view.history_retention_days);
-  const dictionary = el<HTMLTextAreaElement>("dictionary");
-  if (dictionary) dictionary.value = view.dictionary.join("\n");
+  renderDictionary(view.dictionary, view.dictionary_status);
   const deepContext = el<HTMLInputElement>("deep-context");
   if (deepContext) deepContext.checked = view.deep_context;
   const overlayEnabled = el<HTMLInputElement>("overlay-enabled");
@@ -705,6 +731,210 @@ function renderConfig(view: ConfigView) {
   if (groqState) groqState.textContent = keyStateLabel(view, "groq");
   const geminiState = el("gemini-state");
   if (geminiState) geminiState.textContent = keyStateLabel(view, "gemini");
+}
+
+/* --- 辞書: 行単位の編集と「枠に入っているか」の表示 -------------------------
+ *
+ * 旧 UI はテキストエリア 1 枚で、`表記,よみ` を手で書く形だった。優先度も
+ * 追加日時も出所も持てず、そして **Whisper の予算から溢れた語は黙って
+ * 捨てられていた** (登録順の先勝ちなので、末尾 = 今登録した語ほど落ちる)。
+ *
+ * ここでの約束:
+ *
+ * - **DOM を唯一の状態にする** (文体プロファイルと同じ)。別に配列を持つと
+ *   「画面には出ているが保存されない行」がいつか必ず生まれる
+ * - **枠の判定はフロントで数え直さない。** Rust の
+ *   `preview_dictionary_selection` を呼ぶ。2 か所で数えると、画面の表示と
+ *   実際に送るものがずれる — それは「無言で捨てる」の別の顔にすぎない */
+
+/** 出所のバッジ。後続で「候補からの自動登録」が入ると 2 種類になる。 */
+function dictOriginBadge(origin: DictionaryEntry["origin"]): { kind: string; label: string } {
+  return origin === "auto"
+    ? { kind: "bundled", label: "自動追加" }
+    : { kind: "mine", label: "手動追加" };
+}
+
+/** 1 語ぶんの DOM を作る。`inPrompt` は Rust の試算 (不明なら true 扱い)。 */
+function dictRow(entry: DictionaryEntry, inPrompt: boolean): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "style-row dict-row";
+  row.dataset.origin = entry.origin;
+  // 追加日時は表示しないが往復させる (インターフェースの doc)。
+  row.dataset.addedAtMs = String(entry.added_at_ms ?? 0);
+
+  const head = document.createElement("div");
+  head.className = "style-row-head dict-row-head";
+
+  const state = document.createElement("span");
+  state.className = "badge dict-state";
+  setDictState(state, inPrompt);
+
+  const origin = dictOriginBadge(entry.origin);
+  const originBadge = document.createElement("span");
+  originBadge.className = "badge dict-origin";
+  originBadge.dataset.kind = origin.kind;
+  originBadge.textContent = origin.label;
+
+  // ★ = 「絶対に効かせたい」。枠が足りないときに最優先で残る。
+  const pin = document.createElement("label");
+  pin.className = "checkbox dict-pin";
+  const pinInput = document.createElement("input");
+  pinInput.type = "checkbox";
+  pinInput.className = "dict-pinned";
+  pinInput.checked = entry.pinned;
+  const pinText = document.createElement("span");
+  pinText.textContent = "★ 優先";
+  pinInput.setAttribute("aria-label", `${entry.written || "この語"} を優先する`);
+  pin.append(pinInput, pinText);
+
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "danger dict-remove";
+  remove.textContent = "削除";
+  // 何を消すのかを読み上げにも伝える。「削除」だけの行が並ぶと選べない。
+  remove.setAttribute("aria-label", `${entry.written || "この語"} を辞書から削除`);
+  remove.addEventListener("click", () => {
+    row.remove();
+    syncDictEmpty();
+    void refreshDictionaryStatus();
+  });
+  head.append(state, originBadge, pin, remove);
+
+  const fields = document.createElement("div");
+  fields.className = "style-row-conds";
+  const written = labelledInput("表記", "dict-written", entry.written, "nox-voice");
+  const reading = labelledInput("よみ (任意)", "dict-reading", entry.reading ?? "", "しおや");
+  fields.append(written.field, reading.field);
+
+  row.append(head, fields);
+  return row;
+}
+
+/** 「使用中 / 枠外」のバッジ。**ここが黙って捨てないための表示**。 */
+function setDictState(badge: HTMLElement, inPrompt: boolean) {
+  badge.dataset.kind = inPrompt ? "active" : "overflow";
+  badge.textContent = inPrompt ? "使用中" : "枠外";
+  badge.title = inPrompt
+    ? "この語は音声認識へ渡しています"
+    : "枠に入りきらないため音声認識へ渡していません。★ を付けると優先されます";
+}
+
+function syncDictEmpty() {
+  const list = el("dict-list");
+  const empty = el("dict-empty");
+  if (!list || !empty) return;
+  const rows = [...list.querySelectorAll<HTMLElement>(".dict-row")];
+  const shown = rows.filter((r) => !r.hidden);
+  if (rows.length === 0) {
+    empty.textContent = "1 語もありません。「語を追加」で登録できます";
+    empty.hidden = false;
+    return;
+  }
+  // 「1 語も無い」と「絞り込みに一致しない」は別のこと。同じ文にすると、
+  // 絞り込んだだけで辞書が消えたように見える。
+  empty.textContent = "この絞り込みに一致する語はありません";
+  empty.hidden = shown.length > 0;
+}
+
+/** 絞り込み (すべて / 手動追加 / 自動追加)。行は消さず hidden で隠す。 */
+function applyDictFilter() {
+  const list = el("dict-list");
+  const filter = el<HTMLSelectElement>("dict-filter")?.value ?? "all";
+  if (!list) return;
+  for (const row of list.querySelectorAll<HTMLElement>(".dict-row")) {
+    row.hidden = filter !== "all" && row.dataset.origin !== filter;
+  }
+  syncDictEmpty();
+}
+
+function renderDictionary(entries: DictionaryEntry[], status: DictionaryStatus | undefined) {
+  const list = el("dict-list");
+  if (!list) return;
+  list.replaceChildren(
+    ...entries.map((entry, i) => dictRow(entry, status?.in_prompt[i] ?? true)),
+  );
+  applyDictFilter();
+  renderDictBudget(status);
+}
+
+/** 枠の使用状況を 1 文で出す。**上限と、溢れた語数の両方を必ず言う**。 */
+function renderDictBudget(status: DictionaryStatus | undefined) {
+  const node = el("dict-budget");
+  if (!node) return;
+  if (!status) {
+    node.textContent = "枠の試算を取得できません。保存すると再計算されます";
+    return;
+  }
+  const total = status.in_prompt.length;
+  const overflow = total - status.used_terms;
+  const base =
+    `音声認識へ渡しているのは ${status.used_terms} / ${status.max_terms} 語 ` +
+    `(${status.used_chars} / ${status.max_chars} 文字)。` +
+    `★ を付けた語と、新しく登録した語が優先されます`;
+  node.textContent =
+    overflow > 0
+      ? `${base} — ${overflow} 語が枠から溢れています。★ を付けるか、使わない語を減らしてください`
+      : base;
+}
+
+/** 画面の行を読み取る。**表記が空の行も含めて返す** (何行落ちたかを数えるため)。 */
+function collectDictionary(): DictionaryEntry[] {
+  const list = el("dict-list");
+  if (!list) return [];
+  return [...list.querySelectorAll<HTMLElement>(".dict-row")].map((row) => {
+    const value = (selector: string) =>
+      row.querySelector<HTMLInputElement>(selector)?.value.trim() ?? "";
+    const reading = value(".dict-reading");
+    return {
+      written: value(".dict-written"),
+      reading: reading === "" ? null : reading,
+      pinned: row.querySelector<HTMLInputElement>(".dict-pinned")?.checked ?? false,
+      added_at_ms: Number(row.dataset.addedAtMs ?? 0) || 0,
+      origin: (row.dataset.origin === "auto" ? "auto" : "manual") as DictionaryEntry["origin"],
+    };
+  });
+}
+
+/** 枠の試算をやり直す。打つたびに IPC を叩かないよう間引く。 */
+let dictPreviewDebounce = 0;
+async function refreshDictionaryStatus() {
+  window.clearTimeout(dictPreviewDebounce);
+  dictPreviewDebounce = window.setTimeout(() => {
+    const entries = collectDictionary();
+    void invoke<DictionaryStatus>("preview_dictionary_selection", { entries })
+      .then((status) => {
+        const rows = [...document.querySelectorAll<HTMLElement>("#dict-list .dict-row")];
+        // 試算の往復中に行が増減しうる。長さが合わなければ捨てて、
+        // 次の試算に任せる (ずれた印を出すより何も変えない方がよい)。
+        if (status.in_prompt.length !== rows.length) return;
+        rows.forEach((row, i) => {
+          const badge = row.querySelector<HTMLElement>(".dict-state");
+          if (badge) setDictState(badge, status.in_prompt[i]);
+        });
+        renderDictBudget(status);
+      })
+      .catch(() => renderDictBudget(undefined));
+  }, 200);
+}
+
+/** 語を足して、その場で編集できるようにする。 */
+function addDictRow() {
+  const list = el("dict-list");
+  if (!list) return;
+  // 日時 0 = 「新規」。Rust 側が保存時に現在時刻を入れる。
+  const row = dictRow(
+    { written: "", reading: null, pinned: false, added_at_ms: 0, origin: "manual" },
+    true,
+  );
+  list.append(row);
+  // 「自動追加」で絞り込んだまま手動の行を足すと、押したのに何も
+  // 起きないように見える。追加した行が見える絞り込みへ戻す。
+  const filter = el<HTMLSelectElement>("dict-filter");
+  if (filter && filter.value !== "all" && filter.value !== "manual") filter.value = "all";
+  applyDictFilter();
+  // 追加した行が画面外だと「押しても何も起きない」ように見える。
+  row.scrollIntoView({ block: "nearest" });
+  row.querySelector<HTMLInputElement>(".dict-written")?.focus();
 }
 
 /* --- アプリ別の文体: 行単位の編集 -----------------------------------------
@@ -921,7 +1151,6 @@ async function saveSettings(event: Event) {
   const restoreDelay = el<HTMLInputElement>("restore-delay");
   const historyEnabled = el<HTMLInputElement>("history-enabled");
   const retention = el<HTMLInputElement>("history-retention");
-  const dictionary = el<HTMLTextAreaElement>("dictionary");
   const deepContext = el<HTMLInputElement>("deep-context");
   const screenAsk = el<HTMLInputElement>("screen-ask-enabled");
   const overlayEnabled = el<HTMLInputElement>("overlay-enabled");
@@ -937,6 +1166,11 @@ async function saveSettings(event: Event) {
   const typingSpeed = el<HTMLInputElement>("typing-speed");
 
   const styleRows = collectStyleProfiles();
+  const dictRows = collectDictionary();
+  // 表記が空の行は Rust 側でも落とされるが、**何行落としたかを数えたい**
+  // ので、ここでも同じ条件で分けておく (黙って消さない)。
+  const dictEntries = dictRows.filter((e) => e.written !== "");
+  const ignoredDictLines = dictRows.length - dictEntries.length;
 
   // 入力欄が空 = 「変更しない」。誤って既存キーを消さないため未指定で送る。
   const patch: Record<string, unknown> = {
@@ -952,8 +1186,7 @@ async function saveSettings(event: Event) {
     start_hidden: startHidden?.checked ?? true,
     keep_transcript_in_clipboard: keepTranscript?.checked ?? true,
     local_stt_mode: localMode?.value ?? "fallback",
-    // 空行は Rust 側で落とされる。
-    dictionary: (dictionary?.value ?? "").split(/\r?\n/),
+    dictionary: dictEntries,
     // 入力が足りない行は Rust 側でも落とされるが、**何行落としたかを
     // 数えたい**ので、ここでも同じ条件で分けておく。
     style_profiles: styleRows.filter((p) => p.process !== "" && p.instruction !== ""),
@@ -1008,6 +1241,9 @@ async function saveSettings(event: Event) {
           `アプリ別の文体 ${ignoredStyleLines} 行は、プロセス名か指示が空のため保存していません`,
         );
       }
+      if (ignoredDictLines > 0) {
+        skipped.push(`辞書 ${ignoredDictLines} 行は、表記が空のため保存していません`);
+      }
       if (!soundPresetsLoaded) {
         skipped.push("音の一覧を取得できていないため、開始音・取り消し音は変更していません");
       }
@@ -1022,7 +1258,7 @@ async function saveSettings(event: Event) {
     () => {
       if (note) note.textContent = "";
     },
-    ignoredStyleLines > 0 || !soundPresetsLoaded ? 8000 : 2500,
+    ignoredStyleLines > 0 || ignoredDictLines > 0 || !soundPresetsLoaded ? 8000 : 2500,
   );
 }
 
@@ -1847,6 +2083,13 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (document.hidden && capturingMode) void cancelHotkeyCapture();
   });
   el("style-add")?.addEventListener("click", () => addStyleRow());
+  el("dict-add")?.addEventListener("click", () => addDictRow());
+  el("dict-filter")?.addEventListener("change", () => applyDictFilter());
+  // 表記を打った / ★ を付けた瞬間に枠の見え方が変わる。保存を待たせない
+  // (待たせると、その間ずっと画面が嘘をつく)。委譲で受けるのは、行が
+  // 差し替わっても購読し直さずに済むため。
+  el("dict-list")?.addEventListener("input", () => void refreshDictionaryStatus());
+  el("dict-list")?.addEventListener("change", () => void refreshDictionaryStatus());
   el("history-more")?.addEventListener("click", () => void loadHistory(true));
   el<HTMLInputElement>("history-search")?.addEventListener("input", (e) => {
     historyQuery = (e.target as HTMLInputElement).value.trim();

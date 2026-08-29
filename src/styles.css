@@ -929,6 +929,49 @@ label[hidden] {
   color: var(--status-ok);
 }
 
+/* --- 辞書 ----------------------------------------------------------------
+ * 行の作りは .style-row を共有する。違うのは頭の行だけ:
+ * 状態 (使用中 / 枠外) と出所のバッジ、★、削除を 1 列に並べる。 */
+
+.dict-row-head {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+
+/* 削除だけ右端へ逃がす。バッジと★は左に固まっていた方が読みやすい */
+.dict-row-head .dict-remove {
+  margin-left: auto;
+}
+
+.dict-pin {
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+/* 枠に入っている / 溢れている。**溢れを目立たせる**のがこの機能の要点で、
+   ここを控えめにすると「黙って捨てる」に戻ってしまう */
+.badge[data-kind="active"] {
+  background: var(--status-ok-soft);
+  color: var(--status-ok);
+}
+
+.badge[data-kind="overflow"] {
+  background: var(--status-processing-soft);
+  color: var(--status-processing);
+}
+
+.dict-toolbar {
+  display: flex;
+  align-items: end;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+
+.dict-filter {
+  max-width: 12rem;
+}
+
 .suggest-list {
   list-style: none;
   display: grid;

@@ -502,20 +502,42 @@
             <div class="card">
               <div class="card-head">
                 <h2>辞書</h2>
+                <button type="button" id="dict-add">語を追加</button>
               </div>
-              <div class="fields">
-                <label class="field">
-                  <span>
-                    1 行に 1 語。<code>表記,よみ</code> で読みも指定できます
-                  </span>
-                  <textarea
-                    id="dictionary"
-                    rows="5"
-                    autocomplete="off"
-                    placeholder="nox-voice&#10;塩谷,しおや"
-                  ></textarea>
+              <p class="hint">
+                固有名詞や専門用語の<strong>表記</strong>を安定させます。よみは整形
+                (Gemini) 側でだけ使われます — 音声認識のモデルには読み仮名を渡せません
+              </p>
+              <!--
+                枠の使用状況。**溢れを黙って捨てないための表示**で、この機能の
+                本体はここ。行の badge (使用中 / 枠外) と対で読む。
+                文言は src/main.ts が組み立てる (試算は Rust の
+                preview_dictionary_selection が返す)。
+              -->
+              <p class="hint" id="dict-budget" aria-live="polite">読み込み中…</p>
+              <div class="dict-toolbar">
+                <label class="field dict-filter">
+                  <span>絞り込み</span>
+                  <select id="dict-filter">
+                    <option value="all">すべて</option>
+                    <option value="manual">手動追加</option>
+                    <option value="auto">自動追加</option>
+                  </select>
                 </label>
               </div>
+              <!--
+                行単位の編集 UI。文体プロファイル (#style-list) と同じ作りに
+                そろえてある。区画は DOM から消さず、行だけを差し替える。
+              -->
+              <div
+                id="dict-list"
+                class="style-list"
+                role="group"
+                aria-label="辞書の一覧"
+              ></div>
+              <p class="empty" id="dict-empty" hidden>
+                1 語もありません。「語を追加」で登録できます
+              </p>
             </div>
 
             <div class="card">

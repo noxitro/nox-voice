@@ -49,6 +49,10 @@ mod tray;
 #[cfg(test)]
 mod http_test_server;
 
+/// 技術検証スパイク (テスト専用)。製品経路からは呼ばれない。
+#[cfg(test)]
+mod uia_spike;
+
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread;
@@ -848,6 +852,20 @@ fn get_style_suggestions(state: tauri::State<'_, AppState>) -> Result<StyleSugge
     })
 }
 
+/// 編集中の辞書が「何語まで Whisper へ渡るか」を試算する。
+///
+/// **保存を待たずに溢れを見せるために要る。** 保存後の
+/// [`config::ConfigView::dictionary_status`] だけだと、行を足した瞬間から
+/// 保存するまでの間、画面が嘘をつく (それは今回直した「無言で捨てる」の
+/// 別の顔)。判定は設定側と同じ純関数を呼ぶだけにして、フロントに
+/// 数え直させない — 2 か所に書くと必ずずれる。
+#[tauri::command]
+fn preview_dictionary_selection(
+    entries: Vec<dictionary::DictionaryEntry>,
+) -> dictionary::DictionaryStatus {
+    dictionary::DictionaryStatus::of(&entries)
+}
+
 /// `failed/` の WAV を数えて合計サイズを出す。
 ///
 /// 読めないディレクトリは 0 件として扱う (統計表示のためだけなので、
@@ -997,6 +1015,7 @@ pub fn run() {
             get_storage_stats,
             get_dashboard_stats,
             get_style_suggestions,
+            preview_dictionary_selection,
             delete_untranscribed,
             get_local_stt_status,
             download_local_model,

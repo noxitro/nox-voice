@@ -50,7 +50,41 @@
           gemini_key_source: "none",
           gemini_key_preview: "",
           language: "ja",
-          dictionary: ["nox-voice", "塩谷,しおや"],
+          // 辞書は 2026-08-30 から構造化 (表記 / よみ / ★ / 追加日時 / 出所)。
+          // 出所は 2 種類そろえる — 1 種類だけだと絞り込みが検査できない。
+          dictionary: [
+            {
+              written: "nox-voice",
+              reading: null,
+              pinned: false,
+              added_at_ms: 1700000000000,
+              origin: "manual",
+            },
+            {
+              written: "塩谷",
+              reading: "しおや",
+              pinned: true,
+              added_at_ms: 1700000001000,
+              origin: "manual",
+            },
+            {
+              written: "自動候補",
+              reading: null,
+              pinned: false,
+              added_at_ms: 1700000002000,
+              origin: "auto",
+            },
+          ],
+          // 3 語目が枠から溢れている状態を初期値にする。**溢れの表示が
+          // この機能の本体**なので、全部収まっている状態だけを見ても
+          // 何も確かめられない。
+          dictionary_status: {
+            max_terms: 36,
+            max_chars: 140,
+            used_terms: 2,
+            used_chars: 12,
+            in_prompt: [true, true, false],
+          },
           formatting_enabled: true,
           injection_enabled: true,
           deep_context: false,
@@ -156,6 +190,8 @@
           invokes: [],
           /** 直近の set_config パッチ。 */
           lastPatch: null,
+          /** 辞書の何語まで `prompt` に載るか (模擬)。テストから変えられる。 */
+          dictPromptCap: 2,
           /** get_history が返す件数。50 でページング条件を満たす。 */
           historyReturn: 50,
           /** window.confirm の答え。headless ではダイアログが出せないので固定する。 */
@@ -219,6 +255,27 @@
             .join(" + ");
         }
 
+        /** `dictionary::DictionaryStatus` の**形だけ**を返す模擬。
+         *
+         * 選抜の規則 (★ → 新しさ) は**真似しない**。モックが判定を
+         * 写すと、Rust 側の規則を変えた日に両方直すことになり、
+         * しかも「モックが通る」ことしか保証しなくなる。ここは
+         * 「枠に上限があって、溢れる語がある」状態を作るだけにする。
+         * 規則の正しさは dictionary::tests が見る。 */
+        function dictStatus(entries) {
+          const cap = mock.dictPromptCap;
+          let used = 0;
+          let chars = 0;
+          const in_prompt = entries.map((e) => {
+            const written = (e.written ?? "").trim();
+            if (written === "" || used >= cap) return false;
+            chars += (used === 0 ? 0 : 1) + [...written].length;
+            used += 1;
+            return true;
+          });
+          return { max_terms: 36, max_chars: 140, used_terms: used, used_chars: chars, in_prompt };
+        }
+
         function handle(cmd, args) {
           if (failing.has(cmd)) {
             // Rust 側の `Result::Err(String)` は文字列として reject される。
@@ -248,6 +305,12 @@
               // 不具合を検出できない (実機 E2E の代わりにならない穴になる)。
               mock.lastPatch = structuredClone(args.patch);
               Object.assign(mock.config, args.patch);
+              // Rust は保存のたびに枠を計算し直す。ここで据え置くと、
+              // 行が増えても「枠外」が出ないビューが返り、E2E が
+              // 溢れの表示を検査できない穴になる。
+              if (args.patch.dictionary) {
+                mock.config.dictionary_status = dictStatus(mock.config.dictionary);
+              }
               return Promise.resolve(structuredClone(mock.config));
             case "get_history": {
               const start = args.beforeId == null ? 1000 : args.beforeId - 1;
@@ -264,6 +327,8 @@
             case "get_local_stt_status":
               // local_stt::Availability は `#[serde(tag = "state")]` の内部タグ表現。
               return Promise.resolve({ state: "model_missing", expected_path: "C:\\models\\x.bin" });
+            case "preview_dictionary_selection":
+              return Promise.resolve(dictStatus(args.entries ?? []));
             case "get_style_suggestions":
               // lib::StyleSuggestions。0 件と欠測を言い分けられるよう、
               // 履歴の有効・無効と総件数も返す形にしてある。

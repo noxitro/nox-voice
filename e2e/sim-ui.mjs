@@ -979,6 +979,185 @@ async function main() {
     return { ok, detail: JSON.stringify(seen) };
   });
 
+  // --- U14: 辞書は行として並び、枠に入っているかが見える
+  //
+  // 旧 UI はテキストエリア 1 枚で、**予算から溢れた語は黙って捨てられて
+  // いた**。ユーザーには「登録したのに効かない」としか見えない。
+  // ここが落ちると、その状態に戻ったことに誰も気づけない。
+  await load(cdp);
+  await check("U14 辞書は行で並び、使用中 / 枠外と上限が画面に出る", async () => {
+    const r = await cdp.run(`
+      document.querySelector('.nav-item[data-section="dictionary"]').click();
+      await new Promise((r) => setTimeout(r, 40));
+      const rows = [...document.querySelectorAll("#dict-list .dict-row")];
+      return {
+        count: rows.length,
+        states: rows.map((row) => row.querySelector(".dict-state").dataset.kind),
+        origins: rows.map((row) => row.querySelector(".dict-origin").textContent),
+        written: rows.map((row) => row.querySelector(".dict-written").value),
+        readings: rows.map((row) => row.querySelector(".dict-reading").value),
+        pinned: rows.map((row) => row.querySelector(".dict-pinned").checked),
+        budget: document.getElementById("dict-budget").textContent,
+        emptyHidden: document.getElementById("dict-empty").hidden,
+        // 一覧そのものは区画に残り続ける (DOM から消さない)。
+        listPresent: Boolean(document.getElementById("dict-list")),
+      };
+    `);
+    return {
+      ok:
+        r.count === 3 &&
+        JSON.stringify(r.states) === JSON.stringify(["active", "active", "overflow"]) &&
+        JSON.stringify(r.origins) === JSON.stringify(["手動追加", "手動追加", "自動追加"]) &&
+        r.written[1] === "塩谷" &&
+        r.readings[1] === "しおや" &&
+        r.pinned[1] === true &&
+        // 何語入っていて上限がいくつか、そして何語溢れたかを必ず言う。
+        /2 \/ 36 語/.test(r.budget) &&
+        /140 文字/.test(r.budget) &&
+        /1 語が枠から溢れています/.test(r.budget) &&
+        r.emptyHidden === true &&
+        r.listPresent,
+      detail: JSON.stringify(r),
+    };
+  });
+
+  // --- U14b: 追加・編集・★・削除が保存パッチへそのまま乗る
+  await check("U14b 辞書の追加・編集・★・削除が保存パッチに反映される", async () => {
+    const r = await cdp.run(`
+      const rows = () => [...document.querySelectorAll("#dict-list .dict-row")];
+      // 自動追加の行を消して、1 語足して、★ を外す。
+      rows()[2].querySelector(".dict-remove").click();
+      document.getElementById("dict-add").click();
+      await new Promise((r) => setTimeout(r, 30));
+      const added = rows()[rows().length - 1];
+      added.querySelector(".dict-written").value = "Tauri";
+      added.querySelector(".dict-reading").value = "たうり";
+      added.querySelector(".dict-pinned").checked = true;
+      rows()[1].querySelector(".dict-pinned").checked = false;
+
+      window.__NOX_MOCK__.lastPatch = null;
+      document.getElementById("settings-form").requestSubmit();
+      await new Promise((r) => setTimeout(r, 250));
+      return {
+        patch: window.__NOX_MOCK__.lastPatch?.dictionary,
+        note: document.getElementById("settings-note").textContent,
+      };
+    `);
+    const sent = r.patch ?? [];
+    const added = sent.find((e) => e.written === "Tauri");
+    const shioya = sent.find((e) => e.written === "塩谷");
+    return {
+      ok:
+        sent.length === 3 &&
+        !sent.some((e) => e.written === "自動候補") &&
+        added?.reading === "たうり" &&
+        added?.pinned === true &&
+        // 新規行は日時 0 で送る (Rust が現在時刻を入れる)。
+        added?.added_at_ms === 0 &&
+        added?.origin === "manual" &&
+        // 既存行の追加日時は往復する。落とすと全語が「今登録した語」になる。
+        shioya?.added_at_ms === 1700000001000 &&
+        shioya?.pinned === false &&
+        r.note === "保存しました",
+      detail: `${JSON.stringify(sent)} / note="${r.note}"`,
+    };
+  });
+
+  // --- U14c: 表記が空の行は保存されず、黙って消えない
+  await check("U14c 表記が空の行は送らず、その旨を伝える", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      document.querySelector('.nav-item[data-section="dictionary"]').click();
+      document.getElementById("dict-add").click();
+      await new Promise((r) => setTimeout(r, 30));
+      window.__NOX_MOCK__.lastPatch = null;
+      document.getElementById("settings-form").requestSubmit();
+      await new Promise((r) => setTimeout(r, 250));
+      return {
+        sent: window.__NOX_MOCK__.lastPatch?.dictionary.length,
+        note: document.getElementById("settings-note").textContent,
+      };
+    `);
+    return {
+      ok: r.sent === 3 && /辞書 1 行/.test(r.note) && /保存していません/.test(r.note),
+      detail: `送った件数=${r.sent} / note="${r.note}"`,
+    };
+  });
+
+  // --- U14d: 保存を待たずに枠の表示が更新される
+  //
+  // ここが無いと、行を足してから保存するまでの間ずっと画面が嘘をつく。
+  await check("U14d 語を足すと、保存前に枠の表示が更新される", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      document.querySelector('.nav-item[data-section="dictionary"]').click();
+      await new Promise((r) => setTimeout(r, 40));
+      const before = document.getElementById("dict-budget").textContent;
+      document.getElementById("dict-add").click();
+      const rows = [...document.querySelectorAll("#dict-list .dict-row")];
+      const added = rows[rows.length - 1];
+      added.querySelector(".dict-written").value = "追加した語";
+      added.querySelector(".dict-written").dispatchEvent(new Event("input", { bubbles: true }));
+      // 試算は間引かれている (打つたびに IPC を叩かない)。
+      await new Promise((r) => setTimeout(r, 400));
+      return {
+        before,
+        after: document.getElementById("dict-budget").textContent,
+        addedState: added.querySelector(".dict-state").dataset.kind,
+        previews: window.__NOX_MOCK__.count("preview_dictionary_selection"),
+        saved: window.__NOX_MOCK__.count("set_config"),
+      };
+    `);
+    return {
+      ok:
+        r.previews >= 1 &&
+        // 保存していないのに更新されること。
+        r.saved === 0 &&
+        /2 語が枠から溢れています/.test(r.after) &&
+        r.addedState === "overflow",
+      detail: JSON.stringify(r),
+    };
+  });
+
+  // --- U14e: 出所での絞り込み (すべて / 手動追加 / 自動追加)
+  await check("U14e 辞書を出所で絞り込める", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      document.querySelector('.nav-item[data-section="dictionary"]').click();
+      await new Promise((r) => setTimeout(r, 40));
+      const visible = () =>
+        [...document.querySelectorAll("#dict-list .dict-row")].filter((r) => !r.hidden).length;
+      const filter = document.getElementById("dict-filter");
+      const all = visible();
+      filter.value = "auto";
+      filter.dispatchEvent(new Event("change"));
+      const auto = visible();
+      filter.value = "manual";
+      filter.dispatchEvent(new Event("change"));
+      const manual = visible();
+      filter.value = "auto";
+      filter.dispatchEvent(new Event("change"));
+      // 一致 0 件のときは「1 語もありません」と言い分ける。
+      document.querySelectorAll("#dict-list .dict-row")[2].querySelector(".dict-remove").click();
+      return {
+        all,
+        auto,
+        manual,
+        emptyHidden: document.getElementById("dict-empty").hidden,
+        emptyText: document.getElementById("dict-empty").textContent,
+      };
+    `);
+    return {
+      ok:
+        r.all === 3 &&
+        r.auto === 1 &&
+        r.manual === 2 &&
+        r.emptyHidden === false &&
+        /絞り込み/.test(r.emptyText),
+      detail: JSON.stringify(r),
+    };
+  });
+
   // --- U11: 狭い窓でも横あふれが無く、レール下端の状態カードが見える
   for (const [w, h] of [
     [420, 420],

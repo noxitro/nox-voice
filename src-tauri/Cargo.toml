@@ -75,5 +75,12 @@ default = []
 #   cargo build --features local-stt
 local-stt = ["dep:whisper-rs"]
 
+[dev-dependencies]
+# 技術検証スパイク (src/uia_spike.rs, テスト専用) の `#[implement]` マクロが
+# 生成するコードは `::windows_core::` を絶対パスで参照する。`windows` 経由の
+# 再エクスポートでは届かないので、**テストビルドにだけ** 直接の依存を足す。
+# バージョンは `windows` 0.62 が使っているものと同一 (lock で共有される)。
+windows-core = "0.62"
+
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = "2.4.3"

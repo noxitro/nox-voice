@@ -20,7 +20,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::dictionary::{self, DictionaryEntry};
+use crate::dictionary::{DictionaryEntry, DictionaryStatus};
 use crate::sound::{SoundChoice, SoundPreset};
 use crate::style::StyleProfile;
 
@@ -154,8 +154,16 @@ pub struct Config {
     pub gemini_api_key: Secret,
     /// STT の言語ヒント (ISO-639-1)。空なら自動判定に任せる。
     pub language: String,
-    /// 整形プロンプトへ差し込む用語リスト (固有名詞・専門用語の表記ゆれ対策)。
-    pub dictionary: Vec<String>,
+    /// 用語リスト (固有名詞・専門用語の表記ゆれ対策)。
+    ///
+    /// **旧形式 (`["nox-voice", "塩谷,しおや"]` の文字列配列) も読める。**
+    /// 移行は [`DictionaryEntry`] の `Deserialize` が引き受ける
+    /// (専用の移行処理を書かないので、設定ファイル・IPC パッチ・テストの
+    /// どこから来ても同じ形になる)。フィールド単位の `#[serde(default)]`
+    /// は他と同じ理由 — コンテナ側の default は [`Config::default()`] の
+    /// 値を拾うため、項目が無い設定ファイルの扱いが変わりうる。
+    #[serde(default)]
+    pub dictionary: Vec<DictionaryEntry>,
     /// LLM 整形を行うか。false なら生転写をそのまま採用する。
     pub formatting_enabled: bool,
     /// 結果を前景アプリへ自動で貼り付けるか。
@@ -403,9 +411,18 @@ impl Config {
         resolve_key(env_value(ENV_GEMINI_KEY), &self.gemini_api_key)
     }
 
-    /// 辞書を構造化して返す (`表記,よみ` のパース済み)。
+    /// 辞書の全語。**正規化済み** ([`Config::normalize`] が空の表記を落とす)。
     pub fn dictionary_entries(&self) -> Vec<DictionaryEntry> {
-        dictionary::parse_entries(&self.dictionary)
+        self.dictionary.clone()
+    }
+
+    /// 「いま何語が Whisper へ渡っているか」。設定画面へ出すために持つ。
+    ///
+    /// 判定は [`crate::dictionary::select_dictionary_terms`] に一本化する。
+    /// UI 側で数え直すと、**画面の表示と実際に送るものがずれる** —
+    /// それは今回直した「無言で捨てる」の別の顔にすぎない。
+    pub fn dictionary_status(&self) -> DictionaryStatus {
+        DictionaryStatus::of(&self.dictionary)
     }
 
     /// `{gemini_endpoint}/{model}:generateContent` を組み立てる。
@@ -490,6 +507,18 @@ fn default_cancel_sound() -> SoundPreset {
     SoundPreset::Fall
 }
 
+/// 現在時刻 (UNIX epoch ミリ秒)。時計が 1970 より前を指していれば 1。
+///
+/// 0 を返さないのが要点。0 は辞書で「日時不明」の予約値なので、
+/// 返してしまうと [`Config::normalize_dictionary`] が毎回入れ直しに来る。
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(1)
+        .max(1)
+}
+
 fn env_value(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
@@ -524,7 +553,12 @@ pub struct ConfigView {
     pub gemini_key_source: KeySource,
     pub gemini_key_preview: String,
     pub language: String,
-    pub dictionary: Vec<String>,
+    pub dictionary: Vec<DictionaryEntry>,
+    /// 辞書の何語が実際に `prompt` へ載っているか (行と 1 対 1 に対応)。
+    ///
+    /// **溢れた語を黙って捨てないための項目**。ここが無いと、ユーザーには
+    /// 「登録したのに効かない」としか見えない。
+    pub dictionary_status: DictionaryStatus,
     pub formatting_enabled: bool,
     pub injection_enabled: bool,
     pub deep_context: bool,
@@ -595,6 +629,7 @@ impl ConfigView {
                 .unwrap_or_default(),
             language: c.language.clone(),
             dictionary: c.dictionary.clone(),
+            dictionary_status: c.dictionary_status(),
             formatting_enabled: c.formatting_enabled,
             injection_enabled: c.injection_enabled,
             deep_context: c.deep_context,
@@ -661,7 +696,8 @@ pub struct ConfigPatch {
     pub groq_api_key: Option<String>,
     pub gemini_api_key: Option<String>,
     pub language: Option<String>,
-    pub dictionary: Option<Vec<String>>,
+    /// 辞書の全置換。**旧形式の文字列配列も受ける** (フィールドの doc)。
+    pub dictionary: Option<Vec<DictionaryEntry>>,
     pub formatting_enabled: Option<bool>,
     pub injection_enabled: Option<bool>,
     pub deep_context: Option<bool>,
@@ -715,7 +751,7 @@ impl fmt::Debug for ConfigPatch {
                 &format_args!("{}", presence(&self.gemini_api_key)),
             )
             .field("language", &self.language)
-            .field("dictionary", &self.dictionary)
+            .field("dictionary", &self.dictionary.as_ref().map(Vec::len))
             .field("formatting_enabled", &self.formatting_enabled)
             .field("injection_enabled", &self.injection_enabled)
             .field("deep_context", &self.deep_context)
@@ -769,6 +805,7 @@ impl Config {
     /// パッチ適用時だけでなく**読み込み時にも**通すこと。設定ファイルは
     /// 手で編集されうるので、UI を通らない値が入ってくる。
     pub fn normalize(&mut self) {
+        self.normalize_dictionary();
         // 捕獲 UI と同じ不変条件をここでも守る。設定ファイルは手で編集できるので、
         // UI を通らない値 (文字キー・Enter・マウス・範囲外) が入りうる。
         // 文字キーが入ると、押している間ずっと入力先へ流れ続ける。
@@ -925,6 +962,33 @@ impl Config {
         }
     }
 
+    /// 辞書の不変条件を整える。
+    ///
+    /// 1. 表記と読みの前後空白を落とし、**表記が空の語は捨てる**。
+    ///    空の表記は `prompt` に入れようがないうえ、[`ConfigView`] の
+    ///    行と [`DictionaryStatus`] の判定を 1 対 1 に保てなくなる。
+    /// 2. 読みが空文字なら `None` に倒す (「読み無し」と同義にする)。
+    /// 3. **追加日時が 0 (不明) の語に現在時刻を入れる。** 旧形式から
+    ///    移行した語はここで横並びになり、同着は登録順で解ける
+    ///    ([`crate::dictionary::select_dictionary_terms`])。0 のまま
+    ///    残すと、後から足した語だけが常に勝ち続けて古い語が二度と
+    ///    載らなくなる。
+    fn normalize_dictionary(&mut self) {
+        let now = now_ms();
+        self.dictionary.retain_mut(|entry| {
+            entry.written = entry.written.trim().to_string();
+            entry.reading = entry
+                .reading
+                .take()
+                .map(|r| r.trim().to_string())
+                .filter(|r| !r.is_empty());
+            if entry.added_at_ms <= 0 {
+                entry.added_at_ms = now;
+            }
+            !entry.written.is_empty()
+        });
+    }
+
     /// 貼付後にクリップボードをどう扱うか。
     ///
     /// 「残すなら復元ディレイは使わない」という関係は、bool と Duration を
@@ -1056,11 +1120,10 @@ impl Config {
             self.language = v.trim().to_string();
         }
         if let Some(v) = patch.dictionary {
-            self.dictionary = v
-                .into_iter()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            // 掃除 (trim / 空行落とし / 追加日時の補完) は normalize に集める。
+            // 設定ファイルは手で編集できるので、UI 経由の道だけを掃除しても
+            // 不変条件は守れない (末尾の self.normalize() が両方を通す)。
+            self.dictionary = v;
         }
         if let Some(v) = patch.formatting_enabled {
             self.formatting_enabled = v;
@@ -1756,14 +1819,109 @@ mod tests {
         let mut cfg = Config::default();
         cfg.apply(ConfigPatch {
             dictionary: Some(vec![
-                " nox-voice ".to_string(),
-                "".to_string(),
-                "  ".to_string(),
-                "Tauri".to_string(),
+                DictionaryEntry::new(" nox-voice "),
+                DictionaryEntry::new(""),
+                DictionaryEntry::new("  "),
+                DictionaryEntry::new("Tauri"),
             ]),
             ..ConfigPatch::default()
         });
-        assert_eq!(cfg.dictionary, vec!["nox-voice", "Tauri"]);
+        let written: Vec<&str> = cfg.dictionary.iter().map(|e| e.written.as_str()).collect();
+        assert_eq!(written, vec!["nox-voice", "Tauri"]);
+    }
+
+    #[test]
+    fn saved_entries_get_an_added_at_timestamp() {
+        // 0 のままだと選抜で「不明」として横並びになり、後から足した語
+        // だけが常に勝ち続ける。保存の瞬間に埋める。
+        let mut cfg = Config::default();
+        cfg.apply(ConfigPatch {
+            dictionary: Some(vec![DictionaryEntry::new("nox-voice")]),
+            ..ConfigPatch::default()
+        });
+        assert!(cfg.dictionary[0].added_at_ms > 0);
+        // 既に日時を持つ語は書き換えない (登録の古さが消えてしまう)。
+        let stamped = DictionaryEntry {
+            added_at_ms: 1_700_000_000_000,
+            ..DictionaryEntry::new("Tauri")
+        };
+        cfg.apply(ConfigPatch {
+            dictionary: Some(vec![stamped.clone()]),
+            ..ConfigPatch::default()
+        });
+        assert_eq!(cfg.dictionary[0].added_at_ms, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn an_old_string_dictionary_migrates_on_load() {
+        // 旧 config.json は `"dictionary": ["nox-voice", "塩谷,しおや"]`。
+        // **移行で読みが失われないこと**が要点 (読みは整形側の指示になる)。
+        let json = r#"{"dictionary":["nox-voice","塩谷,しおや","  "]}"#;
+        let mut cfg: Config = serde_json::from_str(json).expect("読める");
+        cfg.normalize();
+        assert_eq!(cfg.dictionary.len(), 2, "空行が残った: {:?}", cfg.dictionary);
+        assert_eq!(cfg.dictionary[0].written, "nox-voice");
+        assert_eq!(cfg.dictionary[1].written, "塩谷");
+        assert_eq!(cfg.dictionary[1].reading.as_deref(), Some("しおや"));
+        // 移行分は手動・未★で始まり、日時は読み込み時に埋まる。
+        assert!(cfg.dictionary.iter().all(|e| !e.pinned));
+        assert!(cfg.dictionary.iter().all(|e| e.added_at_ms > 0));
+        // 移行しても他の設定は既定のまま (コンテナ default の罠を踏まない)。
+        assert_eq!(cfg.language, DEFAULT_LANGUAGE);
+    }
+
+    #[test]
+    fn a_migrated_dictionary_survives_a_save_and_reload() {
+        // 移行 → 保存 → 再読込で形が安定すること。ここが崩れると、
+        // 起動のたびに読みや★が落ちる。
+        let mut cfg: Config = serde_json::from_str(r#"{"dictionary":["塩谷,しおや"]}"#)
+            .expect("読める");
+        cfg.normalize();
+        cfg.dictionary[0].pinned = true;
+        let saved = serde_json::to_string(&cfg).expect("書ける");
+        let mut back: Config = serde_json::from_str(&saved).expect("読める");
+        back.normalize();
+        assert_eq!(back.dictionary, cfg.dictionary);
+    }
+
+    #[test]
+    fn a_patch_of_old_string_lines_is_still_accepted() {
+        // フロントが旧形式を送ってきても (古い WebView が残っている等)
+        // 弾かない。serde の入口 1 か所で吸収する設計の確認。
+        let patch: ConfigPatch =
+            serde_json::from_str(r#"{"dictionary":["nox-voice","塩谷,しおや"]}"#).expect("読める");
+        let mut cfg = Config::default();
+        cfg.apply(patch);
+        assert_eq!(cfg.dictionary.len(), 2);
+        assert_eq!(cfg.dictionary[1].reading.as_deref(), Some("しおや"));
+    }
+
+    #[test]
+    fn the_view_reports_which_terms_reach_whisper() {
+        // 「登録したのに効かない」を画面で説明できること。
+        let mut cfg = Config::default();
+        cfg.apply(ConfigPatch {
+            dictionary: Some(
+                (0..60)
+                    .map(|i| DictionaryEntry::new(format!("用語{i:03}")))
+                    .collect(),
+            ),
+            ..ConfigPatch::default()
+        });
+        // 環境変数に依存させないため、解決済みキーを明示して組み立てる。
+        let view = ConfigView::build(
+            &cfg,
+            resolve_key(None, &cfg.groq_api_key),
+            resolve_key(None, &cfg.gemini_api_key),
+        );
+        assert_eq!(view.dictionary.len(), 60);
+        assert_eq!(view.dictionary_status.in_prompt.len(), 60);
+        assert!(view.dictionary_status.used_terms < 60, "溢れが出ていない");
+        assert!(view.dictionary_status.used_chars <= view.dictionary_status.max_chars);
+        assert_eq!(
+            view.dictionary_status.max_terms,
+            crate::dictionary::DICTIONARY_MAX_TERMS
+        );
     }
 
     #[test]
@@ -2471,15 +2629,22 @@ mod tests {
     }
 
     #[test]
-    fn dictionary_entries_parse_readings() {
+    fn dictionary_entries_keep_readings() {
         let mut cfg = Config::default();
         cfg.apply(ConfigPatch {
-            dictionary: Some(vec!["nox-voice".into(), "塩谷,しおや".into()]),
+            dictionary: Some(vec![
+                DictionaryEntry::new("nox-voice"),
+                DictionaryEntry {
+                    reading: Some("  しおや  ".into()),
+                    ..DictionaryEntry::new("塩谷")
+                },
+            ]),
             ..ConfigPatch::default()
         });
         let entries = cfg.dictionary_entries();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1].written, "塩谷");
+        // 読みも trim される (前後の空白は「読み無し」との差にならない)。
         assert_eq!(entries[1].reading.as_deref(), Some("しおや"));
     }
 

@@ -2641,6 +2641,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "whisper-rs",
  "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
