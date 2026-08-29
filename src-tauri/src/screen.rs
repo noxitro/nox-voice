@@ -308,7 +308,7 @@ pub fn scan_decision(candidate: &WindowCandidate, own_process_id: u32) -> ScanDe
 pub fn is_usable_text(text: &str, route: ContextSource) -> bool {
     if !matches!(
         route,
-        ContextSource::TextPattern | ContextSource::ValuePattern
+        ContextSource::TextPattern | ContextSource::ValuePattern | ContextSource::Legacy
     ) {
         return false;
     }
@@ -803,6 +803,9 @@ mod tests {
         let body = "あ".repeat(MIN_USABLE_CHARS);
         assert!(is_usable_text(&body, ContextSource::TextPattern));
         assert!(is_usable_text(&body, ContextSource::ValuePattern));
+        // MSAA 経由も本文。ここを外すと、UIA ネイティブが無いアプリだけが
+        // 「読めなかった」ことになってスクリーンショット送りになる。
+        assert!(is_usable_text(&body, ContextSource::Legacy));
     }
 
     #[test]

@@ -561,8 +561,11 @@ fn read_one(element: &IUIAutomationElement) -> (String, ContextSource) {
 /// 経路の望ましさ。大きいほど本文に近い。
 fn route_rank(source: ContextSource) -> u8 {
     match source {
-        ContextSource::TextPattern => 3,
-        ContextSource::ValuePattern => 2,
+        ContextSource::TextPattern => 4,
+        ContextSource::ValuePattern => 3,
+        // MSAA 経由。UIA ネイティブの 2 経路が両方 0 を返す相手向けの保険で、
+        // 返るのは本文なので `ElementName` (ラベル) より上に置く。
+        ContextSource::Legacy => 2,
         ContextSource::ElementName => 1,
         _ => 0,
     }

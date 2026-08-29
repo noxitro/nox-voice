@@ -31,6 +31,15 @@
 //! いまは [`select_dictionary_terms`] が**優先度で枠を配分**し、
 //! 溢れた語は [`DictionaryStatus`] として設定画面に出す (黙って捨てない)。
 //!
+//! # 自動追加語との同居 (2026-08-30)
+//!
+//! [`crate::learn`] が貼付後の手直しから語を勝手に足す。同じ枠を
+//! 奪い合わせると、**ユーザーが自分で登録した語が黙って押し出される** —
+//! しかもユーザーは何もしていないので理由を知りようがない。
+//! そこで [`rank_key`] が「手動 > 自動」を★の次の順位に置き、
+//! 自動追加語は**余った枠だけ**を使う。件数自体も
+//! [`DICTIONARY_AUTO_MAX_ENTRIES`] で頭打ちにする。
+//!
 //! **枠が余っても語を増やせばよいわけではない。** 語を入れすぎると
 //! 句読点・言語の自動判定・整形全体が引きずられる (superwhisper の
 //! 公式ガイダンス、CB-Whisper 論文の MER 悪化)。実効レンジは 20〜50 語で、
@@ -63,17 +72,30 @@ pub const DICTIONARY_PROMPT_MAX_CHARS: usize = 140;
 /// 入れすぎること自体が転写を悪くする** (モジュール doc)。
 pub const DICTIONARY_MAX_TERMS: usize = 36;
 
+/// 自動追加された語を辞書に何件まで溜めるか。
+///
+/// **`prompt` の枠 ([`DICTIONARY_MAX_TERMS`]) とは別の話**。こちらは
+/// 「設定ファイルと設定画面の一覧が無限に伸びない」ための上限で、
+/// 溢れたら**古い自動追加語から捨てる** ([`merge_auto_entries`])。
+///
+/// 枠より大きくしてあるのは、載らなかった語にも意味があるため —
+/// ユーザーが★を付ければ即座に載るし、「自動追加」の一覧は
+/// 「アプリが何を学んだか」を確かめる場所でもある。
+/// 手動登録語はここで数えないし、捨てもしない。
+pub const DICTIONARY_AUTO_MAX_ENTRIES: usize = 60;
+
 /// 辞書 1 語がどこから来たか。
 ///
-/// いまは手動しか作れないが、**後続で「候補からの登録」を足すことが
-/// 決まっている**ので先に器を持つ。移行を 2 回やらないため。
+/// **出所は表示のためだけのものではない。** [`rank_key`] が枠の配分で
+/// 手動登録語を自動追加語より上に置くので、ここを取り違えると
+/// 「勝手に覚えた語がユーザーの登録した語を押し出す」が起きる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DictionaryOrigin {
     /// ユーザーが自分で登録した。
     #[default]
     Manual,
-    /// アプリが候補として足した (履歴の頻出語など)。
+    /// アプリが自動で覚えた ([`crate::learn`] — 貼付後の手直しから抽出)。
     Auto,
 }
 
@@ -261,19 +283,119 @@ impl DictionaryStatus {
 
 /// 選抜の順位。**大きいほど残る**。
 ///
-/// 要素は 3 つだけにしてある:
+/// 要素は 4 つだけにしてある:
 ///
-/// 1. `pinned` — ユーザーが手で決めた優先度。他の何にも負けない
-/// 2. `added_at_ms` — **新しいほど強い**。使用頻度で並べると使用実績ゼロの
+/// 1. `pinned` — ユーザーが手で決めた優先度。他の何にも負けない。
+///    自動追加語に★を付ければ手動登録語より上に来る (**それでよい** —
+///    ★はユーザーの明示の操作で、出所より新しい意思表示だから)
+/// 2. **手動登録か** — 自動追加語は手動登録語を**決して押し出さない**。
+///    自動学習 ([`crate::learn`]) は黙って語を増やすので、ここを入れないと
+///    「1 日使ったら自分で登録した語が全部枠外になっていた」が起きる。
+///    これは「黙って捨てる」の最悪の形 — ユーザーは自分が何もしていない
+///    のに辞書が効かなくなった理由を知りようがない
+/// 3. `added_at_ms` — **新しいほど強い**。使用頻度で並べると使用実績ゼロの
 ///    新規登録語が真っ先に溢れるが、それは本末転倒 (フィールドの doc)
-/// 3. 登録順の添字 — 同着の解決。日時が 0 (不明) の旧形式が横並びに
+/// 4. 登録順の添字 — 同着の解決。日時が 0 (不明) の旧形式が横並びに
 ///    なったとき、**後から書いた行ほど新しい**とみなす
 ///
 /// 「直近の使用頻度」は**入れていない**。履歴を語で走査するにせよ
-/// カウンタを足すにせよ、上の 2 つで足りない証拠が出るまでは
+/// カウンタを足すにせよ、上の要素で足りない証拠が出るまでは
 /// 履歴スキーマを増やす理由が無い (design.md 2026-08-30)。
-fn rank_key(index: usize, entry: &DictionaryEntry) -> (u8, i64, usize) {
-    (u8::from(entry.pinned), entry.added_at_ms, index)
+fn rank_key(index: usize, entry: &DictionaryEntry) -> (u8, u8, i64, usize) {
+    (
+        u8::from(entry.pinned),
+        u8::from(entry.origin == DictionaryOrigin::Manual),
+        entry.added_at_ms,
+        index,
+    )
+}
+
+/// 自動学習で得た語を既存の辞書へ足す。**純関数に近い手続き** (時刻だけ外から)。
+///
+/// ここが「勝手に増える」を抑える唯一の場所なので、判断を全部集めてある:
+///
+/// - **既にある表記は足さない。** 手動・自動どちらの重複も見る。
+///   同じ誤変換を何度直しても行が増えないようにするため
+/// - 比較は `trim` + ASCII の大文字小文字を無視。`Nox-Voice` と `nox-voice`
+///   を別の語として 2 行持つ意味は無い
+/// - 表記が空の語は無視する ([`Config::normalize`](crate::config::Config::normalize)
+///   がどのみち捨てるが、捨てた語を「追加した」と報告してしまうのを防ぐ)
+/// - **自動追加語が [`DICTIONARY_AUTO_MAX_ENTRIES`] を超えたら古い方から捨てる。**
+///   捨てるのは**自動追加語だけ**で、手動登録語には指一本触れない
+///
+/// 戻り値は**実際に足した語**。呼び出し側 (UI への通知・ログ) は
+/// これを見る。「追加しようとした語」を報告すると、重複で足されなかった
+/// ときに UI が嘘をつく。
+pub fn merge_auto_entries(
+    entries: &mut Vec<DictionaryEntry>,
+    terms: &[(String, Option<String>)],
+    now_ms: i64,
+) -> Vec<DictionaryEntry> {
+    let mut added: Vec<DictionaryEntry> = Vec::new();
+    for (written, reading) in terms {
+        let written = written.trim();
+        if written.is_empty() {
+            continue;
+        }
+        let exists = entries
+            .iter()
+            .chain(added.iter())
+            .any(|e| e.written.trim().eq_ignore_ascii_case(written));
+        if exists {
+            continue;
+        }
+        added.push(DictionaryEntry {
+            written: written.to_string(),
+            reading: reading
+                .as_deref()
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+                .map(str::to_string),
+            pinned: false,
+            added_at_ms: now_ms,
+            origin: DictionaryOrigin::Auto,
+        });
+    }
+    entries.extend(added.iter().cloned());
+    evict_old_auto_entries(entries);
+    added
+}
+
+/// 自動追加語が上限を超えたぶんを古い方から落とす。**手動登録語は触らない**。
+///
+/// # ★ を付けた自動追加語は上限より優先する
+///
+/// 捨てる候補から★を外してあるので、**自動追加語を 60 件すべて★にすると
+/// 件数は上限を超えて伸びる**。これは意図した挙動。★は「この語は残す」と
+/// ユーザーが手で言ったことであり、内部の都合 (一覧が伸びない) のために
+/// それを黙って消すのは、この機能全体で避けている「無言で捨てる」そのもの。
+/// 上限は**アプリが勝手に増やしたぶん**を抑えるためのものなので、
+/// ユーザーが明示的に残した語には効かせない。
+fn evict_old_auto_entries(entries: &mut Vec<DictionaryEntry>) {
+    let auto_count = entries
+        .iter()
+        .filter(|e| e.origin == DictionaryOrigin::Auto)
+        .count();
+    let Some(excess) = auto_count.checked_sub(DICTIONARY_AUTO_MAX_ENTRIES) else {
+        return;
+    };
+    if excess == 0 {
+        return;
+    }
+    // 古い順 = (日時, 登録順) の小さい方から。★が付いた語は
+    // ユーザーが明示的に残したいと言った語なので、捨てる対象から外す。
+    let mut victims: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.origin == DictionaryOrigin::Auto && !e.pinned)
+        .map(|(i, _)| i)
+        .collect();
+    victims.sort_by_key(|&i| (entries[i].added_at_ms, i));
+    victims.truncate(excess);
+    victims.sort_unstable();
+    for &i in victims.iter().rev() {
+        entries.remove(i);
+    }
 }
 
 /// `prompt` へ載せる語を優先度で選ぶ。**純関数**。
@@ -662,6 +784,155 @@ mod tests {
         assert!(status.used_terms < entries.len(), "溢れが出ていない");
         // 空の行は載らない。
         assert!(!status.in_prompt[entries.len() - 1]);
+    }
+
+    // --- 自動追加語と手動登録語の同居 ---
+
+    /// 日時と出所を明示して 1 語作る。
+    fn auto(written: &str, added_at_ms: i64) -> DictionaryEntry {
+        DictionaryEntry {
+            added_at_ms,
+            origin: DictionaryOrigin::Auto,
+            ..DictionaryEntry::new(written)
+        }
+    }
+
+    #[test]
+    fn auto_terms_never_push_out_a_manual_one() {
+        // 自動学習は黙って語を増やす。ここが効いていないと、
+        // 使えば使うほどユーザー自身の登録語が枠外へ落ちていく。
+        let mut entries: Vec<DictionaryEntry> = (0..DICTIONARY_MAX_TERMS + 20)
+            .map(|i| auto(&format!("自動語{i:03}"), 9_000 + i as i64))
+            .collect();
+        // 一番古い手動語。日時では自動語すべてに負けている。
+        entries.push(entry("手で登録した語", false, 1));
+        let selection = select_dictionary_terms(&entries);
+        assert!(
+            selection.kept.contains(&(entries.len() - 1)),
+            "手動登録語が自動追加語に押し出された: {selection:?}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_auto_term_still_beats_an_unpinned_manual_one() {
+        // ★はユーザーの明示の操作なので、出所より新しい意思表示。
+        let mut entries: Vec<DictionaryEntry> = (0..DICTIONARY_MAX_TERMS)
+            .map(|i| entry(&format!("手動語{i:03}"), false, 5_000 + i as i64))
+            .collect();
+        entries.push(DictionaryEntry {
+            pinned: true,
+            ..auto("★を付けた自動語", 1)
+        });
+        let selection = select_dictionary_terms(&entries);
+        assert!(selection.kept.contains(&(entries.len() - 1)));
+    }
+
+    #[test]
+    fn among_auto_terms_the_newest_wins() {
+        // 手動が絡まないときの順位は従来どおり「新しいほど強い」。
+        let mut entries: Vec<DictionaryEntry> = (0..DICTIONARY_MAX_TERMS + 10)
+            .map(|i| auto(&format!("自動語{i:03}"), 1_000 + i as i64))
+            .collect();
+        entries.push(auto("今覚えた語", 9_999));
+        let selection = select_dictionary_terms(&entries);
+        assert!(selection.kept.contains(&(entries.len() - 1)));
+        assert!(selection.dropped.contains(&0));
+    }
+
+    // --- 自動追加語のマージ ---
+
+    #[test]
+    fn merging_adds_new_terms_as_auto() {
+        let mut entries = vec![DictionaryEntry::new("既存語")];
+        let added = merge_auto_entries(
+            &mut entries,
+            &[("塩谷".to_string(), Some("しおや".to_string()))],
+            1_700_000_000_000,
+        );
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].written, "塩谷");
+        assert_eq!(added[0].reading.as_deref(), Some("しおや"));
+        assert_eq!(added[0].origin, DictionaryOrigin::Auto);
+        assert_eq!(added[0].added_at_ms, 1_700_000_000_000);
+        assert!(!added[0].pinned);
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn merging_never_duplicates_an_existing_written_form() {
+        // 同じ誤変換を何度直しても行が増えてはいけない。
+        let mut entries = vec![DictionaryEntry::new("nox-voice")];
+        let added = merge_auto_entries(
+            &mut entries,
+            &[
+                ("nox-voice".to_string(), None),
+                // 大文字小文字だけの違いも同じ語とみなす。
+                ("NOX-Voice".to_string(), None),
+                // 同じ呼び出しの中の重複も潰す。
+                ("新語".to_string(), None),
+                ("  新語  ".to_string(), None),
+            ],
+            1,
+        );
+        let written: Vec<&str> = added.iter().map(|e| e.written.as_str()).collect();
+        assert_eq!(written, vec!["新語"]);
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn merging_skips_blank_written_forms() {
+        // normalize がどのみち捨てるが、「追加した」と報告してはいけない。
+        let mut entries = Vec::new();
+        let added = merge_auto_entries(&mut entries, &[("   ".to_string(), None)], 1);
+        assert!(added.is_empty());
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn an_empty_reading_becomes_none() {
+        let mut entries = Vec::new();
+        merge_auto_entries(&mut entries, &[("語".to_string(), Some("  ".into()))], 1);
+        assert_eq!(entries[0].reading, None);
+    }
+
+    #[test]
+    fn auto_terms_are_capped_by_dropping_the_oldest() {
+        let mut entries: Vec<DictionaryEntry> = (0..DICTIONARY_AUTO_MAX_ENTRIES)
+            .map(|i| auto(&format!("自動語{i:03}"), 1_000 + i as i64))
+            .collect();
+        merge_auto_entries(&mut entries, &[("新しい自動語".to_string(), None)], 9_999);
+        assert_eq!(entries.len(), DICTIONARY_AUTO_MAX_ENTRIES);
+        // 一番古い語が消え、新しい語が入っている。
+        assert!(!entries.iter().any(|e| e.written == "自動語000"));
+        assert!(entries.iter().any(|e| e.written == "新しい自動語"));
+    }
+
+    #[test]
+    fn the_cap_never_evicts_a_manual_or_pinned_term() {
+        // 上限は「自動追加語が無限に伸びない」ためのもの。ユーザーの
+        // 持ち物 (手動登録・★) を巻き添えにしたら本末転倒。
+        let mut entries = vec![
+            // 一番古い = 素直に数えれば真っ先に捨てられる位置。
+            entry("一番古い手動語", false, 1),
+            DictionaryEntry {
+                pinned: true,
+                ..auto("★を付けた自動語", 2)
+            },
+        ];
+        entries.extend(
+            (0..DICTIONARY_AUTO_MAX_ENTRIES).map(|i| auto(&format!("自動語{i:03}"), 1_000 + i as i64)),
+        );
+        merge_auto_entries(&mut entries, &[("さらに新しい語".to_string(), None)], 9_999);
+
+        assert!(entries.iter().any(|e| e.written == "一番古い手動語"));
+        assert!(entries.iter().any(|e| e.written == "★を付けた自動語"));
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.origin == DictionaryOrigin::Auto)
+                .count(),
+            DICTIONARY_AUTO_MAX_ENTRIES
+        );
     }
 
     // --- Whisper プロンプト ---

@@ -88,6 +88,9 @@
           formatting_enabled: true,
           injection_enabled: true,
           deep_context: false,
+          // 自動学習は**既定で有効**。deep context と逆なので、
+          // ここを false にすると「既定 ON」の検査ができなくなる。
+          auto_learn_dictionary: true,
           // 実 ConfigView にはあるがモックから抜けていた。Object.assign で初回保存時に
           // 勝手に生えるので今日は動くが、保存前に読むテストを書くと undefined になる。
           screen_ask_enabled: false,

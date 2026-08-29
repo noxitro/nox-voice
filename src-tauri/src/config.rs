@@ -256,6 +256,15 @@ pub struct Config {
     /// **既定は無効。** 有効にすると、挿入先の画面に表示されている文章が
     /// STT / 整形の API へ送られる (design.md R1)。UI でその旨を明示すること。
     pub deep_context: bool,
+    /// 貼り付けた後の手直しから辞書を自動学習するか ([`crate::learn`])。
+    ///
+    /// **既定は有効。** [`Self::deep_context`] が既定無効なのは
+    /// 「画面のテキストをクラウドへ送る」からで、こちらは送らない —
+    /// 読むのは**自分がたったいま貼り付けた欄だけ**、読んだ本文は
+    /// ローカルの差分計算にしか使わず、クラウドへ行くのは抽出された語が
+    /// 辞書に載ってからの話 (手動で登録した語と同じ扱い)。
+    /// 判断の根拠は design.md 2026-08-30。
+    pub auto_learn_dictionary: bool,
     /// 挿入先アプリごとの文体プロファイル。
     pub style_profiles: Vec<StyleProfile>,
     /// 取り込み済みの同梱既定の版 ([`crate::style::STYLE_DEFAULTS_VERSION`])。
@@ -334,6 +343,9 @@ impl Default for Config {
             overlay_enabled: true,
             // 画面テキストをクラウドへ送るので、明示的に有効化させる。
             deep_context: false,
+            // こちらは送らない (フィールドの doc)。既定で効かせないと
+            // 「直したのに毎回同じ誤変換が出る」が続くだけなので有効。
+            auto_learn_dictionary: true,
             style_profiles: crate::style::default_profiles(),
             // 既定値から作った設定は「現行版を取り込み済み」。ここを 0 に
             // すると、新規ユーザーの初回起動が旧形式移行の経路へ入る。
@@ -562,6 +574,9 @@ pub struct ConfigView {
     pub formatting_enabled: bool,
     pub injection_enabled: bool,
     pub deep_context: bool,
+    /// 貼付後の手直しから辞書を自動学習するか。**既定は有効**
+    /// ([`Config::auto_learn_dictionary`] の doc に理由)。
+    pub auto_learn_dictionary: bool,
     pub style_profiles: Vec<StyleProfile>,
     pub local_stt_mode: LocalSttMode,
     pub start_hidden: bool,
@@ -633,6 +648,7 @@ impl ConfigView {
             formatting_enabled: c.formatting_enabled,
             injection_enabled: c.injection_enabled,
             deep_context: c.deep_context,
+            auto_learn_dictionary: c.auto_learn_dictionary,
             style_profiles: c.style_profiles.clone(),
             local_stt_mode: c.local_stt_mode,
             start_hidden: c.start_hidden,
@@ -701,6 +717,7 @@ pub struct ConfigPatch {
     pub formatting_enabled: Option<bool>,
     pub injection_enabled: Option<bool>,
     pub deep_context: Option<bool>,
+    pub auto_learn_dictionary: Option<bool>,
     pub style_profiles: Option<Vec<StyleProfile>>,
     pub local_stt_mode: Option<LocalSttMode>,
     pub local_model_sha256: Option<String>,
@@ -755,6 +772,7 @@ impl fmt::Debug for ConfigPatch {
             .field("formatting_enabled", &self.formatting_enabled)
             .field("injection_enabled", &self.injection_enabled)
             .field("deep_context", &self.deep_context)
+            .field("auto_learn_dictionary", &self.auto_learn_dictionary)
             .field("local_stt_mode", &self.local_stt_mode)
             .field("start_hidden", &self.start_hidden)
             .field("hotkey_vk", &self.hotkey_vk)
@@ -1134,6 +1152,9 @@ impl Config {
         if let Some(v) = patch.deep_context {
             self.deep_context = v;
         }
+        if let Some(v) = patch.auto_learn_dictionary {
+            self.auto_learn_dictionary = v;
+        }
         if let Some(v) = patch.local_stt_mode {
             self.local_stt_mode = v;
         }
@@ -1323,6 +1344,41 @@ impl ConfigStore {
             .lock()
             .map(|c| c.clone())
             .unwrap_or_else(|e| e.into_inner().clone())
+    }
+
+    /// 自動学習で得た語を辞書へ足して保存する。**実際に足した語**を返す。
+    ///
+    /// # なぜ `update(ConfigPatch { dictionary: ... })` を使わないか
+    ///
+    /// パッチ経由だと「スナップショットを取る → 語を足す → 全置換で書く」に
+    /// なる。学習は裏のスレッドから来るので、その間に設定画面が保存すると
+    /// **どちらかの変更が丸ごと消える**。ここはロックを 1 回だけ取って
+    /// 読み書きを閉じ込める (読んでから書くまでの隙間を作らない)。
+    ///
+    /// 追加そのものの判断 (重複・上限・古い語の退避) は
+    /// [`crate::dictionary::merge_auto_entries`] に集めてある。
+    pub fn add_auto_dictionary_entries(
+        &self,
+        terms: &[(String, Option<String>)],
+    ) -> Result<Vec<DictionaryEntry>, String> {
+        let (added, updated) = {
+            let mut guard = self
+                .config
+                .lock()
+                .map_err(|_| "設定のロックが毒化しました".to_string())?;
+            let now = now_ms();
+            let added = crate::dictionary::merge_auto_entries(&mut guard.dictionary, terms, now);
+            if added.is_empty() {
+                // 1 語も増えないなら書き込みもしない。**保存のたびに
+                // ファイルを触ると、設定画面の「保存しました」と競合する。**
+                return Ok(Vec::new());
+            }
+            // 追加日時の補完や trim をここで書き直さない (不変条件は 1 か所)。
+            guard.normalize();
+            (added, guard.clone())
+        };
+        save(&self.path, &updated)?;
+        Ok(added)
     }
 
     /// パッチを適用して保存する。
@@ -1955,6 +2011,69 @@ mod tests {
     fn local_off_mode_never_uses_local() {
         assert!(LocalSttMode::Off.uses_cloud());
         assert!(!LocalSttMode::Off.allows_local());
+    }
+
+    #[test]
+    fn auto_learning_is_on_by_default_unlike_deep_context() {
+        // 対になる 2 つ。**違いはクラウドへ送るかどうか**で、
+        // 自動学習は送らないので既定で効かせる (design.md 2026-08-30)。
+        let cfg = Config::default();
+        assert!(cfg.auto_learn_dictionary);
+        assert!(!cfg.deep_context);
+    }
+
+    #[test]
+    fn an_older_config_file_gets_auto_learning_enabled() {
+        // 項目が無い設定ファイル (この機能より前に書かれたもの) は
+        // コンテナ既定を拾う。ここが false に化けると、既存ユーザーだけ
+        // 永久に機能が届かない。
+        let cfg: Config = serde_json::from_str(r#"{"language":"ja"}"#).expect("読める");
+        assert!(cfg.auto_learn_dictionary);
+    }
+
+    #[test]
+    fn auto_learning_can_be_turned_off_through_a_patch() {
+        let mut cfg = Config::default();
+        cfg.apply(ConfigPatch {
+            auto_learn_dictionary: Some(false),
+            ..ConfigPatch::default()
+        });
+        assert!(!cfg.auto_learn_dictionary);
+    }
+
+    #[test]
+    fn learned_terms_are_stored_and_survive_a_reload() {
+        let dir = std::env::temp_dir().join(format!("nox-config-learn-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let _ = fs::remove_dir_all(&dir);
+        let store = ConfigStore::load(path.clone());
+        store
+            .update(ConfigPatch {
+                dictionary: Some(vec![DictionaryEntry::new("手で登録した語")]),
+                ..ConfigPatch::default()
+            })
+            .expect("保存できる");
+
+        let added = store
+            .add_auto_dictionary_entries(&[("塩谷".to_string(), Some("しおや".to_string()))])
+            .expect("保存できる");
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].origin, crate::dictionary::DictionaryOrigin::Auto);
+        // 追加日時が入っていないと、選抜で永久に最下位のままになる。
+        assert!(added[0].added_at_ms > 0);
+
+        let reloaded = ConfigStore::load(path.clone()).snapshot();
+        let written: Vec<&str> = reloaded.dictionary.iter().map(|e| e.written.as_str()).collect();
+        assert_eq!(written, vec!["手で登録した語", "塩谷"]);
+        assert_eq!(reloaded.dictionary[1].reading.as_deref(), Some("しおや"));
+
+        // 2 度目は何も増えない = 何度直しても行が増えない。
+        let again = store
+            .add_auto_dictionary_entries(&[("塩谷".to_string(), None)])
+            .expect("成功する");
+        assert!(again.is_empty());
+        assert_eq!(ConfigStore::load(path).snapshot().dictionary.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

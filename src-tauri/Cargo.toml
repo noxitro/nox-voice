@@ -27,6 +27,12 @@ log = "0.4"
 crossbeam-channel = "0.5"
 cpal = "0.18"
 hound = "3.5"
+# `#[implement]` マクロが生成するコードは `::windows_core::` を絶対パスで
+# 参照する。`windows` 経由の再エクスポートでは届かないので直接の依存を持つ。
+# バージョンは `windows` 0.62 が使っているものと同一 (lock で共有される)。
+# 辞書の自動学習 (learn.rs) が UIA のイベントハンドラを実装するため、
+# **本番ビルドにも要る** (かつては uia_spike 用に dev-dependencies だけだった)。
+windows-core = "0.62"
 # 本アプリは Windows 11 専用(WH_KEYBOARD_LL / 前景 HWND 取得に依存)。
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -74,13 +80,6 @@ default = []
 #
 #   cargo build --features local-stt
 local-stt = ["dep:whisper-rs"]
-
-[dev-dependencies]
-# 技術検証スパイク (src/uia_spike.rs, テスト専用) の `#[implement]` マクロが
-# 生成するコードは `::windows_core::` を絶対パスで参照する。`windows` 経由の
-# 再エクスポートでは届かないので、**テストビルドにだけ** 直接の依存を足す。
-# バージョンは `windows` 0.62 が使っているものと同一 (lock で共有される)。
-windows-core = "0.62"
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = "2.4.3"

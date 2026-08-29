@@ -1158,6 +1158,87 @@ async function main() {
     };
   });
 
+  // --- U14f: 自動学習のトグルは既定 ON で、保存パッチへ載る
+  await check("U14f 自動学習は既定 ON で、切り替えが保存パッチに載る", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      document.querySelector('.nav-item[data-section="dictionary"]').click();
+      await new Promise((r) => setTimeout(r, 40));
+      const box = document.getElementById("auto-learn");
+      const initial = box.checked;
+      const hint = document.getElementById("auto-learn-hint").textContent;
+      box.checked = false;
+      window.__NOX_MOCK__.lastPatch = null;
+      document.getElementById("settings-form").requestSubmit();
+      await new Promise((r) => setTimeout(r, 250));
+      return {
+        initial,
+        hint,
+        sent: window.__NOX_MOCK__.lastPatch?.auto_learn_dictionary,
+      };
+    `);
+    return {
+      // 既定 ON であることと、文面が**両方向とも**正確であること。
+      // 「読んだ文章は送らない」だけだと片手落ちで、**覚えた語は
+      // 辞書として送られる**。そこを書かないのはフェアではない。
+      ok:
+        r.initial === true &&
+        r.sent === false &&
+        /クラウドへは送りません/.test(r.hint) &&
+        /パスワード欄は読み取りません/.test(r.hint) &&
+        /覚えた語は\s*他の辞書語と同じく音声認識・整形へ渡されます/.test(r.hint),
+      detail: JSON.stringify(r),
+    };
+  });
+
+  // --- U14g: 学習した語は一覧へ足される (再描画しない)
+  await check("U14g 学習した語が一覧へ足され、編集中の行を巻き戻さない", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      document.querySelector('.nav-item[data-section="dictionary"]').click();
+      await new Promise((r) => setTimeout(r, 40));
+      // 編集中の行を作る。ここが巻き戻ると、打ちかけの文字が消える。
+      const editing = document.querySelectorAll("#dict-list .dict-row")[0];
+      editing.querySelector(".dict-written").value = "打ちかけの語";
+      const before = document.querySelectorAll("#dict-list .dict-row").length;
+      window.__NOX_MOCK__.emit("nox://dictionary-learned", [
+        { written: "日比谷公園", reading: "ひびやこうえん", pinned: false,
+          added_at_ms: 1700000009000, origin: "auto" },
+        // 既にある表記は足さない (同じ語が 2 行に見えないこと)。
+        { written: "自動候補", reading: null, pinned: false,
+          added_at_ms: 1700000009000, origin: "auto" },
+      ]);
+      await new Promise((r) => setTimeout(r, 60));
+      const rows = [...document.querySelectorAll("#dict-list .dict-row")];
+      const added = rows[rows.length - 1];
+      // 「自動追加」で絞り込んだときに出ること = 出所が正しく付いている。
+      const filter = document.getElementById("dict-filter");
+      filter.value = "auto";
+      filter.dispatchEvent(new Event("change"));
+      return {
+        before,
+        after: rows.length,
+        stillEditing: editing.querySelector(".dict-written").value,
+        written: added.querySelector(".dict-written").value,
+        reading: added.querySelector(".dict-reading").value,
+        badge: added.querySelector(".dict-origin").textContent,
+        autoVisible: [...document.querySelectorAll("#dict-list .dict-row")]
+          .filter((r) => !r.hidden).length,
+      };
+    `);
+    return {
+      ok:
+        r.before === 3 &&
+        r.after === 4 &&
+        r.stillEditing === "打ちかけの語" &&
+        r.written === "日比谷公園" &&
+        r.reading === "ひびやこうえん" &&
+        r.badge === "自動追加" &&
+        r.autoVisible === 2,
+      detail: JSON.stringify(r),
+    };
+  });
+
   // --- U11: 狭い窓でも横あふれが無く、レール下端の状態カードが見える
   for (const [w, h] of [
     [420, 420],

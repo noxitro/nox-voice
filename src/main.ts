@@ -169,6 +169,8 @@ interface ConfigView {
   formatting_enabled: boolean;
   injection_enabled: boolean;
   deep_context: boolean;
+  /** 貼付後の直しから語を自動で覚えるか。**既定は有効** (deep context とは別物)。 */
+  auto_learn_dictionary: boolean;
   style_profiles: StyleProfile[];
   local_stt_mode: "off" | "fallback" | "only";
   start_hidden: boolean;
@@ -661,6 +663,8 @@ function renderConfig(view: ConfigView) {
   renderDictionary(view.dictionary, view.dictionary_status);
   const deepContext = el<HTMLInputElement>("deep-context");
   if (deepContext) deepContext.checked = view.deep_context;
+  const autoLearn = el<HTMLInputElement>("auto-learn");
+  if (autoLearn) autoLearn.checked = view.auto_learn_dictionary;
   const overlayEnabled = el<HTMLInputElement>("overlay-enabled");
   if (overlayEnabled) overlayEnabled.checked = view.overlay_enabled;
   const startHidden = el<HTMLInputElement>("start-hidden");
@@ -917,6 +921,34 @@ async function refreshDictionaryStatus() {
   }, 200);
 }
 
+/**
+ * 自動学習が覚えた語を一覧へ足す。
+ *
+ * **再描画してはいけない。** 一覧を作り直すと、いま編集中の行が
+ * 巻き戻る (DOM が唯一の状態なので、打ちかけの文字はどこにも残っていない)。
+ * 逆に何もしないと、**設定画面を開いたまま覚えた語が次の保存で消える** —
+ * 保存は一覧を全置換で送るので、画面に無い行は「削除された」ことになる。
+ * 足すだけが正解。
+ */
+function appendLearnedDictRows(entries: DictionaryEntry[]) {
+  const list = el("dict-list");
+  if (!list || entries.length === 0) return;
+  const known = new Set(
+    [...list.querySelectorAll<HTMLInputElement>(".dict-written")].map((i) =>
+      i.value.trim().toLowerCase(),
+    ),
+  );
+  for (const entry of entries) {
+    // Rust 側も重複を弾くが、画面には「保存していない手入力の行」がある。
+    // それと同じ表記が来たら足さない (同じ語が 2 行に見えるのを防ぐ)。
+    if (known.has(entry.written.trim().toLowerCase())) continue;
+    known.add(entry.written.trim().toLowerCase());
+    list.append(dictRow(entry, true));
+  }
+  applyDictFilter();
+  void refreshDictionaryStatus();
+}
+
 /** 語を足して、その場で編集できるようにする。 */
 function addDictRow() {
   const list = el("dict-list");
@@ -1152,6 +1184,7 @@ async function saveSettings(event: Event) {
   const historyEnabled = el<HTMLInputElement>("history-enabled");
   const retention = el<HTMLInputElement>("history-retention");
   const deepContext = el<HTMLInputElement>("deep-context");
+  const autoLearn = el<HTMLInputElement>("auto-learn");
   const screenAsk = el<HTMLInputElement>("screen-ask-enabled");
   const overlayEnabled = el<HTMLInputElement>("overlay-enabled");
   const startHidden = el<HTMLInputElement>("start-hidden");
@@ -1179,6 +1212,9 @@ async function saveSettings(event: Event) {
     injection_enabled: injection?.checked ?? true,
     history_enabled: historyEnabled?.checked ?? true,
     deep_context: deepContext?.checked ?? false,
+    // 既定は有効。要素が見つからないときに false を送ると、
+    // **UI の事故で機能が黙って切れる**ので true 側へ倒す。
+    auto_learn_dictionary: autoLearn?.checked ?? true,
     // 有効化のトグルは設定フォームにあるが、キーの割り当ては捕獲 UI が
     // 直接保存する。どちらか片方だけでは動かない (Rust 側 `Config` の doc)。
     screen_ask_enabled: screenAsk?.checked ?? false,
@@ -2151,6 +2187,12 @@ window.addEventListener("DOMContentLoaded", async () => {
     void loadDashboardStats();
   });
   await listen<number>("nox://level", (event) => renderLevel(event.payload));
+
+  // 自動学習が語を覚えた。**通知は出さない** — 成功は静かに、が原則
+  // (design.md 2026-08-30)。設定画面が開いているときだけ、一覧へ行を足す。
+  await listen<DictionaryEntry[]>("nox://dictionary-learned", (event) =>
+    appendLearnedDictRows(event.payload ?? []),
+  );
 
   await listen<HotkeyCaptured | null>("nox://hotkey-captured", (event) => {
     const payload = event.payload;

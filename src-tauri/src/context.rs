@@ -33,8 +33,9 @@ use windows::Win32::System::Com::{
     COINIT_MULTITHREADED,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTextPattern,
-    IUIAutomationValuePattern, UIA_TextPatternId, UIA_ValuePatternId,
+    CUIAutomation, IUIAutomation, IUIAutomationElement,
+    IUIAutomationLegacyIAccessiblePattern, IUIAutomationTextPattern, IUIAutomationValuePattern,
+    UIA_LegacyIAccessiblePatternId, UIA_TextPatternId, UIA_ValuePatternId,
 };
 
 /// 取得を見切る時間。これを超えたら空のコンテキストで続行する。
@@ -64,6 +65,13 @@ pub enum ContextSource {
     TextPattern,
     /// `ValuePattern` から取れた (単純なテキストボックス)。
     ValuePattern,
+    /// `LegacyIAccessible` (MSAA) から取れた。
+    ///
+    /// **UIA ネイティブの 2 経路が両方 0 を返す相手が実在する**ので必要。
+    /// スパイクの実測 (2026-08-30): VSCode の `native-edit-context` は
+    /// Text=68 / Value=0、Typeless.exe は Text=0 / Value=105。
+    /// 片方だけ見ていると、相手によって「読めない」が起きる。
+    Legacy,
     /// 要素名しか取れなかった。
     ElementName,
     /// フォーカス要素がパスワード欄だったので読まなかった。
@@ -80,6 +88,7 @@ impl ContextSource {
             ContextSource::Disabled => "無効",
             ContextSource::TextPattern => "TextPattern",
             ContextSource::ValuePattern => "ValuePattern",
+            ContextSource::Legacy => "LegacyIAccessible",
             ContextSource::ElementName => "要素名",
             ContextSource::PasswordSkipped => "パスワード欄のためスキップ",
             ContextSource::TimedOut => "タイムアウト",
@@ -238,16 +247,10 @@ pub(crate) fn must_not_read(element: &IUIAutomationElement) -> bool {
 /// 通せるよう切り出してある。**読み方を 2 か所に書かない**
 /// (design.md「同じ判断を 2 箇所で書いたら、片方は必ず更新から取り残される」)。
 pub(crate) fn read_element(element: &IUIAutomationElement) -> ScreenContext {
-    if let Some(text) = text_from_text_pattern(element) {
+    if let Some((text, source)) = read_body(element, MAX_CONTEXT_CHARS) {
         return ScreenContext {
             text: trim_context(&text),
-            source: ContextSource::TextPattern,
-        };
-    }
-    if let Some(text) = text_from_value_pattern(element) {
-        return ScreenContext {
-            text: trim_context(&text),
-            source: ContextSource::ValuePattern,
+            source,
         };
     }
     if let Some(text) = text_from_name(element) {
@@ -259,8 +262,39 @@ pub(crate) fn read_element(element: &IUIAutomationElement) -> ScreenContext {
     ScreenContext::empty(ContextSource::Unavailable)
 }
 
+/// **本文の経路だけ**を上から順に試す (`Name` は含まない)。切り詰めもしない。
+///
+/// # `Name` を含めない理由
+///
+/// `Name` に返ってくるのは**ラベルであって内容ではない**。スパイクの実測
+/// (2026-08-30) では、空の Wikipedia 検索欄が Text=13 / Name=13 を返した —
+/// 中身は 0 文字なのに「13 文字読めた」ように見える。
+/// [`crate::learn`] はこの値を差分の基準にするので、ラベルが混ざると
+/// **「ユーザーが書き換えた」を毎回誤検知する**。読み取り経路を分ける
+/// のはそのため。deep context 側は最後の手段として `Name` も使うので、
+/// [`read_element`] がこの関数の外側でそれを足す。
+///
+/// `cap` は相手アプリに作らせる文字列の上限。**呼び出し側が用途に合わせて
+/// 決める** — 差分計算は文脈より長い本文を要る (途中で切ると、切れ目の
+/// あとを全部「消された」と読んでしまう)。
+pub(crate) fn read_body(
+    element: &IUIAutomationElement,
+    cap: usize,
+) -> Option<(String, ContextSource)> {
+    if let Some(text) = text_from_text_pattern(element, cap) {
+        return Some((text, ContextSource::TextPattern));
+    }
+    if let Some(text) = text_from_value_pattern(element) {
+        return Some((text, ContextSource::ValuePattern));
+    }
+    if let Some(text) = text_from_legacy(element) {
+        return Some((text, ContextSource::Legacy));
+    }
+    None
+}
+
 /// `TextPattern` から文書テキストを取る。エディタやブラウザの入力欄向け。
-fn text_from_text_pattern(element: &IUIAutomationElement) -> Option<String> {
+fn text_from_text_pattern(element: &IUIAutomationElement, cap: usize) -> Option<String> {
     // SAFETY: element は有効。パターン非対応なら Err か NULL。
     let pattern = unsafe { element.GetCurrentPattern(UIA_TextPatternId) }.ok()?;
     let pattern: IUIAutomationTextPattern = pattern.cast().ok()?;
@@ -269,7 +303,7 @@ fn text_from_text_pattern(element: &IUIAutomationElement) -> Option<String> {
     let range = unsafe { pattern.DocumentRange() }.ok()?;
     // GetText は上限を渡せる。相手に大量のテキストを作らせない。
     // SAFETY: range は有効。
-    let text = unsafe { range.GetText(MAX_CONTEXT_CHARS as i32) }.ok()?;
+    let text = unsafe { range.GetText(cap.min(i32::MAX as usize) as i32) }.ok()?;
 
     let text = text.to_string();
     (!text.trim().is_empty()).then_some(text)
@@ -280,6 +314,19 @@ fn text_from_value_pattern(element: &IUIAutomationElement) -> Option<String> {
     // SAFETY: element は有効。
     let pattern = unsafe { element.GetCurrentPattern(UIA_ValuePatternId) }.ok()?;
     let pattern: IUIAutomationValuePattern = pattern.cast().ok()?;
+    // SAFETY: pattern は有効。
+    let value = unsafe { pattern.CurrentValue() }.ok()?;
+    let value = value.to_string();
+    (!value.trim().is_empty()).then_some(value)
+}
+
+/// `LegacyIAccessible` (MSAA) の値を取る。UIA ネイティブが無い相手の保険。
+///
+/// **3 経路目を省いてはいけない** ([`ContextSource::Legacy`] の doc に実測)。
+fn text_from_legacy(element: &IUIAutomationElement) -> Option<String> {
+    // SAFETY: element は有効。
+    let pattern = unsafe { element.GetCurrentPattern(UIA_LegacyIAccessiblePatternId) }.ok()?;
+    let pattern: IUIAutomationLegacyIAccessiblePattern = pattern.cast().ok()?;
     // SAFETY: pattern は有効。
     let value = unsafe { pattern.CurrentValue() }.ok()?;
     let value = value.to_string();
@@ -378,6 +425,7 @@ mod tests {
             ContextSource::Disabled,
             ContextSource::TextPattern,
             ContextSource::ValuePattern,
+            ContextSource::Legacy,
             ContextSource::ElementName,
             ContextSource::PasswordSkipped,
             ContextSource::TimedOut,
@@ -499,8 +547,9 @@ mod tests {
     #[cfg(test)]
     fn rank(source: ContextSource) -> u8 {
         match source {
-            ContextSource::TextPattern => 3,
-            ContextSource::ValuePattern => 2,
+            ContextSource::TextPattern => 4,
+            ContextSource::ValuePattern => 3,
+            ContextSource::Legacy => 2,
             ContextSource::ElementName => 1,
             _ => 0,
         }

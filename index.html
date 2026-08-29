@@ -515,6 +515,22 @@
                 preview_dictionary_selection が返す)。
               -->
               <p class="hint" id="dict-budget" aria-live="polite">読み込み中…</p>
+              <!--
+                自動学習。**画面コンテキスト (deep context) とは別のもの**で、
+                こちらはクラウドへ送らないので既定で有効。その違いが伝わる
+                文面にしてある (docs/design.md 2026-08-30)。
+              -->
+              <label class="checkbox">
+                <input type="checkbox" id="auto-learn" />
+                <span>貼り付けた後の直しから語を自動で覚える</span>
+              </label>
+              <p class="hint" id="auto-learn-hint">
+                貼り付けた直後の入力欄だけを読み、<strong>自分が貼った範囲</strong>を
+                どう直したかを見ます。読んだ文章はこの PC の中の比較にしか使わず、
+                クラウドへは送りません。パスワード欄は読み取りません。<strong>覚えた語は
+                他の辞書語と同じく音声認識・整形へ渡されます</strong>(＝クラウドへ送られます)。
+                覚えた語は下の一覧に<strong>「自動追加」</strong>として並び、いつでも削除できます
+              </p>
               <div class="dict-toolbar">
                 <label class="field dict-filter">
                   <span>絞り込み</span>

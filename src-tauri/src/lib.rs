@@ -36,6 +36,7 @@ mod history;
 mod hotkey;
 mod inject;
 mod instance;
+mod learn;
 mod local_stt;
 mod overlay;
 mod pipeline;
@@ -1100,6 +1101,9 @@ pub fn run() {
         if let RunEvent::Exit = event {
             // レベル送出スレッドを畳む。
             stop_level_emitter(handle);
+            // 自動学習の見張りに手を引かせる。放っておくと UIA の購読を
+            // 握ったまま最大 90 秒残る (learn.rs の WATCH_MAX)。
+            learn::abandon_all();
             // 録音中の終了 (トレイの「終了」等) で音声を無警告に捨てない。
             finalize_on_exit(handle);
             // 後処理待ちのキューに残っている録音も同様に退避する。
@@ -1935,6 +1939,15 @@ fn transcribe_and_format(
 
             apply_injection(app, &cfg, recording, &mut payload);
             payload.total_ms = started.elapsed().as_millis() as u64;
+
+            // 貼り付いた欄をしばらく見張り、ユーザーが直したところを辞書へ
+            // 覚える (design.md 2026-08-30)。**貼り付いたときだけ**始める —
+            // クリップボードのみモードや貼付失敗では「自分が書いた欄」が
+            // 存在しないので、見張る対象そのものが無い。
+            // 呼び出し側はブロックしない (専用スレッドへ逃がす)。
+            if payload.injected {
+                learn::start_watch(app, cfg.auto_learn_dictionary, &payload.text);
+            }
 
             // 注入の結果を後から書き足す。
             if let Some(id) = history_id {
