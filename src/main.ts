@@ -509,6 +509,81 @@ function syncRestoreDelayEnabled() {
 }
 
 /**
+ * 単独で割り当てると **OS 側の意味**とぶつかる修飾キー (VK → 何が起きるか)。
+ *
+ * フックはキーを握り潰さない (右 Ctrl+C を壊さないための不変条件) ので、
+ * ホットキーの押下と離しは入力先アプリにもそのまま流れる。トリガーが
+ * これらのキーそのものだと、アプリから見れば「修飾キーを単独で叩いた」に
+ * なり、OS/アプリ側の意味が発火する — Alt はメニュー、Win はスタート。
+ *
+ * Ctrl / Shift を入れていないのは、**単独で叩いても何も起きないから**。
+ * 出す意味の無い注意を並べると、本当に効く注意まで読まれなくなる。
+ */
+const LONE_MODIFIER_MEANINGS: Record<number, string> = {
+  0x12: "メニューが開く", // VK_MENU
+  0xa4: "メニューが開く", // VK_LMENU
+  0xa5: "メニューが開く", // VK_RMENU
+  0x5b: "スタートメニューが開く", // VK_LWIN
+  0x5c: "スタートメニューが開く", // VK_RWIN
+};
+
+/**
+ * 修飾キー単独のホットキーに注意を出す。
+ *
+ * 2026-08-29 の不具合 (単独 Alt で Chrome がツールバーへフォーカスを移し、
+ * 貼り付け先の入力欄からキャレットが外れる) の再発防止。Rust 側に
+ * `break_lone_alt` (離しの辺でダミーキーを 1 打挟む) を入れてあるが、
+ * あれは**保険**であって、修飾キー単独が筋の良い選択になるわけではない:
+ * 押している間ずっと入力先アプリへ流れ続けるし、OS 側の意味も残る。
+ * 選ぶこと自体は禁止しない (ペダルを Alt に割り当てている人がいる) ので、
+ * 弾かずに**理由を添えて薦め直す**。
+ *
+ * 空文字を返さず `null` を返すのは、呼び出し側で「出す/出さない」を
+ * 素直に書けるようにするため。
+ */
+function loneModifierNote(vk: number, mods: number[], label: string): string | null {
+  // 修飾キーが 1 つでも付いていれば、その押下が Alt の間に入るので
+  // 「単独」ではない。トリガーが Alt そのもののときだけが対象。
+  if (mods.length > 0) return null;
+  const meaning = LONE_MODIFIER_MEANINGS[vk];
+  if (!meaning) return null;
+  return (
+    `単独の ${label} は OS 側で意味を持つキーです (押して離すだけで${meaning})。` +
+    "押している間ずっと入力先アプリへも流れるので、ブラウザでは離した瞬間に" +
+    "入力欄からフォーカスが外れることがあります。対策は入れてありますが、" +
+    "F13〜F15 のような、どのアプリにも割り当ての無いキーの方が確実です。"
+  );
+}
+
+/** 3 つの用途それぞれに [`loneModifierNote`] の結果を反映する。 */
+function syncLoneModifierWarnings(view: ConfigView) {
+  const targets: Array<{ id: string; vk: number; mods: number[]; label: string }> = [
+    { id: "hotkey", vk: view.hotkey_vk, mods: view.hotkey_mods, label: view.hotkey_label },
+    {
+      id: "clipboard-hotkey",
+      vk: view.clipboard_hotkey_vk,
+      mods: view.clipboard_hotkey_mods,
+      label: view.clipboard_hotkey_label,
+    },
+    {
+      id: "screen-ask-hotkey",
+      vk: view.screen_ask_hotkey_vk,
+      mods: view.screen_ask_hotkey_mods,
+      label: view.screen_ask_hotkey_label,
+    },
+  ];
+  for (const t of targets) {
+    const block = el<HTMLElement>(`${t.id}-lone-mod-warn`);
+    const text = el<HTMLElement>(`${t.id}-lone-mod-warn-text`);
+    if (!block || !text) continue;
+    // 未設定 (vk = 0) はラベルも空。注意の出しようがない。
+    const note = t.vk === 0 ? null : loneModifierNote(t.vk, t.mods, t.label);
+    text.textContent = note ?? "";
+    block.hidden = note === null;
+  }
+}
+
+/**
  * 画面質問モードの「今この機能は効くのか」を、ホットキー区画に出す。
  *
  * この機能は**有効化のトグル**と**キーの割り当て**の両方が揃わないと動かない。
@@ -607,6 +682,9 @@ function renderConfig(view: ConfigView) {
   const screenAskClear = el<HTMLButtonElement>("screen-ask-hotkey-clear");
   if (screenAskClear) screenAskClear.disabled = view.screen_ask_hotkey_vk === 0;
   syncScreenAskEnabled();
+  // 修飾キー単独の注意は、3 用途とも「今の割り当て」から出す。
+  // 捕獲直後も renderConfig を通るので、設定した瞬間に出る。
+  syncLoneModifierWarnings(view);
   const soundEnabled = el<HTMLInputElement>("sound-enabled");
   if (soundEnabled) soundEnabled.checked = view.sound_enabled;
   const soundVolume = el<HTMLInputElement>("sound-volume");

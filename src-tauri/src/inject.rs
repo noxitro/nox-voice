@@ -360,16 +360,23 @@ pub fn inject(text: &str, target: InjectTarget, policy: ClipboardPolicy) -> Inje
     }
 
     // --- クリップボードを開いて退避 + 設定 ---
+    //
+    // クリップボードの奪取も容疑者のひとつ (`OpenClipboard`/`EmptyClipboard` は
+    // 貼り先アプリへ通知を飛ばす)。区間を分けておかないと、フォーカスが
+    // 動いたときにクリップボードのせいか Ctrl+V のせいかを切り分けられない。
+    let clipboard_guard = crate::focus_probe::FocusGuard::begin("クリップボード設定");
     let prepared = match prepare_clipboard(text) {
         Ok(p) => p,
         Err(failure) => {
+            clipboard_guard.end();
             return InjectReport::aborted(
                 failure.outcome,
                 failure.clipboard_state,
                 failure.lost_formats,
-            )
+            );
         }
     };
+    clipboard_guard.end();
     let PreparedClipboard {
         backup,
         lost_formats,
@@ -423,10 +430,17 @@ pub fn inject(text: &str, target: InjectTarget, policy: ClipboardPolicy) -> Inje
     }
 
     // --- Ctrl+V 送出 ---
+    //
+    // 送出の前後も測る。R7 は「前景が同じ」までしか言えないので、
+    // 貼り先の**キャレット**が生きているかはここでしか見えない
+    // (`Injected` なのに何も入らない、の手がかりになる)。
+    let guard = crate::focus_probe::FocusGuard::begin("Ctrl+V 送出");
     if let Err(e) = send_ctrl_v() {
+        guard.end();
         log::error!("Ctrl+V の送出に失敗しました: {e}");
         return InjectReport::aborted(InjectOutcome::SendFailed, holding, lost_formats);
     }
+    guard.end();
     log::info!("Ctrl+V を送出しました ({} 文字)", text.chars().count());
 
     // --- 貼付後のクリップボード ---

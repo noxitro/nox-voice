@@ -11,13 +11,36 @@
 //! 取ると照合が外れて貼付が中止される。したがって:
 //!
 //! - `focusable(false)` — クリックしても入力フォーカスを取らない
+//! - `focused(false)` — **表示のたびに活性化しにいかない** (下記)
 //! - `set_ignore_cursor_events(true)` — クリックがそのまま下のアプリへ抜ける
 //!   (`WS_EX_TRANSPARENT` 相当)。オーバーレイの上でも普通に操作できる
 //! - 表示・非表示は `show()` / `hide()` のみで、`set_focus()` は呼ばない
 //!
-//! この 3 つが効いているので、`GetForegroundWindow` がオーバーレイを返すことは
+//! この 4 つが効いているので、`GetForegroundWindow` がオーバーレイを返すことは
 //! ない。**R7 の照合側にオーバーレイの除外処理は要らない** (除外リストを持つと、
 //! 「フォーカスを取らない」という不変条件が破れたことに気づけなくなる)。
+//!
+//! # `focusable(false)` だけでは足りなかった (2026-08-29)
+//!
+//! `focusable(false)` は `WS_EX_NOACTIVATE` を立てるだけで、**表示の動詞**は
+//! 変えない。tao は `focused` 属性が真のとき `ShowWindow(SW_SHOW)` を使う
+//! (`window_state.rs` の `apply_diff`)。`SW_SHOW` は「表示して活性化する」動詞
+//! なので、`WS_EX_NOACTIVATE` が前景の移動を止めても、**キーボードフォーカスの
+//! 移動までは止まらない**。
+//!
+//! Tauri の `WebviewWindowBuilder` は既定で `focused(true)` なので、
+//! 明示しない限りこちら側に倒れる。さらに wry は `focused` が真だと生成時に
+//! `ICoreWebView2Controller::MoveFocus` を呼び、親が `WM_SETFOCUS` を受けたら
+//! WebView2 へフォーカスを送るサブクラスも仕掛ける。
+//!
+//! 実害はブラウザにだけ出る。ネイティブアプリは再フォーカス時にキャレットを
+//! 復元するが、ブラウザは OS のフォーカスが一瞬でも外れると DOM の `blur` を
+//! 発火させ、戻ってきても contenteditable / textarea の選択位置を戻さない。
+//! 前景は動いていないので R7 の照合は通過し、ログ上は「貼付成功」に見えたまま
+//! **入力欄のカーソルだけが外れる**。
+//!
+//! `focused(false)` にすると tao は `SW_SHOWNOACTIVATE` を使い、この
+//! マーカーは消費されずに残るので**毎回の表示**に効く。
 //!
 //! # 録音開始を遅らせない
 //!
@@ -68,6 +91,12 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     .skip_taskbar(true)
     // フォーカスを奪わない。R7 の HWND 照合が壊れるため必須。
     .focusable(false)
+    // 表示を「活性化しない動詞」で行わせる (モジュール冒頭の注記参照)。
+    // これが無いと tao が `SW_SHOW` を使い、`WS_EX_NOACTIVATE` があっても
+    // キーボードフォーカスが動いて、ブラウザの入力欄からキャレットが外れる。
+    // wry がこの属性を見て WebView2 の `MoveFocus` も抑えるので、
+    // `focusable(false)` とは別に必要 (どちらか片方では足りない)。
+    .focused(false)
     .resizable(false)
     .shadow(false)
     .visible(false)
@@ -133,9 +162,14 @@ pub fn show(app: &AppHandle) {
     };
     // 位置は表示のたびに直す。モニタ構成が変わっていることがある。
     position_bottom_center(&window);
+    // 「小窓を出してもフォーカスは動かない」は設計上の約束なので、破れたら
+    // 既定のログレベルでも鳴らす (focus_probe)。ここを黙らせると、
+    // ブラウザだけで再発したときに前景照合を通過したまま見えなくなる。
+    let guard = crate::focus_probe::FocusGuard::begin("オーバーレイ表示");
     if let Err(e) = window.show() {
         log::warn!("オーバーレイを表示できません: {e}");
     }
+    guard.end();
 }
 
 /// 即座に隠す。
@@ -148,9 +182,13 @@ fn hide_now(app: &AppHandle) {
     let Some(window) = app.get_webview_window(WINDOW_LABEL) else {
         return;
     };
+    // 非表示側も測る。症状の申告は「録音終了時」なので、表示ではなく
+    // 畳むほうが犯人である可能性を最初から排除しないため。
+    let guard = crate::focus_probe::FocusGuard::begin("オーバーレイ非表示");
     if let Err(e) = window.hide() {
         log::warn!("オーバーレイを隠せません: {e}");
     }
+    guard.end();
 }
 
 /// `delay` 後に隠す。ただし**その間に表示が更新されたら何もしない**。

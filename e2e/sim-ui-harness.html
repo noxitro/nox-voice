@@ -91,6 +91,12 @@
           clipboard_hotkey_vk: 0,
           clipboard_hotkey_mods: [],
           clipboard_hotkey_label: "",
+          // ここも実 ConfigView にはあるがモックから抜けていた
+          // (screen_ask_enabled と同じ穴)。読むだけのコードが増えた瞬間に
+          // undefined を触って落ちるので、型どおり 3 つとも置く。
+          screen_ask_hotkey_vk: 0,
+          screen_ask_hotkey_mods: [],
+          screen_ask_hotkey_label: "",
           sound_enabled: true,
           sound_volume: 60,
           start_sound: "soft_pop",

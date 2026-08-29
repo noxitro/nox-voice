@@ -986,11 +986,144 @@ fn handle_key_event(message: u32, lparam: LPARAM) {
             }
         };
 
+        // トリガーが Alt そのものなら、**離しを観測した瞬間**にダミーキーを
+        // 1 打挟む。挟まないと、前景アプリが「Alt を単独で叩いた」と読み、
+        // ブラウザは入力欄からフォーカスを外す ([`break_lone_alt`] の doc)。
+        //
+        // **なぜ押下ではいけないか** (2026-08-29 に一度こう書いて外した):
+        // 低レベルフックは、そのキーが前景アプリのキューへ届く**前**に走る。
+        // 押下を観測した時点で `SendInput` すると、ダミーは Alt-down を
+        // **追い越して**先に並ぶ:
+        //     ダミー → Alt押下 → Alt解放   ＝ 依然として「単独 Alt」
+        // Alt の押下と離しの間には何も無いままなので、メニューは起動する。
+        // 離しの側で撒けば、フックは Alt-up がアプリへ届く前に走るので:
+        //     Alt押下 → ダミー → Alt解放   ＝ 単独ではない → 起動しない
+        //
+        // ここに置く (`send` の前) のは、チャネルが満杯でも撒くため。
+        // 「録音を取りこぼしたうえにフォーカスも失う」を作らない。
+        if is_up {
+            break_lone_alt(combo.vk);
+        }
+
         // 時刻はここで採る。デキュー時刻で判定すると、コントローラの詰まりが
         // そのまま「長押し」に化ける (HotkeyEvent の doc 参照)。
         send(HotkeyEvent::new(kind));
         // 1 回のキー入力で発火するのは 1 用途だけ。
         return;
+    }
+}
+
+/// 単独 Alt を崩すために撒いたダミーキーの累計 ([`break_lone_alt`])。
+///
+/// `dropped_events` と同じ「フックの外から観測できる数字」。E2E はこれで
+/// 「撒いたこと」を確かめる (フックからはログを出せないため)。
+static LONE_ALT_BREAKS: AtomicU64 = AtomicU64::new(0);
+
+/// [`LONE_ALT_BREAKS`] の現在値。
+pub fn lone_alt_breaks() -> u64 {
+    LONE_ALT_BREAKS.load(Ordering::Relaxed)
+}
+
+/// `vk` が Alt キーか (汎用・左・右)。
+///
+/// 純関数なのでテストできる。ここを間違えると、ダミーキーを撒きすぎるか
+/// (実害は無いが余計)、単独 Alt の取りこぼしになる。
+fn is_alt_key(vk: u32) -> bool {
+    // VK_MENU / VK_LMENU / VK_RMENU。
+    matches!(vk, 0x12 | 0xA4 | 0xA5)
+}
+
+/// トリガーが Alt 単独のとき、「Alt を単独で叩いた」状態を崩す。
+///
+/// # なぜ必要か (2026-08-29 の不具合)
+///
+/// フックはキーを**抑制しない**ので、ホットキーの押下と離しは前景アプリにも
+/// そのまま届く。トリガーが Alt そのもの (既定の右 Alt など) だと、前景アプリ
+/// から見た挙動は「Alt を押して、何も押さずに離した」— つまり Windows の
+/// メニュー起動そのものになる。Chromium はこれを
+/// **「ツールバーのメニューボタンへフォーカスを移す」**と解釈する
+/// (Chromium の Accessibility: Keyboard Access に明記されている)。
+///
+/// 結果として、PTT を離した瞬間 = 録音終了の瞬間に、**ページの入力欄から
+/// キャレットが外れる**。前景ウィンドウは Chrome のままなので R7 の照合は
+/// 通過し、ログ上は貼付成功に見えるのに、実際には貼り先を失っている。
+/// ネイティブアプリで報告が無かったのは、メニューを持たない Electron 製の
+/// アプリでは単独 Alt が何もしないから。
+///
+/// # 直し方
+///
+/// どのアプリにも意味を持たないダミーキー ([`HEARTBEAT_VK`] と同じ
+/// `VK_NONAME`) を 1 打挟む。Alt の押下と離しの間にキーが 1 つでも入れば、
+/// それはもう「単独の Alt」ではないので、メニューは起動しない。
+/// **キーを握り潰さない**という既存の不変条件を守ったまま直せるのが
+/// この手の利点 (抑制すると Alt+Tab などが壊れる)。
+///
+/// # 撒く辺は「離し」(2026-08-29 に押下側へ書いて外した)
+///
+/// 最初は Alt の**押下**を観測した瞬間に撒いた。効かなかった。低レベルフックは
+/// キーが前景アプリのキューへ届く**前**に走るので、押下時の `SendInput` は
+/// Alt-down を追い越して先に並ぶ:
+///
+/// ```text
+/// ダミー → Alt押下 → Alt解放     ＝ 押下と離しの間は空 = 単独 Alt
+/// ```
+///
+/// **離し**を観測した瞬間に撒けば、フックは Alt-up がアプリへ届く前に走るので
+/// 正しい順序になる:
+///
+/// ```text
+/// Alt押下 → ダミー → Alt解放     ＝ 単独ではない → メニューは起動しない
+/// ```
+///
+/// 「Alt を押し下げた状態で `VK_NONAME` が来る」= アプリから見れば
+/// `Alt+VK_NONAME` の打鍵で、どのアプリにも割り当ての無い組み合わせなので
+/// 副作用は無い (`VK_NONAME` を選んだ理由でもある)。
+///
+/// # フックの不変条件との折り合い
+///
+/// モジュール冒頭のとおり、コールバックでは確保・ロック・IO・panic が禁止。
+/// `SendInput` は 1 回の syscall で、確保もロックも取らず、ここでの入力は
+/// スタック上の固定長配列なので**この制約に触れない**。加えて呼ぶのは
+/// 「Alt 単独トリガーを離した瞬間」だけ = 1 録音につき 1 回で、
+/// キー入力ごとの経路には乗らない。
+/// (フックの中から `SendInput` を呼ぶこと自体は Windows が想定している。
+/// 自分で撒いた打鍵は `dwExtraInfo` のマーカーで捨てるので再帰もしない。)
+///
+/// `dwExtraInfo` に [`crate::inject::SELF_INJECTED_MARKER`] を載せるので、
+/// 自分のフックはこの打鍵を最初の分岐で捨てる (PTT の解釈には通らない)。
+///
+/// 数える ([`LONE_ALT_BREAKS`]) のは常に行うが、**打鍵はテストでは送らない**。
+/// `cargo test` が走っているマシンの前景アプリへキーを撒くわけにいかない。
+fn break_lone_alt(trigger_vk: u32) {
+    if !is_alt_key(trigger_vk) {
+        return;
+    }
+    // 数えるのは常に行う (atomic なのでフックの制約に触れない)。
+    // ログはここから出せない — フックでの IO は禁止なので、
+    // 出すのはコントローラ側 ([`lone_alt_breaks`] を読む人) の仕事。
+    LONE_ALT_BREAKS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(not(test))]
+    {
+        let make = |up: bool| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(HEARTBEAT_VK as u16),
+                    wScan: 0,
+                    dwFlags: if up {
+                        KEYEVENTF_KEYUP
+                    } else {
+                        KEYBD_EVENT_FLAGS(0)
+                    },
+                    time: 0,
+                    dwExtraInfo: crate::inject::SELF_INJECTED_MARKER,
+                },
+            },
+        };
+        let inputs = [make(false), make(true)];
+        // SAFETY: inputs は有効な INPUT 配列で、cbsize は正しい構造体サイズ。
+        // 失敗 (UIPI で弾かれる等) しても録音は続けるので戻り値は見ない。
+        let _ = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     }
 }
 
@@ -2205,6 +2338,125 @@ mod tests {
         );
 
         set_mode_hotkey(HotkeyMode::Inject, Some(HotkeyCombo::default()));
+    }
+
+    // --- 単独 Alt のメニュー起動をつぶす (2026-08-29) -------------------------
+    //
+    // 既定の右 Alt のように**トリガー自体が Alt**だと、離した瞬間に前景アプリが
+    // 「Alt を単独で叩いた」と読む。Chromium はそれをツールバーへのフォーカス
+    // 移動として扱うので、ブラウザの入力欄からキャレットが外れる
+    // ([`break_lone_alt`] の doc)。前景ウィンドウは変わらないため R7 では
+    // 検出できない = ここで固定しておかないと静かに再発する。
+
+    #[test]
+    fn only_alt_keys_need_the_lone_tap_broken() {
+        // 汎用・左・右の 3 つ。VK_CONTROL や VK_SHIFT を単独で叩いても
+        // メニューは開かないので、余計な打鍵を撒かない。
+        assert!(is_alt_key(0x12), "VK_MENU");
+        assert!(is_alt_key(0xA4), "VK_LMENU");
+        assert!(is_alt_key(0xA5), "VK_RMENU");
+        assert!(!is_alt_key(0xA2), "左 Ctrl まで対象にしている");
+        assert!(!is_alt_key(0xA0), "左 Shift まで対象にしている");
+        assert!(!is_alt_key(0x20), "Space まで対象にしている");
+        assert!(!is_alt_key(0x7C), "F13 まで対象にしている");
+    }
+
+    #[test]
+    fn an_alt_trigger_gets_a_dummy_keystroke_on_release_not_on_press() {
+        let _guard = hook_state_lock();
+        let rx = hook_events();
+        // 既定の設定と同じ「右 Alt 単独」。
+        set_mode_hotkey(HotkeyMode::Inject, HotkeyCombo::from_parts(&[], 0xA5));
+        drain(&rx);
+
+        let before = lone_alt_breaks();
+        feed_key(0xA5, WM_KEYDOWN);
+        assert_eq!(
+            rx.try_recv().map(|e| e.kind).ok(),
+            Some(HotkeyEventKind::Press { mode: HotkeyMode::Inject })
+        );
+        // **押下では撒かない**。ここが 2026-08-29 に一度間違えた辺:
+        // フックは前景アプリより先に走るので、押下時に撒いたダミーは
+        // Alt-down を追い越して並び、アプリから見た押下〜離しの間は
+        // 空のまま = 単独 Alt が崩れない ([`break_lone_alt`] の doc)。
+        assert_eq!(
+            lone_alt_breaks(),
+            before,
+            "押下で撒いている (ダミーが Alt-down を追い越すので効かない)"
+        );
+
+        // 離しを観測した瞬間に 1 打。フックは Alt-up がアプリへ届く前に
+        // 走るので、アプリから見た順序は Alt押下 → ダミー → Alt解放 になる。
+        feed_key(0xA5, WM_KEYUP);
+        assert_eq!(
+            rx.try_recv().map(|e| e.kind).ok(),
+            Some(HotkeyEventKind::Release { mode: HotkeyMode::Inject })
+        );
+        assert_eq!(
+            lone_alt_breaks(),
+            before + 1,
+            "右 Alt の離しでダミーキーが挟まれていない (Chrome のメニューがフォーカスを取る)"
+        );
+
+        set_mode_hotkey(HotkeyMode::Inject, Some(HotkeyCombo::default()));
+    }
+
+    #[test]
+    fn an_alt_trigger_breaks_once_per_press_not_per_autorepeat() {
+        let _guard = hook_state_lock();
+        let rx = hook_events();
+        set_mode_hotkey(HotkeyMode::Inject, HotkeyCombo::from_parts(&[], 0xA5));
+        drain(&rx);
+
+        let before = lone_alt_breaks();
+        // 長押しはオートリピートで押下が何度も来る。撒くのは離しの 1 回だけ。
+        feed_key(0xA5, WM_KEYDOWN);
+        feed_key(0xA5, WM_KEYDOWN);
+        feed_key(0xA5, WM_KEYDOWN);
+        assert_eq!(lone_alt_breaks(), before, "オートリピートのたびに撒いている");
+        feed_key(0xA5, WM_KEYUP);
+        assert_eq!(lone_alt_breaks(), before + 1, "離しで撒いた回数が 1 でない");
+
+        // 押していないのに離しだけ来ても撒かない (KEY_IS_DOWN が偽なら
+        // そもそもこのスロットの離しではない)。
+        feed_key(0xA5, WM_KEYUP);
+        assert_eq!(lone_alt_breaks(), before + 1, "押していない離しでも撒いている");
+
+        drain(&rx);
+        set_mode_hotkey(HotkeyMode::Inject, Some(HotkeyCombo::default()));
+    }
+
+    #[test]
+    fn a_non_alt_trigger_is_left_alone() {
+        let _guard = hook_state_lock();
+        let rx = hook_events();
+        // Ctrl+Space。Space の押下が Alt の間に入るわけでもなく、そもそも
+        // メニューを開かないので、ダミーキーは要らない。
+        set_mode_hotkey(HotkeyMode::Inject, Some(ctrl_space()));
+        drain(&rx);
+
+        let before = lone_alt_breaks();
+        feed_key(0xA2, WM_KEYDOWN);
+        feed_key(0x20, WM_KEYDOWN);
+        assert_eq!(
+            rx.try_recv().map(|e| e.kind).ok(),
+            Some(HotkeyEventKind::Press { mode: HotkeyMode::Inject })
+        );
+        assert_eq!(lone_alt_breaks(), before, "要らない打鍵を撒いている");
+
+        feed_key(0x20, WM_KEYUP);
+        feed_key(0xA2, WM_KEYUP);
+        // 撒く辺を離しへ移したので、離しの側でも念のため見る。
+        assert_eq!(lone_alt_breaks(), before, "離しで要らない打鍵を撒いている");
+        drain(&rx);
+        set_mode_hotkey(HotkeyMode::Inject, Some(HotkeyCombo::default()));
+    }
+
+    #[test]
+    fn the_dummy_key_is_the_same_no_op_the_watchdog_uses() {
+        // どのアプリにも意味を持たない VK_NONAME。ここを普通のキー
+        // (Ctrl など) に変えると、Alt と組んで AltGr になり文字が入る。
+        assert_eq!(HEARTBEAT_VK, 0xFC, "VK_NONAME でなくなっている");
     }
 
     // --- 用途ごとのホットキー --------------------------------------------

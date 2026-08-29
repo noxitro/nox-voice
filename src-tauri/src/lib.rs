@@ -29,6 +29,7 @@ mod audio;
 mod config;
 mod context;
 mod dictionary;
+mod focus_probe;
 mod foreground;
 mod format;
 mod history;
@@ -954,7 +955,12 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(
             tauri_plugin_log::Builder::new()
-                .level(log::LevelFilter::Info)
+                // 既定は Info。フォーカス診断 (focus_probe) は debug なので
+                // 普段は 1 行も出ない。実機で追うときだけ
+                // `NOX_VOICE_LOG=debug` で上げる。
+                .level(focus_probe::log_level_from_env(
+                    std::env::var("NOX_VOICE_LOG").ok().as_deref(),
+                ))
                 // `target()` は既定ターゲットに「追加」する (置き換えではない) ため、
                 // 明示指定するときは `targets()` で丸ごと差し替える。
                 // 追加してしまうと同じログが二重に書かれる。
@@ -1341,6 +1347,11 @@ fn start_recording(app: &AppHandle, mode: HotkeyMode) -> Result<(), String> {
 
     // デバイス初期化には数十 ms かかりうるので、その前に前景を押さえる。
     // ここで採った HWND が M3 の挿入先照合 (R7) の基準になる。
+    //
+    // 同じ瞬間にキーボードフォーカス側も控えておく。R7 が見る前景だけでは
+    // 「前景は同じなのに入力欄のキャレットだけ外れた」を後から追えない
+    // (focus_probe のモジュール注記)。貼付直前の値と目で突き合わせるための基準。
+    focus_probe::log_point("録音開始 直前");
     let target = foreground::capture_foreground();
 
     let recorder = audio::start(state.limit_tx.clone()).map_err(|e| e.to_string())?;
@@ -1421,6 +1432,9 @@ fn start_recording(app: &AppHandle, mode: HotkeyMode) -> Result<(), String> {
         overlay::show(app);
         start_level_emitter(app, meter);
     }
+    // 小窓とレベル送出まで含めた「録音開始一式」を通した後の状態。
+    // 表示の区間 (overlay 側の FocusGuard) で捕まらない移動がここに出る。
+    focus_probe::log_point("録音開始 直後");
     Ok(())
 }
 
@@ -1489,6 +1503,17 @@ fn request_finalize(app: &AppHandle) -> Result<(), String> {
     };
     // 通常停止の時点で録音は終わった扱い。キャンセルキーを非武装へ戻す。
     hotkey::set_recording_active(false);
+
+    // フックは自分ではログを出せない (IO 禁止) ので、単独 Alt 対策の打鍵を
+    // 撒いたかどうかはここで数字として残す。**開始側ではなく停止側**なのは、
+    // 撒くのがトリガーの離しの辺だから ([`hotkey::break_lone_alt`] の doc)。
+    // 開始時に読むと必ず「撒く前」の値で、増えたことが見えない。
+    // ホットキーが Alt でなければ増えないので、増えていない = 対策が
+    // 要らなかった、と読める。
+    log::debug!(
+        "[focus] 単独 Alt 対策の打鍵 累計 {} 回",
+        hotkey::lone_alt_breaks()
+    );
 
     let pending = state
         .pending

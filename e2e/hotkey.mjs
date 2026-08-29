@@ -32,7 +32,17 @@ const REPO = path.resolve(import.meta.dirname, "..");
 const EXE = path.join(REPO, "src-tauri", "target", "debug", "nox-voice.exe");
 const SEND_KEYS = path.join(REPO, "e2e", "send-keys.ps1");
 
-const VK = { LCTRL: 0xa2, LSHIFT: 0xa0, SPACE: 0x20, F13: 0x7c, F14: 0x7d, F15: 0x7e, ESC: 0x1b };
+const VK = {
+  LCTRL: 0xa2,
+  LSHIFT: 0xa0,
+  SPACE: 0x20,
+  F13: 0x7c,
+  F14: 0x7d,
+  F15: 0x7e,
+  ESC: 0x1b,
+  // 既定のホットキー。単独 Alt の回帰 (T11/T12) に使う。
+  RALT: 0xa5,
+};
 
 const results = [];
 /** 合成入力がフックまで届く環境か。届かない run は「失敗」ではなく「欠測」。 */
@@ -281,6 +291,10 @@ async function startApp() {
       ...process.env,
       WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${CDP_PORT}`,
       RUST_LOG: "info",
+      // フォーカス診断 (focus_probe) は debug なので、既定の Info では 1 行も
+      // 出ない。T11/T12 はその行を読むので、E2E では明示的に上げる。
+      // ここを消すと T11/T12 が「証拠が無い」で落ちる (アプリの不具合ではない)。
+      NOX_VOICE_LOG: "debug",
     },
     stdio: "ignore",
     detached: false,
@@ -297,6 +311,12 @@ async function startApp() {
 
 function readConfig() {
   return JSON.parse(fs.readFileSync(CONFIG, "utf8"));
+}
+
+/** ログ中の「単独 Alt 対策の打鍵 累計 N 回」の最後の N。無ければ 0。 */
+function lastLoneAltBreaks(text) {
+  const hits = [...text.matchAll(/単独 Alt 対策の打鍵 累計 (\d+) 回/g)];
+  return hits.length ? Number(hits[hits.length - 1][1]) : 0;
 }
 
 // --- シナリオ ----------------------------------------------------------------
@@ -523,6 +543,85 @@ async function main() {
       "T8 二重起動しても常駐は 1 プロセスだけ",
       alive === "1",
       `起動中の nox-voice.exe = ${alive} 個 (2 個目の exitCode=${second.exitCode})`,
+    );
+
+    // --- T11 / T12: 単独 Alt のホットキーとフォーカス診断 (2026-08-29 の回帰)
+    //
+    // 何を検証しているか:
+    //   T11 = トリガーが Alt 単独 (既定の右 Alt) でも PTT が壊れないこと。
+    //         フックは**トリガーを離すたび**に VK_NONAME を 1 打撒く
+    //         (break_lone_alt)。押下の辺では撒かない — 低レベルフックは
+    //         前景アプリより先に走るので、押下時に撒くとダミーが Alt-down を
+    //         追い越し、アプリから見た押下〜離しの間が空のままになる
+    //         (2026-08-29 に一度そう書いて効かなかった。design.md の Q7)。
+    //         この打鍵が自分のホットキー解釈へ混ざると、押しても録音が
+    //         始まらなくなる — つまり修正そのものの陰性側の確認。
+    //         撒いたことは `[focus] 単独 Alt 対策の打鍵 累計 N 回` で見る
+    //         (フックからはログを出せないので、数字を後から読む形にしてある)。
+    //         この行は**録音の停止側** (request_finalize) で出る。撒く辺が
+    //         離しなので、開始時に読むと必ず「撒く前」の値になるため。
+    //         したがって計測は「録音確定を待ってから読む」順でなければならない。
+    //   T12 = 小窓の表示・非表示でキーボードフォーカスが動かないこと。
+    //         focus_probe が違反を見つけたら warn を出すので、その不在を見る。
+    //
+    // 何を検証**できていないか** (ここが本題なので必ず読むこと):
+    //   - **ブラウザの入力欄でキャレットが残るか**は測れていない。元の不具合は
+    //     「Chrome がツールバーへフォーカスを移し、ページの caret が消える」で、
+    //     これは Chrome の中の話なので Win32 の API (GetForegroundWindow /
+    //     GetGUIThreadInfo) からは見えない。DOM の blur を見るしかなく、
+    //     それには実ブラウザと実ページが要る。実機確認の手順は
+    //     docs/design.md の Q7 節を参照。
+    //   - 貼付 (Ctrl+V) 経路の診断も出ない。この E2E は API キーを与えないので
+    //     STT が失敗し、注入まで到達しない。
+    //   - 合成キーがフックへ届かない環境では T11 は SKIP になる (T1 と同じ較正)。
+    //     T12 は録音を伴わないので、フックに依らず判定できる。
+    killApp();
+    await sleep(1000);
+    const altCfg = {
+      ...readConfig(),
+      hotkey_vk: VK.RALT,
+      hotkey_mods: [],
+      // 小窓を出さないと表示・非表示の区間が測れない (T12 の前提)。
+      overlay_enabled: true,
+    };
+    fs.writeFileSync(CONFIG, JSON.stringify(altCfg, null, 2));
+    await startApp();
+    markLog();
+    const breaksBefore = lastLoneAltBreaks(readNewLog());
+    sendKeys(`down:A5,sleep:800,up:A5`, app.pid);
+    const altStarted = await waitForLog("録音開始", 6000);
+    const altFinalized = await waitForLog("録音確定", 8000);
+    const altLog = readNewLog();
+    const breaksAfter = lastLoneAltBreaks(altLog);
+    record(
+      "T11 単独 右Alt の PTT が効き、離しでダミーキーが 1 打撒かれる",
+      Boolean(altStarted && altFinalized) && breaksAfter > breaksBefore,
+      !altStarted
+        ? "右 Alt を押しても録音が始まらない (撒いたダミーキーが自分の解釈へ混ざっている可能性)"
+        : !altFinalized
+          ? "右 Alt を離しても録音が確定しない"
+          : breaksAfter > breaksBefore
+            ? `ダミーキー累計 ${breaksBefore} → ${breaksAfter}`
+            : `録音は通ったがダミーキーが撒かれていない (累計 ${breaksAfter} のまま。`
+              + "撒く辺が離しから外れたか、停止側のログが出ていない)",
+    );
+
+    // 小窓の区間で違反 warn が出ていないこと。
+    // 出ている場合はその行をそのまま detail に載せる — 「動いた」だけでは
+    // どこで動いたのか分からないため。
+    const focusViolation = altLog
+      .split(/\r?\n/)
+      .find((l) => l.includes("[focus]") && l.includes("フォーカスが動きました"));
+    const sawOverlayProbe = altLog.includes("[focus] オーバーレイ表示");
+    record(
+      "T12 小窓の表示・非表示でキーボードフォーカスが動かない",
+      sawOverlayProbe && !focusViolation,
+      focusViolation
+        ? `違反: ${focusViolation.trim()}`
+        : sawOverlayProbe
+          ? "オーバーレイ表示の区間を計測し、違反なし"
+          : "診断行が 1 行も出ていない (NOX_VOICE_LOG=debug が効いていないか、小窓が無効)",
+      false,
     );
 
   } finally {

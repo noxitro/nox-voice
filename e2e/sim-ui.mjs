@@ -492,6 +492,42 @@ async function main() {
     };
   });
 
+  // --- U2c: 修飾キー単独を割り当てると注意が出る (2026-08-29 の不具合の名残)
+  //
+  // 単独 Alt はフックが握り潰さないので入力先アプリにも流れ、Chrome は
+  // それを「メニューを開け」と読む (docs/design.md の Q7)。Rust 側に
+  // break_lone_alt という保険はあるが、選ばない方が確実なので UI で薦め直す。
+  // 弾かない = 出るのは注意だけ、という形をここで固定する。
+  await check("U2d 修飾キー単独のホットキーには注意が出て、普通のキーでは消える", async () => {
+    const r = await cdp.run(`
+      const block = document.getElementById("hotkey-lone-mod-warn");
+      const text = document.getElementById("hotkey-lone-mod-warn-text");
+      // 捕獲を通さず設定値だけ差し替え、renderConfig を通す
+      // (capturingMode が無いときの nox://hotkey-captured は get_config へ落ちる)。
+      const apply = async (vk, mods, label) => {
+        window.__NOX_MOCK__.config.hotkey_vk = vk;
+        window.__NOX_MOCK__.config.hotkey_mods = mods;
+        window.__NOX_MOCK__.config.hotkey_label = label;
+        window.__NOX_MOCK__.emit("nox://hotkey-captured", null);
+        await new Promise((r) => setTimeout(r, 250));
+        return { hidden: block.hidden, text: text.textContent };
+      };
+      const lone = await apply(0xa5, [], "右 Alt");
+      const combo = await apply(0xa5, [0xa2], "左 Ctrl + 右 Alt");
+      const plain = await apply(0x7c, [], "F13");
+      return { lone, combo, plain };
+    `);
+    return {
+      ok:
+        r.lone.hidden === false &&
+        /右 Alt/.test(r.lone.text) &&
+        // 修飾キーが付けば「単独」ではないので出ない。
+        r.combo.hidden === true &&
+        r.plain.hidden === true,
+      detail: JSON.stringify(r),
+    };
+  });
+
   // --- U3: 区画切替で aria-current が動き、可視区画はちょうど 1 つ
   await check("U3 全 8 区画で「可視はちょうど 1 つ」「aria-current もちょうど 1 つ」", async () => {
     const r = await cdp.run(`

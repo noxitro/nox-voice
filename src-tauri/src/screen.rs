@@ -1060,6 +1060,99 @@ mod tests {
         assert!(scan.has_material());
     }
 
+    /// 実画面を走査して**そのまま Gemini へ投げる**通しの疎通確認。
+    ///
+    /// [`live_screen_scan`] は走査までしか見ておらず、
+    /// [`crate::format::tests::live_gemini_screen_ask`] は画像を含まない合成データを送る。
+    /// **画像込みの往復だけがどちらでも検証されない**ので、ここで塞ぐ。
+    ///
+    /// UIA で本文が読めないアプリ (Electron 等) では、実運用の資料は
+    /// 実質スクリーンショット 1 枚だけになる。**縮小した画面から
+    /// モデルが実際に読み取れるのか**がこの機能の成否そのものなので、
+    /// 合成データではなく本物の画面で確かめる必要がある。
+    ///
+    /// **画面の内容がクラウドへ送られる** (design.md R1)。`#[ignore]` を外さないこと。
+    /// 実行: `cargo test --lib -- --ignored --nocapture live_screen_ask_end_to_end`
+    #[test]
+    #[ignore = "実画面を Gemini へ送る。GEMINI_API_KEY が必要"]
+    fn live_screen_ask_end_to_end() {
+        let Ok(key) = std::env::var("GEMINI_API_KEY") else {
+            println!("GEMINI_API_KEY が無いのでスキップします");
+            return;
+        };
+        let question = std::env::var("NOX_ASK")
+            .unwrap_or_else(|_| "画面に見えている内容を箇条書きで説明してください".to_string());
+
+        let started = Instant::now();
+        let scan = super::start_scan(true).expect("走査を開始できる").wait();
+        let scanned = started.elapsed();
+
+        println!("モニタ : {}", scan.monitor.label());
+        println!("走査   : {scanned:?}");
+        for window in &scan.windows {
+            println!(
+                "  {:<22} {:<14} {} 文字",
+                window.process.chars().take(20).collect::<String>(),
+                window.route.label(),
+                window.text.chars().count()
+            );
+        }
+        match &scan.screenshot {
+            Some(shot) => println!("画像   : {}x{} / {} KB", shot.width, shot.height, shot.png.len() / 1024),
+            None => println!("画像   : なし"),
+        }
+
+        // 本番と同じ組み立て (crate::answer_screen_question と同形)。
+        let windows: Vec<crate::format::AskWindow<'_>> = scan
+            .windows
+            .iter()
+            .map(|w| crate::format::AskWindow {
+                title: &w.title,
+                process: &w.process,
+                position: &w.position,
+                text: &w.text,
+            })
+            .collect();
+        let images: Vec<crate::format::AskImage<'_>> = scan
+            .screenshot
+            .iter()
+            .map(|shot| crate::format::AskImage {
+                mime: "image/png",
+                bytes: &shot.png,
+            })
+            .collect();
+
+        let cfg = crate::config::Config::default();
+        let asker = crate::format::GeminiFormatter::new(
+            crate::stt::build_http_client().expect("クライアント"),
+            cfg.gemini_url(),
+            crate::config::Secret::new(key),
+        );
+
+        let ask_started = Instant::now();
+        let answer = {
+            use crate::format::ScreenAnswerer;
+            asker.ask(&crate::format::AskRequest {
+                question: &question,
+                monitor: scan.monitor.label(),
+                windows: &windows,
+                images: &images,
+            })
+        };
+        let asked = ask_started.elapsed();
+
+        match answer {
+            Ok(text) => {
+                println!("質問   : {question}");
+                println!("往復   : {asked:?} (走査込み {:?})", started.elapsed());
+                println!("回答:
+{text}");
+                assert!(!text.trim().is_empty(), "空の回答が返った");
+            }
+            Err(e) => panic!("画面質問に失敗: {e}"),
+        }
+    }
+
     /// 実機で「モニタ 1 枚がどう読めるか」を調べる診断。
     ///
     /// **本文は絶対に出さない** (他人の画面の内容なので)。出すのは
