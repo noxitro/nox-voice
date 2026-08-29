@@ -486,9 +486,10 @@ fn retranscribe_history_entry(state: tauri::State<'_, AppState>, id: i64) -> Res
 
 /// キー捕獲モードを開始する (設定 UI の「キーを押して設定」)。
 ///
-/// 次に押されたキーが `nox://hotkey-captured` で返る。Esc で取り消し。
-/// 押し忘れて放置されると他アプリのキーを拾ってしまうので、
-/// [`CAPTURE_TIMEOUT`] で自動的に畳む。
+/// キーを拾うのは**フロントの DOM** ([`finish_hotkey_capture`])。ここが行うのは
+/// 「捕獲中である」ことの宣言だけで、その間フックは PTT の解釈をやめる
+/// ([`hotkey::begin_capture`])。押し忘れて放置されると設定画面が捕獲状態のまま
+/// 残るので、[`CAPTURE_TIMEOUT`] で自動的に畳む。
 #[tauri::command]
 fn start_hotkey_capture(app: AppHandle, mode: Option<String>) -> Result<u64, String> {
     // 録音中に捕獲へ入ると、PTT の離しが捕獲側へ吸われて録音が止まらなくなる。
@@ -504,6 +505,14 @@ fn start_hotkey_capture(app: AppHandle, mode: Option<String>) -> Result<u64, Str
 
     let generation = hotkey::begin_capture();
 
+    // 捕獲そのものはフックに依存しなくなったが、**設定したホットキーを押す
+    // 経路は依存したまま**。ユーザーがこの画面に居るということは、直後に
+    // 押して試すということなので、ここでフックの生存を 1 回確かめておく。
+    // 「設定はできたのに押しても録音が始まらない」を減らすための止血
+    // ([`hotkey::ensure_hook_alive_async`] の doc)。捕獲の表示を遅らせない
+    // よう、確認は別スレッドで走る。
+    hotkey::ensure_hook_alive_async("キー捕獲の開始");
+
     // 時間で必ず畳む。自分の世代のときだけ効く。
     let timer_app = app.clone();
     let spawned = thread::Builder::new()
@@ -513,9 +522,14 @@ fn start_hotkey_capture(app: AppHandle, mode: Option<String>) -> Result<u64, Str
             if hotkey::end_capture(Some(generation)) {
                 log::info!("キー捕獲がタイムアウトしました");
                 emit_hotkey_captured(&timer_app, None);
+                // 「押したのに何も起きなかった」場合もここに落ちてくる。
+                // DOM 方式では Win キーの組み合わせ・PrintScreen など、
+                // OS が先に処理してしまうキーがそもそもウィンドウへ届かない。
+                // 黙って取り消すと理由が分からないので必ず添える。
                 emit_error(
                     &timer_app,
-                    "キーが押されなかったため、ホットキーの設定を取り消しました",
+                    "キーが押されなかったため、ホットキーの設定を取り消しました。\n\
+Win キーとの組み合わせや PrintScreen は Windows が先に処理するため設定できません",
                 );
             }
         });
@@ -529,6 +543,19 @@ fn start_hotkey_capture(app: AppHandle, mode: Option<String>) -> Result<u64, Str
 #[tauri::command]
 fn cancel_hotkey_capture() {
     hotkey::end_capture(None);
+}
+
+/// 押している最中の `code` 列を表示名にする (「左 Ctrl + Space」)。
+///
+/// 表示名も Rust 側にしか無い ([`hotkey::key_label`])。フロントで組み立てると
+/// **経過表示と確定後のラベルが別々の綴りになる**ので、経過も往復させる。
+/// 写せない `code` はここでは弾かない — 押している最中に「使えません」と
+/// 出しても、まだ組み合わせが完成していないので早すぎる。確定時
+/// ([`finish_hotkey_capture`]) に理由つきで断る。
+#[tauri::command]
+fn describe_hotkey_codes(codes: Vec<String>) -> String {
+    let keys: Vec<u32> = codes.iter().filter_map(|c| hotkey::code_to_vk(c)).collect();
+    hotkey::describe_keys(&keys)
 }
 
 /// フロントから来た用途名を [`HotkeyMode`] へ。既定は貼り付け。
@@ -953,6 +980,8 @@ pub fn run() {
             retranscribe_history_entry,
             start_hotkey_capture,
             cancel_hotkey_capture,
+            describe_hotkey_codes,
+            finish_hotkey_capture,
             clear_hotkey,
             preview_sound,
             list_sound_presets,
@@ -1185,18 +1214,9 @@ fn start_hotkey_controller(app: &AppHandle) {
             // エラーを出すだけで、解釈器の状態が無駄に汚れる。
             let mut active_mode: Option<HotkeyMode> = None;
             let mut seen_drops = 0u64;
-            // 捕獲モードの蓄積。押された順に積み、すべて離した時点で確定する。
-            // generation はフック側が各イベントに載せてくるので、捕獲のやり直し
-            // (begin_capture のたびに進む) が起きたら古い内容を捨てる。
-            //
-            // captured_keys は「今押されているキー」、session_keys は「この捕獲で
-            // 観測した全キー」。確定は最後の 1 個が離れた瞬間だが、そのときには
-            // 先に離したキーは captured から抜けている。確定対象は**観測した全キー**
-            // (Ctrl を押して Space をタップして両方離す、なら Ctrl+Space) なので、
-            // 2 本で持つ必要がある。
-            let mut capture_generation = 0u64;
-            let mut captured_keys: Vec<u32> = Vec::new();
-            let mut session_keys: Vec<u32> = Vec::new();
+            // ここに捕獲の蓄積は無い。設定 UI のキー捕獲はフックを通らず、
+            // フロントの DOM イベント → `finish_hotkey_capture` で確定する
+            // (`hotkey::CAPTURE_MODE` の doc)。捕獲中フックは何も出さない。
 
             loop {
                 crossbeam_channel::select! {
@@ -1204,34 +1224,7 @@ fn start_hotkey_controller(app: &AppHandle) {
                         // フック側が落ちた = 終了。
                         Err(_) => break,
                         Ok(event) => {
-                            // 設定 UI のキー捕獲は録音とは別経路。押下と離しの
-                            // 両方を受け、すべて離した瞬間に組み合わせを確定させる。
-                            match event.kind {
-                                hotkey::HotkeyEventKind::CapturedDown { vk, generation } => {
-                                    handle_capture_down(
-                                        &app,
-                                        vk,
-                                        generation,
-                                        &mut capture_generation,
-                                        &mut captured_keys,
-                                        &mut session_keys,
-                                    );
-                                    continue;
-                                }
-                                hotkey::HotkeyEventKind::CapturedUp { vk, generation } => {
-                                    handle_capture_up(
-                                        &app,
-                                        vk,
-                                        generation,
-                                        &mut capture_generation,
-                                        &mut captured_keys,
-                                        &mut session_keys,
-                                    );
-                                    continue;
-                                }
-                                _ => {}
-                            }
-                            // 録音のキャンセルも解釈器を通さない別経路。
+                            // 録音のキャンセルは解釈器を通さない別経路。
                             // 破棄した時点で解釈器の押下状態は無効になるので捨てる
                             // (開始失敗時と同じ整理)。押しっぱなしだった PTT キーの
                             // 離しが、あとから StopRecording に化けないようにする。
@@ -1247,8 +1240,8 @@ fn start_hotkey_controller(app: &AppHandle) {
                             let mode = match event.kind {
                                 hotkey::HotkeyEventKind::Press { mode }
                                 | hotkey::HotkeyEventKind::Release { mode } => mode,
-                                // 上で処理済み (捕獲・キャンセル)。
-                                _ => continue,
+                                // 上で処理済み (キャンセル)。
+                                hotkey::HotkeyEventKind::Cancel => continue,
                             };
                             if active_mode.is_some_and(|active| active != mode) {
                                 log::debug!(
@@ -2548,189 +2541,171 @@ fn enforce_retention(app: &AppHandle, days: u32) {
     }
 }
 
-/// 設定 UI のキー捕獲: 押下を処理する。
+/// キー捕獲の確定結果。
 ///
-/// 捕獲は「押したキーをすべて離した瞬間」に確定する ([`handle_capture_up`])。
-/// 押している最中の組み合わせは都度 UI へ流して見せる。
-fn handle_capture_down(
-    app: &AppHandle,
-    vk: u32,
-    generation: u64,
-    current_generation: &mut u64,
-    captured: &mut Vec<u32>,
-    session: &mut Vec<u32>,
-) {
-    if generation != *current_generation {
-        // 捕獲のやり直し。古いセッションの残骸は捨てる。
-        *current_generation = generation;
-        captured.clear();
-        session.clear();
-    }
-    log::info!(
-        "捕獲 Down: vk=0x{vk:02X} gen={generation} (押下中={} / 観測={})",
-        captured.len(),
-        session.len()
-    );
-    if !hotkey::is_capturing() {
-        log::info!("捕獲 Down 破棄: 既に捕獲モードが終わっている");
-        return; // タイムアウト等で既に畳んでいる。
-    }
-    if vk == hotkey::ESCAPE_VK {
-        hotkey::end_capture(None);
-        captured.clear();
-        session.clear();
-        log::info!("キー捕獲を取り消しました");
-        emit_hotkey_captured(app, None);
-        return;
-    }
-    if !session.contains(&vk) {
-        session.push(vk);
-    }
-    if !captured.contains(&vk) {
-        captured.push(vk);
-    }
-    emit_hotkey_captured_progress(app, session);
+/// # なぜ `Result` の `Err` ではなく値で返すのか
+///
+/// 「使えないキーだった」は異常ではなく普通の分岐であり、しかも
+/// **捕獲を続けるかどうかが分岐ごとに違う**。`Err` に混ぜると、フロント側は
+/// `catch` の中で「これは押し直せる拒否なのか、もう終わっている失敗なのか」を
+/// 文字列から推測するしかなくなり、静かに取り違える。実際に、拒否されたのに
+/// 捕獲まで畳まれる形で表面化した (E2E T10)。分岐を型にして、
+/// **捕獲が続くかどうかを呼び出し側が読み違えられないようにする。**
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+enum CaptureVerdict {
+    /// 採用した。捕獲は終了し、確定値は `nox://hotkey-captured` でも届く。
+    Accepted,
+    /// 取り消した (Esc)。捕獲は終了。
+    Cancelled,
+    /// ホットキーに使えない。**捕獲は続いている** — 押し直せる。
+    Rejected { message: String },
+    /// 捕獲が既に畳まれていた (タイムアウト・区画切替・窓から離れた)。
+    Expired { message: String },
 }
 
-/// 設定 UI のキー捕獲: 離しを処理し、全キーが離れた時点で確定する。
+/// 設定 UI のキー捕獲を確定する (フロントの DOM が「全キーを離した」と判断した時点)。
 ///
-/// 確定する組み合わせは「この捕獲で観測した全キー」([`handle_capture_down`] の
-/// doc 参照)。最後の 1 個が離れた時点では、先に離したキーは押下中リストから
-/// 既に抜けているため、セッション全体を見る必要がある。
-fn handle_capture_up(
-    app: &AppHandle,
-    vk: u32,
-    generation: u64,
-    current_generation: &mut u64,
-    captured: &mut Vec<u32>,
-    session: &mut Vec<u32>,
-) {
-    if generation != *current_generation {
-        // 捕獲のやり直しで世代が進んでいる。古い離しは何もしない。
-        log::info!("捕獲 Up 破棄 (世代違い): vk=0x{vk:02X} gen={generation}");
-        return;
-    }
-    // 観測していないキーの離し (捕獲開始前に押されていたキーなど) は無視する。
-    // さもないと「押してもいない Space を離した」だけで確定処理が走る。
-    // 捕獲が既に畳まれている (Esc 取り消し・タイムアウト) 場合も同様に無視。
-    if !captured.contains(&vk) || !hotkey::is_capturing() {
-        log::info!(
-            "捕獲 Up 破棄: vk=0x{vk:02X} (押下中={captured:?} / capturing={})",
-            hotkey::is_capturing()
-        );
-        return;
-    }
-
-    captured.retain(|k| *k != vk);
-    if !captured.is_empty() {
-        log::info!(
-            "捕獲 Up: vk=0x{vk:02X} を外したが未解放あり ({captured:?})"
-        );
-        return; // まだ押しているキーがある。確定しない。
+/// # なぜフロントから来るのか
+///
+/// 以前はグローバルフックが捕獲イベントを流していたが、`WH_KEYBOARD_LL` は
+/// 応答が遅れると OS に無言で外れる ([`hotkey::spawn_hook_watchdog`] の doc)。
+/// 外れている間、PTT より先に**捕獲だけが完全に沈黙する**。捕獲は
+/// 「設定ウィンドウにフォーカスがある」場面の操作なので、そもそもグローバル
+/// フックを使う必然性が無い。今はフロントが `keydown` / `keyup` を拾い、
+/// `KeyboardEvent.code` の列をここへ渡す (`docs/design.md` 2026-08-28)。
+///
+/// # なぜ VK への変換をここで行うのか
+///
+/// 許可判定・正規化・表示名がすべて Rust 側に揃っているため
+/// ([`hotkey::code_to_vk`] の doc)。フロントは `code` を運ぶだけにして、
+/// 判定は既存の [`hotkey::decide_capture_combo`] をそのまま通す。
+///
+/// `keys` の順序は押された順。トリガーの決め方がそれに依存する
+/// (修飾キーだけの組み合わせは「最後に押した方」がトリガー)。
+#[tauri::command]
+fn finish_hotkey_capture(app: AppHandle, codes: Vec<String>) -> CaptureVerdict {
+    // タイムアウトや区画切替で既に畳まれている。ここで確定させると、
+    // 「取り消したはずなのにホットキーが変わっていた」になる。
+    if !hotkey::is_capturing() {
+        return CaptureVerdict::Expired {
+            message: "ホットキーの設定は既に終了しています。もう一度やり直してください"
+                .to_string(),
+        };
     }
 
-    // 全キーが離れた → 確定。観測した全キーを評価し、蓄積を空にする
-    // (拒否された場合は次の押し直しから再スタート)。
-    let finished: Vec<u32> = session.clone();
-    captured.clear();
-    session.clear();
-
-    let outcome = hotkey::decide_capture_combo(&finished);
-    log::info!(
-        "捕獲 確定判定: {:?} → {}",
-        finished.iter().map(|vk| format!("0x{vk:02X}")).collect::<Vec<_>>(),
-        match &outcome {
-            hotkey::CaptureOutcome::Accept(combo) => format!("Accept {}", combo.label()),
-            hotkey::CaptureOutcome::Rejected(label) => format!("Rejected {label}"),
-            hotkey::CaptureOutcome::Cancel => "Cancel".to_string(),
-        }
-    );
-
-    match outcome {
-        hotkey::CaptureOutcome::Rejected(label) => {
-            log::info!("ホットキーに使えない組み合わせです: {label}");
-            emit_error(
-                app,
-                &format!(
-                    "「{label}」はホットキーに使えません。押している間ずっと入力先へ流れてしまいます。\n\
-Ctrl / Alt / Shift / Win / CapsLock / F1〜F12 などから選んでください"
+    // 写せない `code` は**黙って落とさない**。落とすと「Win + F13」の
+    // つもりが「F13」単独で保存される。捕獲は続けたまま理由を返す。
+    let keys = match hotkey::codes_to_vks(&codes) {
+        Ok(keys) => keys,
+        Err(code) => {
+            log::info!("捕獲: 写せない code を受け取りました: {code}");
+            return CaptureVerdict::Rejected {
+                message: format!(
+                    "このキー ({code}) はホットキーに使えません。
+Ctrl / Alt / Shift / Win / CapsLock / F1〜F24 などから選んでください"
                 ),
-            );
-            // 捕獲は続ける。押し直せばよい (タイムアウトで自動的に畳む)。
+            };
         }
+    };
+
+    match hotkey::decide_capture_combo(&keys) {
         hotkey::CaptureOutcome::Cancel => {
             hotkey::end_capture(None);
             log::info!("キー捕獲を取り消しました");
-            emit_hotkey_captured(app, None);
+            emit_hotkey_captured(&app, None);
+            CaptureVerdict::Cancelled
+        }
+        hotkey::CaptureOutcome::Rejected(label) => {
+            // **捕獲は続ける。** 押し直せばよい (タイムアウトで自動的に畳む)。
+            // ここで end_capture を呼ぶと「1 回押したら終わり」になり、
+            // Space のような単独では選べないキーを踏んだ利用者が
+            // そのたびにボタンを押し直す羽目になる。
+            log::info!("ホットキーに使えない組み合わせです: {label} (捕獲は継続)");
+            CaptureVerdict::Rejected {
+                message: format!(
+                    "「{label}」はホットキーに使えません。押している間ずっと入力先へ流れてしまいます。
+Ctrl / Alt / Shift / Win / CapsLock / F1〜F12 などから選んでください"
+                ),
+            }
         }
         hotkey::CaptureOutcome::Accept(combo) => {
-            hotkey::end_capture(None);
-            // 確定時、これらのキーはまだ押されたまま。離すまで通常経路から
-            // 締め出す。これをしないと、設定した直後にオートリピートで録音が
-            // 始まる (M1 回帰)。
-            hotkey::suppress_until_release_keys(&finished);
-            let state = app.state::<AppState>();
-            // 捕獲を始めたコマンドが残した用途へ書く。
-            // 用途が増えるたびに if を足していくと、足し忘れた用途が黙って
-            // 貼り付け側へ書き込む (= 録音キーが勝手に変わる)。スロット番号
-            // から機械的に戻す。
-            let mode = HotkeyMode::from_slot(
-                state.capture_slot.load(std::sync::atomic::Ordering::SeqCst),
-            );
-            let patch = match mode {
-                HotkeyMode::Inject => config::ConfigPatch {
-                    hotkey_vk: Some(combo.vk),
-                    hotkey_mods: Some(combo.mods_vec()),
-                    ..Default::default()
-                },
-                HotkeyMode::ClipboardOnly => config::ConfigPatch {
-                    clipboard_hotkey_vk: Some(combo.vk),
-                    clipboard_hotkey_mods: Some(combo.mods_vec()),
-                    ..Default::default()
-                },
-                HotkeyMode::ScreenAsk => config::ConfigPatch {
-                    screen_ask_hotkey_vk: Some(combo.vk),
-                    screen_ask_hotkey_mods: Some(combo.mods_vec()),
-                    ..Default::default()
-                },
+            commit_captured_combo(&app, &keys, combo);
+            CaptureVerdict::Accepted
+        }
+    }
+}
+
+/// 確定した組み合わせを設定へ書き、実フックへ反映して UI へ返す。
+fn commit_captured_combo(app: &AppHandle, pressed: &[u32], combo: hotkey::HotkeyCombo) {
+    log::info!("捕獲 確定: {} ({combo:?})", combo.label());
+
+    // 抑制を**先に**張ってから捕獲モードを抜ける。逆順だと、その隙間に
+    // 押しっぱなしのオートリピートが通常経路へ流れ、設定しただけで録音が
+    // 始まる (M1 回帰)。押されていないキーは登録されない
+    // ([`hotkey::suppress_until_release_keys`] の doc — 登録すると解除する
+    // keyup が来ず、そのキーが恒久的に無視される)。
+    hotkey::suppress_until_release_keys(pressed);
+    hotkey::end_capture(None);
+
+    let state = app.state::<AppState>();
+    // 捕獲を始めたコマンドが残した用途へ書く。
+    // 用途が増えるたびに if を足していくと、足し忘れた用途が黙って
+    // 貼り付け側へ書き込む (= 録音キーが勝手に変わる)。スロット番号
+    // から機械的に戻す。
+    let mode = HotkeyMode::from_slot(state.capture_slot.load(std::sync::atomic::Ordering::SeqCst));
+    let patch = match mode {
+        HotkeyMode::Inject => config::ConfigPatch {
+            hotkey_vk: Some(combo.vk),
+            hotkey_mods: Some(combo.mods_vec()),
+            ..Default::default()
+        },
+        HotkeyMode::ClipboardOnly => config::ConfigPatch {
+            clipboard_hotkey_vk: Some(combo.vk),
+            clipboard_hotkey_mods: Some(combo.mods_vec()),
+            ..Default::default()
+        },
+        HotkeyMode::ScreenAsk => config::ConfigPatch {
+            screen_ask_hotkey_vk: Some(combo.vk),
+            screen_ask_hotkey_mods: Some(combo.mods_vec()),
+            ..Default::default()
+        },
+    };
+    match state.config.update(patch) {
+        Ok(updated) => {
+            // 正規化後の値で実際のフックへ反映する。設定が保存できてから
+            // にするのは、保存失敗時に挙動と設定がずれるのを防ぐため。
+            //
+            // 正規化で弾かれることがある (貼り付け用と同じ組み合わせ)。
+            // その場合 `clipboard_hotkey_combo()` は None を返すので、
+            // UI には「設定されなかった」ことがそのまま伝わる。
+            apply_hotkeys(&updated);
+            let saved = match mode {
+                HotkeyMode::Inject => Some(updated.hotkey_combo()),
+                HotkeyMode::ClipboardOnly => updated.clipboard_hotkey_combo(),
+                // 有効化フラグを見ない方で確認する。無効のまま
+                // キーだけ先に決めるのは正しい操作順なので、
+                // それを「保存できなかった」と報告してはいけない。
+                HotkeyMode::ScreenAsk => hotkey::HotkeyCombo::from_parts(
+                    &updated.screen_ask_hotkey_mods,
+                    updated.screen_ask_hotkey_vk,
+                ),
             };
-            match state.config.update(patch) {
-                Ok(updated) => {
-                    // 正規化後の値で実際のフックへ反映する。設定が保存できてから
-                    // にするのは、保存失敗時に挙動と設定がずれるのを防ぐため。
-                    //
-                    // 正規化で弾かれることがある (貼り付け用と同じ組み合わせ)。
-                    // その場合 `clipboard_hotkey_combo()` は None を返すので、
-                    // UI には「設定されなかった」ことがそのまま伝わる。
-                    apply_hotkeys(&updated);
-                    let saved = match mode {
-                        HotkeyMode::Inject => Some(updated.hotkey_combo()),
-                        HotkeyMode::ClipboardOnly => updated.clipboard_hotkey_combo(),
-                        // 有効化フラグを見ない方で確認する。無効のまま
-                        // キーだけ先に決めるのは正しい操作順なので、
-                        // それを「保存できなかった」と報告してはいけない。
-                        HotkeyMode::ScreenAsk => hotkey::HotkeyCombo::from_parts(
-                            &updated.screen_ask_hotkey_mods,
-                            updated.screen_ask_hotkey_vk,
-                        ),
-                    };
-                    match saved {
-                        Some(combo) => emit_hotkey_captured_combo(app, &combo),
-                        None => {
-                            emit_error(
-                                app,
-                                "その組み合わせは他の用途のホットキーと同じなので設定できません",
-                            );
-                            emit_hotkey_captured(app, None);
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::error!("ホットキーを保存できません: {e}");
-                    emit_error(app, &format!("ホットキーを保存できません: {e}"));
+            match saved {
+                Some(combo) => emit_hotkey_captured_combo(app, &combo),
+                None => {
+                    emit_error(
+                        app,
+                        "その組み合わせは他の用途のホットキーと同じなので設定できません",
+                    );
                     emit_hotkey_captured(app, None);
                 }
             }
+        }
+        Err(e) => {
+            log::error!("ホットキーを保存できません: {e}");
+            emit_error(app, &format!("ホットキーを保存できません: {e}"));
+            emit_hotkey_captured(app, None);
         }
     }
 }
@@ -2747,16 +2722,11 @@ fn emit_hotkey_captured_combo(app: &AppHandle, combo: &hotkey::HotkeyCombo) {
     }
 }
 
-/// 捕獲の進行中 (押している最中) の組み合わせを UI へ流す。
-fn emit_hotkey_captured_progress(app: &AppHandle, keys: &[u32]) {
-    let payload = serde_json::json!({
-        "label": hotkey::describe_keys(keys),
-        "capturing": true,
-    });
-    if let Err(e) = app.emit(EVENT_HOTKEY_CAPTURED, payload) {
-        log::warn!("キー捕獲経過の送出に失敗: {e}");
-    }
-}
+// 押している最中の経過表示は**イベントでは流さない**。
+// キーを見ているのはフロント自身なので、`describe_hotkey_codes` の戻り値を
+// その場で描けばよい。Rust からイベントで返すと、押すたびに
+// invoke → emit → listen の 3 ホップを回ることになり、
+// 表示が実際の指の動きから遅れる。
 
 /// 捕獲の終端 (取り消し・タイムアウト・保存失敗) を UI へ返す。
 ///

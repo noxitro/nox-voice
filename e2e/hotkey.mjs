@@ -9,6 +9,12 @@
 //   F13..F16 を使い、さらに nox-voice 自身のウィンドウを前景にしてから送る。
 // - 設定ファイルは実物 (app_config_dir) を使う。開始時に退避し、終了時に必ず戻す。
 //
+// 2026-08-28: キー捕獲は DOM の keydown/keyup へ移った。捕獲系のテスト
+// (T3 / T7 / T10) は SendInput ではなく **CDP から webview へキーを入れる**
+// (`Cdp#key` の doc)。前景を取れない環境でも判定できるので、これらは
+// injectionReachesHook に依らない (SKIP にならない)。逆に「物理キーが
+// OS → WebView2 → DOM と届くか」はここでは測れない。docs/hotkey-e2e.md 参照。
+//
 // 使い方: node e2e/hotkey.mjs
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -151,6 +157,82 @@ class Cdp {
     if (r.exceptionDetails) throw new Error(`評価失敗: ${JSON.stringify(r.exceptionDetails)}`);
     return r.result.value;
   }
+
+  /** この接続で「キーを送る手段」を 1 度だけ実測して決める。
+   *
+   * # なぜ推測で決め打ちしないのか (2026-08-28、実測で踏んだ)
+   *
+   * `Input.dispatchKeyEvent` はレンダラの入力パイプラインを通るので本来は
+   * こちらが望ましい。ところが WebView2 では **`code` が空のまま DOM へ届く**
+   * ことが実測で判明した。捕獲は `event.code` だけを見ているので、Esc が
+   * "Unidentified" になって取り消しが効かず、T7 が捕獲を開いたまま素通りし、
+   * その残骸が次の T10 を巻き添えにして落とした (原因の切り分けに丸ごと
+   * 1 往復かかった)。
+   *
+   * そこで**実際に 1 打送って `code` が届くかを確かめる**。届かなければ
+   * `KeyboardEvent` の合成へ落とす。どちらを使ったかは結果に必ず出す —
+   * 「どの経路で緑になったのか」が分からない緑は信用できない。
+   *
+   * 捕獲が始まる前に呼ぶこと (プローブのキーが捕獲へ混ざらないように)。 */
+  async detectKeyTransport() {
+    if (this.transport) return this.transport;
+    this.transport = await (async () => {
+      try {
+        await this.eval(
+          `window.__noxProbe = "(未着)";` +
+            `window.__noxProbeHandler = (e) => { window.__noxProbe = e.code === "" ? "(空文字)" : e.code; };` +
+            `window.addEventListener("keydown", window.__noxProbeHandler, true); true`,
+        );
+        await this.send("Input.dispatchKeyEvent", {
+          type: "rawKeyDown",
+          code: "F13",
+          key: "F13",
+          windowsVirtualKeyCode: 0x7c,
+          nativeVirtualKeyCode: 0x7c,
+        });
+        const seen = await this.eval(`window.__noxProbe`);
+        await this.eval(
+          `window.removeEventListener("keydown", window.__noxProbeHandler, true); true`,
+        );
+        if (seen === "F13") return { how: "cdp", label: "Input.dispatchKeyEvent" };
+        return { how: "synthetic", label: `KeyboardEvent 合成 (CDP は code=${seen})` };
+      } catch (e) {
+        return { how: "synthetic", label: `KeyboardEvent 合成 (Input domain 不可: ${e.message})` };
+      }
+    })();
+    return this.transport;
+  }
+
+  /** 設定 UI へキーを 1 打送る (押す or 離す)。
+   *
+   * # なぜ SendInput ではなく CDP なのか (2026-08-28)
+   *
+   * キー捕獲は DOM の `keydown` / `keyup` で行うようになった
+   * (`docs/design.md`「キー捕獲を DOM イベントへ移す」)。DOM へ届くには
+   * **アプリのウィンドウが前景でなければならない**が、このハーネスは
+   * バックグラウンドのコンソールから起動するので前景を取れないことが多い。
+   * `SendInput` の合成キーは前景のアプリへ行ってしまい、捕獲には届かない。
+   *
+   * **測れないこと**: 物理キーが OS → WebView2 → DOM と届くこと自体。
+   * ここは前景を取れる実機でしか確かめられない (docs/hotkey-e2e.md)。 */
+  async key(type, code, vk) {
+    const transport = await this.detectKeyTransport();
+    if (transport.how === "cdp") {
+      await this.send("Input.dispatchKeyEvent", {
+        type: type === "down" ? "rawKeyDown" : "keyUp",
+        code,
+        key: code,
+        windowsVirtualKeyCode: vk,
+        nativeVirtualKeyCode: vk,
+      });
+      return transport.label;
+    }
+    await this.eval(
+      `window.dispatchEvent(new KeyboardEvent(${JSON.stringify(type === "down" ? "keydown" : "keyup")},` +
+        ` { code: ${JSON.stringify(code)}, bubbles: true, cancelable: true }))`,
+    );
+    return transport.label;
+  }
 }
 
 // --- アプリの起動と停止 ------------------------------------------------------
@@ -255,7 +337,10 @@ async function main() {
     const pid = app.pid;
 
     let cdp = await connectSettingsPage();
-    record("T0 設定画面へ CDP 接続", true, "");
+    // どの経路でキーを入れるかを**実測してから**始める (Cdp#detectKeyTransport)。
+    // 捕獲が始まる前にやること — プローブのキーが捕獲へ混ざらないように。
+    const transport = await cdp.detectKeyTransport();
+    record("T0 設定画面へ CDP 接続", true, `捕獲系のキー経路: ${transport.label}`);
 
     // --- T1: 既定の組み合わせ (左Ctrl+Space) の長押しで録音が始まり、離すと確定する
     markLog();
@@ -293,19 +378,28 @@ async function main() {
     );
 
     // --- T3: 捕獲 UI で 左Ctrl+F14 を設定できる
+    //
+    // キーは CDP から webview へ入れる (Cdp#key の doc)。捕獲は DOM 経由に
+    // なったので、ここは**フックの生死と無関係に**通らなければならない。
+    // 逆に言えば、T1 が SKIP の環境でも T3 は判定できる (needsInjectedKeys=false)。
     markLog();
     await cdp.eval(`document.getElementById("hotkey-capture").click()`);
     const capStart = await waitForLog("キー捕獲モード: 開始", 5000);
-    sendKeys(`down:A2,down:7D,sleep:200,up:7D,up:A2`, pid);
+    const keyPath = await cdp.key("down", "ControlLeft", VK.LCTRL);
+    await cdp.key("down", "F14", VK.F14);
+    await sleep(200);
+    await cdp.key("up", "F14", VK.F14);
+    await cdp.key("up", "ControlLeft", VK.LCTRL);
     const capEnd = await waitForLog("キー捕獲モード: 終了", 5000);
     await sleep(500);
     const cfgAfter = readConfig();
     const label = await cdp.eval(`document.getElementById("hotkey-label").textContent`);
     const captured = cfgAfter.hotkey_vk === VK.F14 && cfgAfter.hotkey_mods.includes(VK.LCTRL);
     record(
-      "T3 捕獲 UI で 左Ctrl+F14 を設定",
+      "T3 捕獲 UI (DOM の keydown/keyup) で 左Ctrl+F14 を設定",
       Boolean(capStart && capEnd && captured),
-      `config: vk=0x${cfgAfter.hotkey_vk.toString(16)} mods=${JSON.stringify(cfgAfter.hotkey_mods)} / UI ラベル="${label}"`,
+      `経路=${keyPath} / config: vk=0x${cfgAfter.hotkey_vk.toString(16)} mods=${JSON.stringify(cfgAfter.hotkey_mods)} / UI ラベル="${label}"`,
+      false,
     );
 
     // --- T4: 設定した新しい組み合わせが実際に効く
@@ -334,6 +428,7 @@ async function main() {
     await sleep(1000);
     await startApp();
     cdp = await connectSettingsPage();
+    await cdp.detectKeyTransport();
     const persisted = readConfig();
     markLog();
     sendKeys(`down:A2,down:7D,sleep:800,up:7D,up:A2`, app.pid);
@@ -350,15 +445,56 @@ async function main() {
     const before = readConfig();
     await cdp.eval(`document.getElementById("hotkey-capture").click()`);
     await waitForLog("キー捕獲モード: 開始", 5000);
-    sendKeys(`down:1B,sleep:100,up:1B`, app.pid);
+    await cdp.key("down", "Escape", VK.ESC);
+    await cdp.key("up", "Escape", VK.ESC);
     await sleep(800);
     const after = readConfig();
+    const cancelled = await waitForLog("キー捕獲モード: 終了", 3000);
     record(
       "T7 Esc で捕獲を取り消すと設定は変わらない",
-      after.hotkey_vk === before.hotkey_vk &&
+      Boolean(cancelled) &&
+        after.hotkey_vk === before.hotkey_vk &&
         JSON.stringify(after.hotkey_mods) === JSON.stringify(before.hotkey_mods),
       `vk=0x${after.hotkey_vk.toString(16)} mods=${JSON.stringify(after.hotkey_mods)}`,
+      false,
     );
+
+    // --- T10: 使えないキーは黙って失敗せず、理由を出して捕獲を続ける
+    //
+    // DOM 方式では「押したのに何も起きない」が一番ありがちな見え方になる。
+    // 断る経路が生きていることを、Rust の判定ごと通しで確かめる。
+    markLog();
+    const beforeReject = readConfig();
+    await cdp.eval(`document.getElementById("hotkey-capture").click()`);
+    // 開始の確認は必須。ここを見ないと、前のテストが捕獲を開いたままだった
+    // 場合に click が「畳んで終わり」になり、そのまま素通りで緑になる
+    // (実測でこの取り違えが起きた)。
+    const rejectCapStart = await waitForLog("キー捕獲モード: 開始", 5000);
+    await cdp.key("down", "Enter", 0x0d);
+    await cdp.key("up", "Enter", 0x0d);
+    await sleep(600);
+    const rejectBanner = await cdp.eval(
+      `(document.getElementById("error")?.hidden === false) && document.getElementById("error").textContent`,
+    );
+    const afterReject = readConfig();
+    const stillCapturing = await cdp.eval(
+      `document.getElementById("hotkey-label").dataset.capturing === "true"`,
+    );
+    record(
+      "T10 使えないキー (Enter) は理由が出て、設定は変わらず捕獲は続く",
+      Boolean(rejectCapStart) &&
+        Boolean(rejectBanner) &&
+        /Enter/.test(String(rejectBanner)) &&
+        stillCapturing === true &&
+        afterReject.hotkey_vk === beforeReject.hotkey_vk,
+      `開始=${Boolean(rejectCapStart)} / 帯="${rejectBanner}" / 捕獲継続=${stillCapturing}`,
+      false,
+    );
+    // 捕獲を畳んでから次へ。開いたままだと T9 の 20 秒放置の間ずっと
+    // フックが消音され、押しても録音が始まらない。
+    await cdp.key("down", "Escape", VK.ESC);
+    await cdp.key("up", "Escape", VK.ESC);
+    await sleep(400);
     // --- T9: フックが無言で外されても自力で復帰する
     //
     // 起動直後にフックが OS に外されている run が実測で再現する。番犬が

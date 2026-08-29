@@ -1308,12 +1308,14 @@ async function loadHistory(append = false) {
   }
 }
 
-/** ホットキー捕獲のイベント。`null` は取り消し・タイムアウト・失敗。 */
+/** ホットキー捕獲の確定イベント。`null` は取り消し・タイムアウト・失敗。
+ *
+ * 押している最中の経過表示はこのイベントでは来ない。キーを見ているのは
+ * フロント自身なので、`describe_hotkey_codes` の戻り値をその場で描く
+ * ([`showHotkeyCaptureProgress`])。 */
 interface HotkeyCaptured {
   /** 組み合わせの表示名 (「左 Ctrl + Space」など)。 */
   label: string;
-  /** 押している最中の経過表示。確定ではない。 */
-  capturing?: boolean;
 }
 
 /** ホットキーの用途。Rust 側 `hotkey::HotkeyMode` と対応。 */
@@ -1337,9 +1339,93 @@ let capturingMode: HotkeyModeId | null = null;
 /** 残り秒のカウントダウン。 */
 let captureCountdown: number | undefined;
 
+/* --- キー捕獲は DOM の keydown / keyup で行う (2026-08-28) ------------------
+ *
+ * 以前は Rust 側のグローバルフック (`WH_KEYBOARD_LL`) が捕獲イベントを
+ * 送っていた。しかしこのフックは、コールバックへのメッセージ往復が
+ * 1 秒 (Windows 10 1709 以降の上限) を超えると **OS に無言で外される**。
+ * 外れたことをアプリから知る手段は無い
+ * ([LowLevelKeyboardProc](https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelkeyboardproc))。
+ * ビルドなどで CPU が飽和するとフックスレッドがスケジュールされず、
+ * 実測で「捕獲イベントがプロセス起動から累計 0 件」になった。
+ *
+ * 捕獲は**設定ウィンドウにフォーカスがある**場面の操作なので、グローバル
+ * フックを使う必然性が無い。DOM イベントならフックの生死と無関係になり、
+ * 「捕獲だけが死ぬ」という一番ユーザーに見える故障が構造的に消える。
+ *
+ * 集めるのは `KeyboardEvent.code` (**物理キーの位置**)。`event.key` は
+ * 配列と修飾キーの状態で変わる (Shift+2 が "@" になる / Ctrl 単独の左右が
+ * 区別できない) ので使わない。VK への変換・許可判定・表示名は Rust 側の
+ * 1 か所に閉じている (`hotkey::code_to_vk` の doc)。 */
+
+/** いま押されている `code` (離すたびに減る)。 */
+let captureHeldCodes: string[] = [];
+/** この捕獲で観測した全 `code` (押された順)。確定対象はこちら。
+ *
+ * 「Ctrl を押す → Space をタップ → Ctrl を離す」のように、確定の瞬間には
+ * 先に離したキーが `captureHeldCodes` から抜けている。2 本で持つ必要がある。 */
+let captureSessionCodes: string[] = [];
+/** 経過表示の追い越し防止。invoke の応答順は保証されない。 */
+let captureProgressSeq = 0;
+/** 開始 IPC の進行中プロミス (解決値 = 実際に捕獲へ入れたか)。
+ *
+ * 捕獲は Rust の応答を待たずに始める (下記 [`toggleHotkeyCapture`])。
+ * その空白の間に押されたキーはフロント側で溜まるので、Rust へ渡す確定と
+ * 経過表示だけは**開始が確定してから**投げる。順番を守らないと、
+ * Rust がまだ捕獲モードに入っていないうちに確定が届いて弾かれる。 */
+let captureStartPending: Promise<boolean> | null = null;
+
+/** Rust 側 `CAPTURE_TIMEOUT` と揃えた既定の残り秒。
+ *
+ * 正は Rust (`start_hotkey_capture` の戻り値)。捕獲の受け入れ態勢を IPC より
+ * 前に作る以上、最初の 1 秒だけは真の値を知らないまま表示する必要がある。
+ * 応答が返った時点で引き直す ([`toggleHotkeyCapture`])。 */
+const CAPTURE_SECONDS_FALLBACK = 10;
+
+/**
+ * 捕獲中はどの要素もフォーカスを持たせない (`document.body` へ落とす)。
+ *
+ * 捕獲ボタンや区画見出しがフォーカスを持ったままだと、組み合わせに含めた
+ * Space / Enter がその要素を**再発火**させる。捕獲ボタンなら
+ * 「もう一度押した」ことになり、捕獲が即座に取り消される (実機で踏んだ)。
+ * `preventDefault()` でも止まるが、フォーカスを残す理由が無いので
+ * 二重の防御にする。**IPC を待たずに呼ぶこと** — 待つと、その往復の間だけ
+ * ボタンがフォーカスを持ったままの時間帯ができる。
+ */
+function releaseFocusForCapture() {
+  const active = document.activeElement;
+  if (active instanceof HTMLElement && active !== document.body) active.blur();
+}
+
+/** 残り秒の表示を (再)開始する。
+ *
+ * 捕獲はグローバルではなくなったが、入りっぱなしだと「押したのに決まらない」
+ * ように見えるので、いつ諦められるかを見せる。 */
+function startCaptureCountdown(mode: HotkeyModeId, seconds: number) {
+  window.clearInterval(captureCountdown);
+  const label = el(HOTKEY_ELEMENTS[mode].label);
+  let remaining = seconds;
+  const tick = () => {
+    if (label) {
+      label.textContent =
+        remaining > 0 ? `キーを押してください… (${remaining})` : "キーを押してください…";
+    }
+    remaining -= 1;
+    if (remaining < 0) window.clearInterval(captureCountdown);
+  };
+  tick();
+  captureCountdown = window.setInterval(tick, 1000);
+}
+
 function setHotkeyCapturing(mode: HotkeyModeId, active: boolean, seconds = 0) {
   capturingMode = active ? mode : null;
   window.clearInterval(captureCountdown);
+  // 前回の押しかけを持ち越さない。持ち越すと、やり直した捕獲に
+  // 前回のキーが混ざった組み合わせが保存される。
+  captureHeldCodes = [];
+  captureSessionCodes = [];
+  captureProgressSeq += 1;
+  if (!active) captureStartPending = null;
 
   const ids = HOTKEY_ELEMENTS[mode];
   const label = el(ids.label);
@@ -1354,23 +1440,10 @@ function setHotkeyCapturing(mode: HotkeyModeId, active: boolean, seconds = 0) {
   if (button) button.textContent = active ? "キャンセル" : "キーを押して設定";
 
   if (!active) return;
-
-  // 残り時間を出す。捕獲はグローバルなので、入りっぱなしだと
-  // 他アプリで打ったキーを拾ってしまう。時間が見えている方が安全。
-  let remaining = seconds;
-  const tick = () => {
-    if (label) {
-      label.textContent =
-        remaining > 0 ? `キーを押してください… (${remaining})` : "キーを押してください…";
-    }
-    remaining -= 1;
-    if (remaining < 0) window.clearInterval(captureCountdown);
-  };
-  tick();
-  captureCountdown = window.setInterval(tick, 1000);
+  startCaptureCountdown(mode, seconds);
 }
 
-/** 捕獲中にキーが押されるたび、Rust 側から組み合わせの経過が流れてくる。 */
+/** 押している最中の組み合わせを見せる。確定は「すべて離した瞬間」。 */
 function showHotkeyCaptureProgress(labelText: string) {
   // カウントダウンの上書きを止めて、押している形を見せる。
   window.clearInterval(captureCountdown);
@@ -1378,6 +1451,125 @@ function showHotkeyCaptureProgress(labelText: string) {
   if (label) {
     label.dataset.capturing = "true";
     label.textContent = `${labelText} (離すと確定)`;
+  }
+}
+
+/** 使えない組み合わせだったあと、もう一度押してもらう表示に戻す。
+ *
+ * 捕獲は Rust 側で続いている (押し直せる)。「左 Ctrl + Enter (離すと確定)」が
+ * 残ったままだと、拒否されたのに設定できたように見える。 */
+function showHotkeyCaptureRetry() {
+  const label = el(HOTKEY_ELEMENTS[capturingMode ?? "inject"].label);
+  if (label) {
+    label.dataset.capturing = "true";
+    label.textContent = "キーを押してください…";
+  }
+}
+
+/**
+ * 捕獲中の `keydown`。
+ *
+ * 捕獲していない間は何もしない (通常の画面操作を壊さない)。
+ * 捕獲中は既定動作を必ず止める — Space はフォーカス中のボタンを押し、
+ * Tab はフォーカスを移し、Ctrl+A は画面を全選択する。
+ * 「キーを設定しただけで UI が操作される」のを防ぐため。
+ */
+function onCaptureKeyDown(event: KeyboardEvent) {
+  if (!capturingMode) return;
+  event.preventDefault();
+  event.stopPropagation();
+  // オートリピートは 1 回の押下に畳む (フック側と同じ扱い)。
+  if (event.repeat) return;
+  // `code` が空になる環境がある (IME 経由の合成キーなど)。捨てずに
+  // そのまま積み、確定時に Rust 側から「使えません」と言わせる。
+  const code = event.code || "Unidentified";
+  if (code === "Escape") {
+    // Esc は「取り消し」。ホットキーには選べない (選べると設定を
+    // やり直す手段が無くなる)。押した瞬間に畳む。
+    void cancelHotkeyCapture();
+    return;
+  }
+  if (!captureHeldCodes.includes(code)) captureHeldCodes.push(code);
+  if (!captureSessionCodes.includes(code)) captureSessionCodes.push(code);
+  void showCaptureProgressFor(captureSessionCodes.slice());
+}
+
+/** 捕獲中の `keyup`。全キーが離れた瞬間に確定する (既存仕様の維持)。 */
+function onCaptureKeyUp(event: KeyboardEvent) {
+  if (!capturingMode) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const code = event.code || "Unidentified";
+  // 捕獲開始前から押されていたキーの離しは無視する。さもないと
+  // 「押してもいないキーを離した」だけで確定処理が走る。
+  if (!captureSessionCodes.includes(code)) return;
+  captureHeldCodes = captureHeldCodes.filter((c) => c !== code);
+  if (captureHeldCodes.length > 0) return; // まだ押しているキーがある。
+  const codes = captureSessionCodes.slice();
+  captureSessionCodes = [];
+  void finishHotkeyCapture(codes);
+}
+
+/** 押している最中の表示名を Rust に作らせて描く。
+ *
+ * 表示名 (`hotkey::key_label`) も Rust 側にしかない。フロントで組み立てると
+ * 経過表示と確定後のラベルが別々の綴りになる。 */
+async function showCaptureProgressFor(codes: string[]) {
+  const seq = ++captureProgressSeq;
+  try {
+    // 開始 IPC がまだ飛んでいる最中に押された分。順番を守る。
+    if (captureStartPending && !(await captureStartPending)) return;
+    const label = await invoke<string>("describe_hotkey_codes", { codes });
+    // 応答を待つ間に離しきった / 捕獲が畳まれた場合は描かない。
+    if (seq !== captureProgressSeq || !capturingMode) return;
+    showHotkeyCaptureProgress(label);
+  } catch (e) {
+    // 経過表示が作れないだけ。捕獲は続ける (確定時にきちんと判定される)。
+    console.warn("捕獲の経過表示を作れません", e);
+  }
+}
+
+/** 確定の返り値。Rust 側 `lib::CaptureVerdict` と対応。
+ *
+ * 例外ではなく**値**で返す。「使えないキーだった」は異常ではなく普通の
+ * 分岐で、しかも**捕獲を続けるかどうかが分岐ごとに違う**。throw/catch に
+ * 混ぜると「拒否されたのに捕獲まで畳まれる」を静かに作り込む
+ * (実際に E2E T10 で踏んだ)。 */
+type CaptureVerdict =
+  /** 採用。捕獲は終了し、確定値は `nox://hotkey-captured` で届く。 */
+  | { verdict: "accepted" }
+  /** 取り消し。捕獲は終了。 */
+  | { verdict: "cancelled" }
+  /** ホットキーに使えない組み合わせ。**捕獲は続く** (押し直せる)。 */
+  | { verdict: "rejected"; message: string }
+  /** 捕獲が既に畳まれていた (タイムアウト・区画切替)。 */
+  | { verdict: "expired"; message: string };
+
+/** 確定を Rust へ渡す。採用・取り消しは `nox://hotkey-captured` でも届く。 */
+async function finishHotkeyCapture(codes: string[]) {
+  try {
+    if (captureStartPending && !(await captureStartPending)) return;
+    const result = await invoke<CaptureVerdict>("finish_hotkey_capture", { codes });
+    if (result.verdict === "rejected") {
+      // **捕獲は終わっていない。** 理由を出して、押し直せる表示に戻す。
+      // ここで setHotkeyCapturing(false) を呼ぶと「1 回押したら終わり」に
+      // なり、Space のような単独では選べないキーを踏んだ利用者が
+      // そのたびにボタンを押し直す羽目になる。
+      showError(result.message);
+      showHotkeyCaptureRetry();
+      return;
+    }
+    if (result.verdict === "expired") {
+      showError(result.message);
+      if (capturingMode) setHotkeyCapturing(capturingMode, false);
+      renderConfig(await invoke<ConfigView>("get_config"));
+    }
+    // accepted / cancelled は Rust が nox://hotkey-captured を出す。
+  } catch (e) {
+    // ここへ来るのは IPC そのものの失敗。捕獲状態は Rust 側が正なので、
+    // 現在値を取り直して表示を戻す。
+    showError(`${e}`);
+    if (capturingMode) setHotkeyCapturing(capturingMode, false);
   }
 }
 
@@ -1398,19 +1590,42 @@ async function toggleHotkeyCapture(mode: HotkeyModeId) {
   // 捕獲は「押してから離すまで」を見せる操作なので、別の区画から
   // 呼ばれた場合 (トレイ導線・E2E の直接 click) でも表示を合わせる。
   showSection("hotkeys");
-  try {
-    const seconds = await invoke<number>("start_hotkey_capture", { mode });
-    setHotkeyCapturing(mode, true, seconds);
-    // ボタンがキーボードフォーカスを持ったままだと、組み合わせの一部として
-    // 押した Space の離しでボタンが再度発火し、捕獲が即キャンセルされる。
-    // 捕獲中はフォーカスを外して、キー入力をフック側に集中させる。
-    if (document.activeElement instanceof HTMLElement) {
-      document.activeElement.blur();
+
+  // ---- ここから先の順序が要件 (2026-08-28、実機で踏んだ) -------------------
+  //
+  // 「キーを受け付ける状態」と「フォーカスを外す」を **IPC より前**に確定
+  // させる。以前は `await invoke("start_hotkey_capture")` の**後**で
+  // `capturingMode` を立てていたため、IPC の往復の間だけ
+  // **キーを受け付けられない無防備な時間帯**ができていた。そこで押された
+  // Space は `preventDefault()` されず、フォーカスを持ったままの捕獲ボタンを
+  // 再発火させ、2 回目の toggle が「捕獲中なら畳む」に入って捕獲が即座に
+  // 取り消される。ユーザーには「space を押すとウィンドウにフォーカスが移る」
+  // と見えた。
+  //
+  // 楽観的に開始し、失敗したら巻き戻す。待ち時間やタイマーで隙間を
+  // 埋めてはいけない — 隙間が**存在しない**ことが要件なので。
+  // 回帰テスト: e2e/sim-ui.mjs の U2c。
+  setHotkeyCapturing(mode, true, CAPTURE_SECONDS_FALLBACK);
+  releaseFocusForCapture();
+
+  const started = (async () => {
+    try {
+      const seconds = await invoke<number>("start_hotkey_capture", { mode });
+      // 応答が返るまでに畳まれている / 別用途へ移っていたら触らない。
+      if (capturingMode !== mode) return false;
+      // 実際の残り秒で引き直す。ただし**既に押されていれば上書きしない** —
+      // 経過表示 (「左 Ctrl (離すと確定)」) をカウントダウンで潰してしまう。
+      if (captureSessionCodes.length === 0) startCaptureCountdown(mode, seconds);
+      return true;
+    } catch (e) {
+      // 録音中など。巻き戻して理由を出す。
+      if (capturingMode === mode) setHotkeyCapturing(mode, false);
+      showError(`${e}`);
+      return false;
     }
-  } catch (e) {
-    setHotkeyCapturing(mode, false);
-    showError(`${e}`);
-  }
+  })();
+  captureStartPending = started;
+  await started;
 }
 
 /** 用途に割り当てたホットキーを解除する (録音用は Rust 側が拒否する)。 */
@@ -1538,8 +1753,15 @@ window.addEventListener("DOMContentLoaded", async () => {
   el("cancel-sound-preview")?.addEventListener("click", () => void previewSound("cancel"));
   await loadSoundPresets();
 
+  // キー捕獲の入力源。**capture フェーズ**で拾う。バブリングで待つと、
+  // ボタンや入力欄が先に既定動作を済ませてしまう (Space でボタンが再発火し、
+  // 捕獲が即キャンセルされる)。捕獲していない間は素通しする。
+  window.addEventListener("keydown", onCaptureKeyDown, true);
+  window.addEventListener("keyup", onCaptureKeyUp, true);
+
   // ウィンドウから離れたら捕獲をやめる。設定画面を離れたまま
-  // 捕獲が続くと、他アプリで打ったキーがホットキーとして保存される。
+  // 捕獲が続くと、キーがどこにも届かないまま時間だけ過ぎる
+  // (DOM 捕獲はフォーカスのあるウィンドウにしか届かない)。
   window.addEventListener("blur", () => {
     if (capturingMode) void cancelHotkeyCapture();
   });
@@ -1623,11 +1845,6 @@ window.addEventListener("DOMContentLoaded", async () => {
       // 取り消し・タイムアウト・保存失敗。現在値を取り直して元に戻す。
       setHotkeyCapturing(mode, false);
       void invoke<ConfigView>("get_config").then(renderConfig);
-      return;
-    }
-    if (payload.capturing) {
-      // まだ押している最中。確定は「すべて離した瞬間」。
-      showHotkeyCaptureProgress(payload.label);
       return;
     }
     setHotkeyCapturing(mode, false);

@@ -295,46 +295,199 @@ async function main() {
   });
 
   // --- U2: 捕獲の表示遷移 (カウントダウン → 経過 → 確定)
-  await check("U2 捕獲の表示遷移: カウントダウン → 経過表示 → 確定でラベル更新", async () => {
+  //
+  // 2026-08-28 から捕獲は **DOM の keydown / keyup** で行う。ここは
+  // 「イベントを流したら表示が変わるか」ではなく、**実際にキーを押して離す**
+  // 形にしてある。押している最中の経過表示・全キーを離した瞬間の確定・
+  // Rust へ渡る `code` の列まで、この 1 本で通しで見える
+  // (実機では届かない Win キー等は原理的にここでも試せない)。
+  await check("U2 捕獲: キーを押して離すと確定する (DOM の keydown/keyup)", async () => {
     const r = await cdp.run(`
       const label = document.getElementById("hotkey-label");
       const button = document.getElementById("hotkey-capture");
       const countdown = { text: label.textContent, capturing: label.dataset.capturing, button: button.textContent };
+      const key = (type, code) =>
+        window.dispatchEvent(new KeyboardEvent(type, { code, bubbles: true, cancelable: true }));
 
-      // 押している最中 (capturing: true)。Rust 側 hotkey.rs の
-      // nox://hotkey-captured と同じ形で発火させる。
-      const delivered = window.__NOX_MOCK__.emit("nox://hotkey-captured", { label: "左 Ctrl + F14", capturing: true });
-      await new Promise((r) => setTimeout(r, 30));
+      // 押していく。1 打ごとに describe_hotkey_codes へ往復して表示名をもらう。
+      key("keydown", "ControlLeft");
+      await new Promise((r) => setTimeout(r, 60));
+      const afterCtrl = label.textContent;
+      key("keydown", "F14");
+      await new Promise((r) => setTimeout(r, 60));
       const progress = { text: label.textContent, capturing: label.dataset.capturing };
 
-      // 確定。Rust 側は保存してから確定イベントを出すので、モックの
-      // 現在値も先に進めておく (でないと直後の get_config が古い値で上書きする)。
-      window.__NOX_MOCK__.config.hotkey_label = "左 Ctrl + F14";
+      // 途中で 1 つ離しただけでは確定しない (既存仕様: すべて離した瞬間)。
       window.__NOX_MOCK__.config.hotkey_vk = 0x7d;
-      window.__NOX_MOCK__.emit("nox://hotkey-captured", { label: "左 Ctrl + F14" });
-      const immediate = label.textContent;
-      await new Promise((r) => setTimeout(r, 200));
+      key("keyup", "ControlLeft");
+      await new Promise((r) => setTimeout(r, 60));
+      const halfReleased = { text: label.textContent, finished: window.__NOX_MOCK__.count("finish_hotkey_capture") };
+
+      key("keyup", "F14");
+      await new Promise((r) => setTimeout(r, 250));
       return {
-        delivered,
         countdown,
+        afterCtrl,
         progress,
-        immediate,
+        halfReleased,
+        sentCodes: window.__NOX_MOCK__.lastArgs("finish_hotkey_capture"),
         settled: { text: label.textContent, capturing: label.dataset.capturing, button: button.textContent },
         homeHint: document.getElementById("home-hotkey").textContent,
       };
     `);
     return {
       ok:
-        r.delivered === 1 &&
         /キーを押してください/.test(r.countdown.text) &&
         r.countdown.capturing === "true" &&
         r.countdown.button === "キャンセル" &&
+        r.afterCtrl === "左 Ctrl (離すと確定)" &&
         r.progress.text === "左 Ctrl + F14 (離すと確定)" &&
-        r.immediate === "左 Ctrl + F14" &&
+        r.progress.capturing === "true" &&
+        r.halfReleased.finished === 0 &&
+        r.halfReleased.text === "左 Ctrl + F14 (離すと確定)" &&
+        JSON.stringify(r.sentCodes?.codes) === JSON.stringify(["ControlLeft", "F14"]) &&
         r.settled.text === "左 Ctrl + F14" &&
         r.settled.capturing === undefined &&
         r.settled.button === "キーを押して設定" &&
         r.homeHint === "左 Ctrl + F14",
+      detail: JSON.stringify(r),
+    };
+  });
+
+  // --- U2c: 捕獲ボタンを押した「直後」のキーが素通りしない
+  //
+  // # なぜこのテストが要るのか (2026-08-28、実機で踏んだ)
+  //
+  // 捕獲の開始は invoke = IPC で、呼んでから応答が返るまでに必ず空白がある。
+  // 「捕獲中」フラグと blur を `await` の**後**に置くと、その往復の間だけ
+  // **キーを受け付けられない無防備な時間帯**ができる。そこで押された Space は
+  // preventDefault されず、フォーカスを持ったままの捕獲ボタンを再発火させ、
+  // 2 回目の toggle が「捕獲中なら畳む」に入って**捕獲が即座に取り消される**。
+  // 実機では「space を押すとウィンドウのほうにフォーカスされる」と見えた。
+  //
+  // ここでは IPC に 300ms の遅延を注入し、**click の応答を待たずに**キーを
+  // 押す。タイマーや待ち時間で誤魔化していないことを、この 1 本で固定する。
+  await check("U2c 捕獲ボタンの click 直後 (IPC 完了前) に押したキーも取りこぼさない", async () => {
+    const r = await cdp.run(`
+      // 前の捕獲が残っていれば畳んでおく (区画を移ると畳まれる)。
+      document.querySelector('.nav-item[data-section="home"]').click();
+      await new Promise((r) => setTimeout(r, 200));
+      // ホットキー区画を開いてから掴む。**非表示の要素はフォーカスできない**ので、
+      // 隠れたままボタンを focus() しても実機の状況を再現できない
+      // (呼び出し元のブラウザ実測は「ボタンにフォーカス → click」だった)。
+      document.querySelector('.nav-item[data-section="hotkeys"]').click();
+      await new Promise((r) => setTimeout(r, 200));
+      window.__NOX_MOCK__.reset();
+      window.__NOX_MOCK__.delays.start_hotkey_capture = 300;
+
+      const button = document.getElementById("hotkey-capture");
+      button.focus();
+      const focusedBefore = document.activeElement.id;
+      button.click();
+
+      // **応答を待たない**。ここが要点。実機のユーザーも待たない。
+      const down = new KeyboardEvent("keydown", { code: "Space", bubbles: true, cancelable: true });
+      window.dispatchEvent(down);
+      const up = new KeyboardEvent("keyup", { code: "Space", bubbles: true, cancelable: true });
+      window.dispatchEvent(up);
+      const duringIpc = {
+        downPrevented: down.defaultPrevented,
+        upPrevented: up.defaultPrevented,
+        activeElement: document.activeElement === document.body ? "BODY" : document.activeElement.id,
+      };
+
+      // IPC が返りきるまで待ってから、捕獲が生きているか見る。
+      await new Promise((r) => setTimeout(r, 700));
+      const label = document.getElementById("hotkey-label");
+      window.__NOX_MOCK__.delays.start_hotkey_capture = 0;
+      return {
+        focusedBefore,
+        duringIpc,
+        starts: window.__NOX_MOCK__.count("start_hotkey_capture"),
+        cancels: window.__NOX_MOCK__.count("cancel_hotkey_capture"),
+        capturing: label.dataset.capturing,
+        button: button.textContent,
+        activeAfter: document.activeElement === document.body ? "BODY" : document.activeElement.id,
+      };
+    `);
+    return {
+      ok:
+        r.focusedBefore === "hotkey-capture" &&
+        // IPC の最中でもキーは捕獲側が食う (ボタンの既定動作へ行かせない)。
+        r.duringIpc.downPrevented === true &&
+        r.duringIpc.upPrevented === true &&
+        // 捕獲中はどの要素もフォーカスを持たない。
+        r.duringIpc.activeElement === "BODY" &&
+        r.activeAfter === "BODY" &&
+        // ボタンが再発火していない = 開始 1 回・取り消し 0 回。
+        r.starts === 1 &&
+        r.cancels === 0 &&
+        r.capturing === "true" &&
+        r.button === "キャンセル",
+      detail: JSON.stringify(r),
+    };
+  });
+
+  // --- U2b: 使えない組み合わせは理由が出て、捕獲は続く (押し直せる)
+  //
+  // 黙って失敗しないこと。DOM 方式では「押したのに何も起きない」が
+  // 一番ありがちな見え方になるので、断る側の経路を明示的に押さえる。
+  await check("U2b 使えないキーは理由を出し、捕獲は続いて押し直せる", async () => {
+    const r = await cdp.run(`
+      // 直前のテストが捕獲を開いたままにしている。区画を移ると畳まれる。
+      document.querySelector('.nav-item[data-section="home"]').click();
+      await new Promise((r) => setTimeout(r, 200));
+      document.getElementById("hotkey-capture").click();
+      await new Promise((r) => setTimeout(r, 150));
+      const label = document.getElementById("hotkey-label");
+      const key = (type, code) =>
+        window.dispatchEvent(new KeyboardEvent(type, { code, bubbles: true, cancelable: true }));
+
+      key("keydown", "Enter");
+      await new Promise((r) => setTimeout(r, 60));
+      key("keyup", "Enter");
+      await new Promise((r) => setTimeout(r, 250));
+      const banner = document.getElementById("error");
+      const rejected = {
+        text: label.textContent,
+        capturing: label.dataset.capturing,
+        error: banner ? banner.textContent : "",
+        errorHidden: banner ? banner.hidden : null,
+      };
+
+      // 2 度目の拒否でも終わらないこと。Space 単独は
+      // is_allowed_hotkey が許さない (押しっぱなしで入力先へ流れる) ので、
+      // ユーザーが素朴に踏みやすい拒否経路。
+      key("keydown", "Space");
+      await new Promise((r) => setTimeout(r, 60));
+      key("keyup", "Space");
+      await new Promise((r) => setTimeout(r, 250));
+      const rejectedTwice = {
+        text: label.textContent,
+        capturing: label.dataset.capturing,
+        error: banner ? banner.textContent : "",
+      };
+
+      // 捕獲は続いている。押し直せば普通に決まる。
+      key("keydown", "ControlLeft");
+      key("keydown", "F13");
+      await new Promise((r) => setTimeout(r, 60));
+      key("keyup", "F13");
+      key("keyup", "ControlLeft");
+      await new Promise((r) => setTimeout(r, 250));
+      return { rejected, rejectedTwice, settled: label.textContent };
+    `);
+    return {
+      ok:
+        r.rejected.text === "キーを押してください…" &&
+        r.rejected.capturing === "true" &&
+        r.rejected.errorHidden === false &&
+        /Enter/.test(r.rejected.error) &&
+        // 2 度目の拒否でも捕獲は生きている。
+        r.rejectedTwice.text === "キーを押してください…" &&
+        r.rejectedTwice.capturing === "true" &&
+        /Space/.test(r.rejectedTwice.error) &&
+        r.settled === "左 Ctrl + F13",
       detail: JSON.stringify(r),
     };
   });
@@ -384,6 +537,40 @@ async function main() {
         missing.length === 0
           ? `${keys.length} 項目 / note="${r.note}" / style_profiles=${r.patch.style_profiles.length} 件`
           : `欠落: ${missing.join(", ")}`,
+    };
+  });
+
+  // --- U4b: 認識と整形で「画面コンテキスト」「画面質問モード」を入れて保存すると、
+  //   実際の保存ボタンを押したあとチェックが画面に残る (往復する)。
+  //
+  // 過去のモックは set_config でパッチを内部 config に反映していなかったため、
+  // `renderConfig` が元の false で上書きし、この不具合を検出できなかった。
+  // (実機では Rust が反映するので別の壊れ方だが、E2E が盲点だった。)
+  await check("U4b 認識と整形: deep_context / screen_ask_enabled のチェックが保存後も残る", async () => {
+    const r = await cdp.run(`
+      document.querySelector('.nav-item[data-section="transcribe"]').click();
+      await new Promise((r) => setTimeout(r, 50));
+      const dc = document.getElementById("deep-context");
+      const sa = document.getElementById("screen-ask-enabled");
+      dc.checked = true; sa.checked = true;
+      document.querySelector('#savebar button[type="submit"]').click();
+      await new Promise((r) => setTimeout(r, 300));
+      return {
+        deepAfterSave: document.getElementById("deep-context").checked,
+        screenAskAfterSave: document.getElementById("screen-ask-enabled").checked,
+        cfgDeep: window.__NOX_MOCK__.config.deep_context,
+        cfgScreenAsk: window.__NOX_MOCK__.config.screen_ask_enabled,
+        note: document.getElementById("settings-note").textContent,
+      };
+    `);
+    return {
+      ok:
+        r.deepAfterSave === true &&
+        r.screenAskAfterSave === true &&
+        r.cfgDeep === true &&
+        r.cfgScreenAsk === true &&
+        r.note === "保存しました",
+      detail: JSON.stringify(r),
     };
   });
 

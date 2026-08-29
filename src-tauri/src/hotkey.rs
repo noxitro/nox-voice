@@ -245,23 +245,25 @@ static HOTKEY_COMBOS: [AtomicU64; HOTKEY_SLOTS] = [
 
 /// キー捕獲モード。設定 UI の「キーを押して設定」で使う。
 ///
-/// ON の間、フックは PTT の解釈をやめて**押されたキーをそのまま報告する**。
-/// 捕獲中に録音が始まってしまうのを防ぐため、モードは排他にする。
+/// # このフラグは今や「PTT の消音」だけを意味する (2026-08-28)
+///
+/// 以前はフックが捕獲モード中の押下を [`HotkeyEventKind`] として報告し、
+/// それが捕獲 UI の入力源だった。**その経路は廃止した**。
+/// `WH_KEYBOARD_LL` は応答が遅れると OS に無言で外され
+/// ([`spawn_hook_watchdog`] の doc)、外れている間は捕獲だけが沈黙する。
+/// 捕獲は「設定ウィンドウにフォーカスがある」場面の操作なので、
+/// グローバルフックを使う必然性が無い。今は**フロントの DOM の
+/// `keydown` / `keyup`** が入力源で、フックの生死と完全に無関係になった
+/// (`docs/design.md`「キー捕獲を DOM イベントへ移す」)。
+///
+/// それでもこのフラグが要るのは**安全側の理由**: 捕獲中は現行ホットキーの
+/// キー (既定なら 左Ctrl+Space) が押される。フックがそれを PTT として
+/// 解釈すると、**キーを設定しようとしただけで録音が始まる**。
+/// ON の間、フックは PTT・キャンセルの解釈を一切行わずに捨てる。
 static CAPTURE_MODE: AtomicBool = AtomicBool::new(false);
 
 /// 捕獲セッションの世代。タイムアウトが**古い**捕獲を打ち切らないようにする。
 static CAPTURE_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-/// フックの捕獲支店が出したイベントの累計。
-///
-/// 診断用。「フックは出したのにコントローラに届いていない」ことを
-/// 数値で切り分けるためのカウンタ (atomic なのでフックから触れて安全)。
-static CAPTURE_EVENTS_SENT: AtomicU64 = AtomicU64::new(0);
-
-/// フックが捕獲イベントを何件送ったか (診断用)。
-pub fn capture_events_sent() -> u64 {
-    CAPTURE_EVENTS_SENT.load(Ordering::Relaxed)
-}
 
 /// 「離されるまで無視する」キーのスロット (0 = 空)。
 ///
@@ -354,13 +356,7 @@ pub fn end_capture(generation: Option<u64>) -> bool {
     }
     let was_capturing = CAPTURE_MODE.swap(false, Ordering::SeqCst);
     if was_capturing {
-        // 送出件数を必ず添える。「キーを押したのに何も設定されない」とき、
-        // フックが出していないのか (0 件) コントローラまで届いていないのか
-        // (1 件以上あるのに確定ログが無い) を、この数字だけで切り分けられる。
-        log::info!(
-            "キー捕獲モード: 終了 (フックが送った捕獲イベント 累計 {} 件)",
-            capture_events_sent()
-        );
+        log::info!("キー捕獲モード: 終了");
     }
     was_capturing
 }
@@ -480,7 +476,12 @@ pub fn key_label(vk: u32) -> String {
         0x1D => "無変換",
         0x1C => "変換",
         0xF3 | 0xF4 => "半角/全角",
-        0x70..=0x7B => return format!("F{}", vk - 0x6F),
+        // F1〜F24。**F13 以降まで名前を持つ**必要がある: `is_allowed_hotkey` は
+        // 昔から F24 まで許しているのに、ここは F12 までしか名前を知らず、
+        // F13 を選ぶと「VK 0x7C」と表示されていた。DOM 捕獲では F13〜F24 が
+        // 物理キーの無い環境でも押せる (E2E も F13〜F15 を使う) ので、
+        // 名前が無いままだと実際に目に見える。
+        0x70..=0x87 => return format!("F{}", vk - 0x6F),
         0x30..=0x39 => return format!("{}", vk - 0x30),
         0x41..=0x5A => return char::from(vk as u8).to_string(),
         0x60..=0x69 => return format!("テンキー {}", vk - 0x60),
@@ -517,6 +518,138 @@ fn modifier_order(vk: u32) -> u8 {
 /// `vk` が修飾キー (左右個別の Ctrl / Shift / Alt / Win) か。
 pub fn is_modifier(vk: u32) -> bool {
     matches!(vk, 0xA0..=0xA5 | 0x5B | 0x5C)
+}
+
+/// DOM の `KeyboardEvent.code` を Windows の仮想キーコードへ写す。
+///
+/// # なぜフロントで VK へ直さないのか
+///
+/// 許可判定 ([`is_allowed_hotkey`] / [`is_allowed_combo_key`])・正規化
+/// ([`sanitize_combo`])・表示名 ([`key_label`]) はすべて VK を入り口にして
+/// ここに揃っている。フロントでも VK を組み立てると同じ表が 2 か所に増え、
+/// **必ず片方だけ更新されてずれる**。フロントは `code` の列を渡すだけにして、
+/// 写像はこの純関数 1 か所に閉じる。
+///
+/// # なぜ `code` であって `key` ではないか
+///
+/// `KeyboardEvent.key` は「そのキーが今の配列で何を打つか」でレイアウトと
+/// 修飾キーの状態に左右される (Shift+`2` が `"@"` になる、Ctrl 単独が
+/// `"Control"` になり左右が区別できない、など)。ホットキーが要るのは
+/// **物理キーの位置**なので `code` を使う。`code` は左右も区別する
+/// (`ControlLeft` / `ControlRight`)。
+///
+/// 写せない `code` は `None`。呼び出し側は黙って捨てず、
+/// 「そのキーは設定に使えない」とユーザーへ言うこと。
+pub fn code_to_vk(code: &str) -> Option<u32> {
+    // 修飾キー・ロック系・IME・機能キー。ホットキーに選べる本命。
+    let fixed = match code {
+        "ControlLeft" => 0xA2,
+        "ControlRight" => 0xA3,
+        "ShiftLeft" => 0xA0,
+        "ShiftRight" => 0xA1,
+        "AltLeft" => 0xA4,
+        // 日本語配列の右 Alt は AltGr ではなく素の右 Alt。ブラウザは
+        // どちらも `AltRight` で報告するので、VK も右 Alt に写す。
+        "AltRight" => 0xA5,
+        "MetaLeft" | "OSLeft" => 0x5B,
+        "MetaRight" | "OSRight" => 0x5C,
+        "ContextMenu" => 0x5D,
+        "CapsLock" => 0x14,
+        "ScrollLock" => 0x91,
+        "NumLock" => 0x90,
+        "Pause" => 0x13,
+        // JIS 配列の IME キー。Chromium は 変換 = Convert、無変換 = NonConvert、
+        // かな = KanaMode で報告する (かなは VK が実キーと食い違うため
+        // `is_allowed_hotkey` 側で弾かれる — ここでは写すだけ)。
+        "Convert" => 0x1C,
+        "NonConvert" => 0x1D,
+        "KanaMode" => 0x15,
+        // 以下は許可判定で弾かれるが、**弾く理由を名前で言う**ために写す。
+        // 写せないと「そのキーは認識できません」になり、
+        // 「Enter は押しっぱなしで実害が出るから使えません」と言えなくなる。
+        "Space" => 0x20,
+        "Enter" | "NumpadEnter" => 0x0D,
+        "Escape" => ESCAPE_VK,
+        "Tab" => 0x09,
+        "Backspace" => 0x08,
+        "Insert" => 0x2D,
+        "Delete" => 0x2E,
+        "Home" => 0x24,
+        "End" => 0x23,
+        "PageUp" => 0x21,
+        "PageDown" => 0x22,
+        "ArrowLeft" => 0x25,
+        "ArrowUp" => 0x26,
+        "ArrowRight" => 0x27,
+        "ArrowDown" => 0x28,
+        "PrintScreen" => 0x2C,
+        "NumpadMultiply" => 0x6A,
+        "NumpadAdd" => 0x6B,
+        "NumpadSubtract" => 0x6D,
+        "NumpadDecimal" => 0x6E,
+        "NumpadDivide" => 0x6F,
+        _ => 0,
+    };
+    if fixed != 0 {
+        return Some(fixed);
+    }
+
+    // 連番になっているものは範囲で写す。表に 60 行並べても間違いが増えるだけ。
+    if let Some(rest) = code.strip_prefix("Key") {
+        // KeyA..KeyZ。`code` の仕様上ここは必ず ASCII 大文字 1 文字。
+        let mut chars = rest.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            if c.is_ascii_uppercase() {
+                return Some(c as u32);
+            }
+        }
+        return None;
+    }
+    if let Some(rest) = code.strip_prefix("Digit") {
+        // Digit0..Digit9 (数字列。テンキーは Numpad*)。
+        if let Ok(n) = rest.parse::<u32>() {
+            if n <= 9 && rest.len() == 1 {
+                return Some(0x30 + n);
+            }
+        }
+        return None;
+    }
+    if let Some(rest) = code.strip_prefix("Numpad") {
+        if let Ok(n) = rest.parse::<u32>() {
+            if n <= 9 && rest.len() == 1 {
+                return Some(0x60 + n);
+            }
+        }
+        return None;
+    }
+    if let Some(rest) = code.strip_prefix('F') {
+        // F1..F24。**F13〜F24 は物理キーボードに無くても DOM に届く**ので、
+        // 「他アプリと衝突しないキー」を選ぶ手段としてそのまま使える
+        // (E2E も F13〜F15 を使っている)。
+        if let Ok(n) = rest.parse::<u32>() {
+            if (1..=24).contains(&n) && !rest.starts_with('0') {
+                return Some(0x6F + n);
+            }
+        }
+        return None;
+    }
+    None
+}
+
+/// `code` の列を VK の列へ。1 つでも写せなければ、その `code` を返す。
+///
+/// 「1 つでも」で止めるのは、写せなかったキーを黙って落とすと
+/// **ユーザーが押したのと違う組み合わせが保存される**ため。
+/// 例: 「Win + F13」のつもりで押した結果が「F13」単独になる。
+pub fn codes_to_vks(codes: &[String]) -> Result<Vec<u32>, String> {
+    let mut out = Vec::with_capacity(codes.len());
+    for code in codes {
+        match code_to_vk(code) {
+            Some(vk) => out.push(vk),
+            None => return Err(code.clone()),
+        }
+    }
+    Ok(out)
 }
 
 /// 組み合わせの構成キーに選んでよいか ([`is_allowed_hotkey`] の緩和版)。
@@ -576,13 +709,6 @@ pub enum HotkeyEventKind {
     Press { mode: HotkeyMode },
     /// ホットキーが離された。`mode` は押されたときと同じ用途。
     Release { mode: HotkeyMode },
-    /// 捕獲モード中にキーが押された。PTT の解釈は行わない。
-    ///
-    /// `generation` は押された時点の捕獲世代。設定 UI はこれで
-    /// 「今進行中の捕獲」だけを採用する (古いセッションの残骸を捨てる)。
-    CapturedDown { vk: u32, generation: u64 },
-    /// 捕獲モード中にキーが離された。組み合わせの確定タイミングを作る。
-    CapturedUp { vk: u32, generation: u64 },
     /// 録音中にキャンセルキーが押された。PTT の解釈は行わない
     /// (コントローラが録音を破棄する)。
     Cancel,
@@ -772,24 +898,15 @@ fn handle_key_event(message: u32, lparam: LPARAM) {
         combos[slot] = Some(combo);
     }
 
-    // 捕獲モード中は、押した / 離したをそのまま報告する。
-    // ここで PTT の判定に混ぜると、設定中に録音が始まってしまう。
-    // 確定は「捕獲したキーをすべて離した瞬間」で、コントローラ側が行う。
+    // 捕獲モード中は、キーを一切解釈せずに捨てる。
+    //
+    // 捕獲そのものはフロントの DOM イベントが行う ([`CAPTURE_MODE`] の doc)。
+    // ここが担うのは**消音**だけ: 捕獲中に押されるのは多くの場合いま設定中の
+    // ホットキーそのもの (既定なら 左Ctrl+Space) なので、PTT として解釈すると
+    // 「キーを設定しようとしただけで録音が始まる」。キャンセルキー (Esc) も
+    // 同じ理由で通さない — 捕獲の取り消しは DOM 側で処理する。
+    // キー自体は抑制しない (呼び出し元が必ず `CallNextHookEx` へ流す)。
     if CAPTURE_MODE.load(Ordering::SeqCst) {
-        let generation = CAPTURE_GENERATION.load(Ordering::SeqCst);
-        let kind = if is_down {
-            HotkeyEventKind::CapturedDown {
-                vk: info.vkCode,
-                generation,
-            }
-        } else {
-            HotkeyEventKind::CapturedUp {
-                vk: info.vkCode,
-                generation,
-            }
-        };
-        CAPTURE_EVENTS_SENT.fetch_add(1, Ordering::Relaxed);
-        send(HotkeyEvent::new(kind));
         return;
     }
 
@@ -1028,28 +1145,125 @@ fn spawn_hook_watchdog() {
                     last_seen = seen; // 実キーが流れている = 生きている。
                     continue;
                 }
-                let before = HEARTBEAT_SEEN.load(Ordering::SeqCst);
-                if !send_heartbeat_key() {
-                    continue; // 送れないときは判定しない (欠測であって故障ではない)。
-                }
-                let deadline = Instant::now() + HEARTBEAT_GRACE;
-                while HEARTBEAT_SEEN.load(Ordering::SeqCst) == before && Instant::now() < deadline {
-                    thread::sleep(Duration::from_millis(20));
-                }
-                if HEARTBEAT_SEEN.load(Ordering::SeqCst) == before {
-                    log::warn!(
-                        "キーボードフックが応答しません (生存確認のキーを観測できない)。再設置します"
-                    );
-                    // SAFETY: 引数は数値のみ。宛先スレッドが無ければ Err が返るだけ。
-                    if let Err(e) =
-                        unsafe { PostThreadMessageW(tid, WM_REHOOK, WPARAM(0), LPARAM(0)) }
-                    {
-                        log::error!("フックスレッドへの再設置要求に失敗: {e}");
-                    }
+                match probe_hook_alive() {
+                    HookProbe::Alive => {}
+                    // 送れないときは判定しない (欠測であって故障ではない)。
+                    HookProbe::Unknown => {}
+                    HookProbe::Silent => request_rehook(tid, "定期の生存確認"),
                 }
                 last_seen = HOOK_EVENTS_SEEN.load(Ordering::SeqCst);
             }
         });
+}
+
+/// 生存確認の結果。
+///
+/// **`Silent` は「フックが死んでいる」の証明ではない**。生存確認は
+/// `SendInput` で自分宛にキーを 1 打送るが、[SendInput の MSDN][si] によれば
+/// UIPI でブロックされた場合、**戻り値でも `GetLastError` でも判別できない**
+/// (昇格したウィンドウが前景にあるときなど)。つまり「生きているフックを
+/// 再設置する」偽陽性が構造的に混ざる。再設置自体は無害だが、
+/// ログが騒がしくなると本物の故障が埋もれるので、
+/// 再設置ログには**そのとき前景だったプロセス名**を必ず添える
+/// ([`request_rehook`])。切り分けの手掛かりはそこにしか無い。
+///
+/// [si]: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookProbe {
+    /// ダミーキーがフックまで届いた = 生きている。
+    Alive,
+    /// 送ったのに観測できなかった = 死んでいる**か**、送出が握り潰された。
+    Silent,
+    /// そもそも送れなかった。判定不能 (欠測)。
+    Unknown,
+}
+
+/// ダミーキーを 1 打送って、自分のフックが観測できるか確かめる。
+fn probe_hook_alive() -> HookProbe {
+    let before = HEARTBEAT_SEEN.load(Ordering::SeqCst);
+    if !send_heartbeat_key() {
+        return HookProbe::Unknown;
+    }
+    let deadline = Instant::now() + HEARTBEAT_GRACE;
+    while HEARTBEAT_SEEN.load(Ordering::SeqCst) == before && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    if HEARTBEAT_SEEN.load(Ordering::SeqCst) == before {
+        HookProbe::Silent
+    } else {
+        HookProbe::Alive
+    }
+}
+
+/// フックスレッドへ再設置を要求する。
+///
+/// 前景プロセス名を必ず添える ([`HookProbe`] の doc)。昇格したウィンドウが
+/// 前景にある間は `SendInput` が UIPI で捨てられ、生きているフックでも
+/// `Silent` になる。ログにその名前が並んでいれば、後から
+/// 「本当に外れていた」のか「偽陽性だった」のかを読み分けられる。
+fn request_rehook(tid: u32, reason: &str) {
+    let foreground = crate::foreground::capture_foreground();
+    log::warn!(
+        "キーボードフックが応答しません ({reason}: 生存確認のキーを観測できない)。再設置します \
+         [そのときの前景プロセス: {} / 昇格ウィンドウが前景だと生存確認だけが届かないことがある]",
+        if foreground.process_name.is_empty() {
+            "<unknown>"
+        } else {
+            foreground.process_name.as_str()
+        }
+    );
+    // SAFETY: 引数は数値のみ。宛先スレッドが無ければ Err が返るだけ。
+    if let Err(e) = unsafe { PostThreadMessageW(tid, WM_REHOOK, WPARAM(0), LPARAM(0)) } {
+        log::error!("フックスレッドへの再設置要求に失敗: {e}");
+    }
+}
+
+/// 「今すぐ」フックの生存を確かめ、応答が無ければ再設置させる。
+///
+/// # なぜ捕獲の開始時に呼ぶのか
+///
+/// 捕獲そのものは DOM イベントへ移したのでフックに依存しない
+/// ([`CAPTURE_MODE`] の doc)。しかし**PTT 経路は引き続きフックに依存する**。
+/// ホットキーを設定した直後こそユーザーが押して試す瞬間なので、
+/// そこで「設定はできたのに押しても録音が始まらない」に当たると、
+/// 原因がフックの脱落だと気づく手掛かりが何も無い。
+///
+/// 定期の番犬 ([`spawn_hook_watchdog`]) は 15 秒周期で、しかも
+/// 「無操作のとき」しか確認しない。捕獲の前後はまさに人がキーを打っている
+/// 時間帯なので、番犬は動かない。ここで能動的に 1 回確かめる。
+///
+/// 呼び出し側をブロックしないよう、確認は自前のスレッドで行う
+/// (最悪 [`HEARTBEAT_GRACE`] + 再確認ぶん待つ)。捕獲の開始表示を
+/// 1 秒近く遅らせると、それはそれで「押しても反応しない」に見える。
+pub fn ensure_hook_alive_async(reason: &'static str) {
+    let tid = HOOK_THREAD_ID.load(Ordering::SeqCst);
+    if tid == 0 {
+        return; // フックスレッドが居ない (未設置 / 終了処理中)。
+    }
+    let spawned = thread::Builder::new()
+        .name("nox-hook-health".to_string())
+        .spawn(move || match probe_hook_alive() {
+            HookProbe::Alive => log::info!("フックの生存を確認 ({reason})"),
+            HookProbe::Unknown => {
+                log::info!("フックの生存確認を送れませんでした ({reason})。判定は見送る")
+            }
+            HookProbe::Silent => {
+                request_rehook(tid, reason);
+                // 再設置が効いたかまで見る。効いていなければ、次に押しても
+                // 発火しないことが**この時点で**分かる (ログに残る)。
+                thread::sleep(Duration::from_millis(200));
+                match probe_hook_alive() {
+                    HookProbe::Alive => log::info!("再設置後にフックの生存を確認"),
+                    HookProbe::Silent => log::warn!(
+                        "再設置してもフックが応答しません。ホットキーが効かない可能性があります"
+                    ),
+                    HookProbe::Unknown => {}
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("フックの生存確認スレッドを起動できません: {e}");
+    }
 }
 
 /// 生存確認用のダミーキーを 1 打送る。送れたら `true`。
@@ -1137,9 +1351,7 @@ impl PttInterpreter {
         match event.kind {
             HotkeyEventKind::Press { .. } => self.on_press(event.at),
             HotkeyEventKind::Release { .. } => self.on_release(event.at),
-            // 捕獲は設定操作であって録音操作ではない。
-            HotkeyEventKind::CapturedDown { .. } | HotkeyEventKind::CapturedUp { .. } => None,
-            // キャンセルも解釈器を通らない。コントローラが直接処理し、
+            // キャンセルは解釈器を通らない。コントローラが直接処理し、
             // この解釈器の押下状態は reset() で捨てられる。
             HotkeyEventKind::Cancel => None,
         }
@@ -1522,6 +1734,9 @@ mod tests {
         assert_eq!(key_label(0x14), "CapsLock");
         assert_eq!(key_label(0x70), "F1");
         assert_eq!(key_label(0x7B), "F12");
+        // 回帰: F13〜F24 は許可されているのに名前が無く、「VK 0x7C」と出ていた。
+        assert_eq!(key_label(0x7C), "F13");
+        assert_eq!(key_label(0x87), "F24");
         assert_eq!(key_label(0x41), "A");
         assert_eq!(key_label(0x30), "0");
         assert_eq!(key_label(0x60), "テンキー 0");
@@ -1701,24 +1916,6 @@ mod tests {
         assert!(end_capture(Some(generation)));
         assert!(!end_capture(Some(generation)), "二重終了で true を返した");
         assert!(!end_capture(None));
-    }
-
-    #[test]
-    fn a_captured_event_is_not_a_recording_action() {
-        // 設定操作で録音が始まってはいけない。
-        let mut it = interp();
-        for vk in [0x70u32, 0x20, 0xA2] {
-            let event = HotkeyEvent {
-                kind: HotkeyEventKind::CapturedDown { vk, generation: 1 },
-                at: Instant::now(),
-            };
-            assert_eq!(it.on_event(event), None);
-            let event = HotkeyEvent {
-                kind: HotkeyEventKind::CapturedUp { vk, generation: 1 },
-                at: Instant::now(),
-            };
-            assert_eq!(it.on_event(event), None);
-        }
     }
 
     #[test]
@@ -1932,22 +2129,18 @@ mod tests {
         set_recording_active(true);
         drain(&rx);
 
-        // 捕獲モード中は Esc も「押されたキー」として報告される (従来動作)。
-        // ここで Cancel として扱うと、設定中に録音が破棄されてしまう。
+        // 捕獲モード中の Esc は「捕獲の取り消し」であって録音の破棄ではない。
+        // 取り消しは DOM 側 (フォーカスのあるウィンドウ) が処理するので、
+        // フックはここで何も出してはいけない。
         let previous = CAPTURE_MODE.swap(true, Ordering::SeqCst);
         feed_key(DEFAULT_CANCEL_VK as i32, WM_KEYDOWN);
-        let event = rx.try_recv().expect("捕獲イベントが届かない");
-        assert_eq!(
-            event.kind,
-            HotkeyEventKind::CapturedDown {
-                vk: DEFAULT_CANCEL_VK,
-                generation: CAPTURE_GENERATION.load(Ordering::SeqCst),
-            },
+        assert!(
+            rx.try_recv().is_err(),
             "捕獲モード中に Cancel 側へ吸われた"
         );
         assert!(
             !CANCEL_IS_DOWN.load(Ordering::SeqCst),
-            "捕獲経路で押下状態が汚れた"
+            "捕獲中の Esc で押下状態が汚れた"
         );
 
         CAPTURE_MODE.store(previous, Ordering::SeqCst);
@@ -2333,9 +2526,13 @@ mod tests {
     }
 
     #[test]
-    fn capture_reports_both_down_and_up_with_the_generation() {
+    fn capture_mode_mutes_the_ptt_path_entirely() {
+        // 捕獲中に現行ホットキー (左Ctrl+Space) をそのまま押しても、
+        // 録音が始まってはいけない。捕獲そのものは DOM 側が拾うので、
+        // フックがここで出すべきイベントは 1 件も無い。
         let _guard = hook_state_lock();
         let rx = hook_events();
+        set_mode_hotkey(HotkeyMode::Inject, Some(ctrl_space()));
         let generation = begin_capture();
         drain(&rx);
 
@@ -2343,35 +2540,91 @@ mod tests {
         feed_key(0x20, WM_KEYDOWN);
         feed_key(0xA2, WM_KEYUP);
         feed_key(0x20, WM_KEYUP);
-
-        let kinds: Vec<_> = (0..4)
-            .filter_map(|_| rx.try_recv().ok())
-            .map(|e| e.kind)
-            .collect();
-        assert_eq!(
-            kinds,
-            vec![
-                HotkeyEventKind::CapturedDown {
-                    vk: 0xA2,
-                    generation
-                },
-                HotkeyEventKind::CapturedDown {
-                    vk: 0x20,
-                    generation
-                },
-                HotkeyEventKind::CapturedUp {
-                    vk: 0xA2,
-                    generation
-                },
-                HotkeyEventKind::CapturedUp {
-                    vk: 0x20,
-                    generation
-                },
-            ],
-            "捕獲イベントの列が違う"
+        assert!(
+            rx.try_recv().is_err(),
+            "捕獲中にフックがイベントを出した (設定しようとしただけで録音が始まる)"
         );
 
+        // 捕獲を抜ければ、同じキーが普通にホットキーとして働く。
         end_capture(Some(generation));
+        feed_key(0xA2, WM_KEYDOWN);
+        feed_key(0x20, WM_KEYDOWN);
+        assert_eq!(
+            rx.try_recv().map(|e| e.kind).ok(),
+            Some(HotkeyEventKind::Press {
+                mode: HotkeyMode::Inject
+            }),
+            "捕獲を抜けたのにホットキーが復帰しない"
+        );
+        feed_key(0x20, WM_KEYUP);
+        feed_key(0xA2, WM_KEYUP);
+        drain(&rx);
+
+        set_mode_hotkey(HotkeyMode::Inject, Some(HotkeyCombo::default()));
+    }
+
+    #[test]
+    fn dom_codes_map_to_the_virtual_keys_the_rest_of_the_module_expects() {
+        // 写像は 1 か所しか無い ([`code_to_vk`] の doc)。ここがずれると
+        // 「押したキーと違うホットキーが保存される」形で表面化する。
+        assert_eq!(code_to_vk("ControlLeft"), Some(0xA2));
+        assert_eq!(code_to_vk("ControlRight"), Some(0xA3));
+        assert_eq!(code_to_vk("ShiftLeft"), Some(0xA0));
+        assert_eq!(code_to_vk("AltRight"), Some(0xA5));
+        assert_eq!(code_to_vk("MetaLeft"), Some(0x5B));
+        assert_eq!(code_to_vk("CapsLock"), Some(0x14));
+        assert_eq!(code_to_vk("Space"), Some(0x20));
+        assert_eq!(code_to_vk("Escape"), Some(ESCAPE_VK));
+        assert_eq!(code_to_vk("Convert"), Some(0x1C));
+        assert_eq!(code_to_vk("NonConvert"), Some(0x1D));
+        // 連番の端。F13〜F24 は物理キーが無くても DOM に届く。
+        assert_eq!(code_to_vk("F1"), Some(0x70));
+        assert_eq!(code_to_vk("F12"), Some(0x7B));
+        assert_eq!(code_to_vk("F13"), Some(0x7C));
+        assert_eq!(code_to_vk("F24"), Some(0x87));
+        assert_eq!(code_to_vk("KeyA"), Some(0x41));
+        assert_eq!(code_to_vk("KeyZ"), Some(0x5A));
+        assert_eq!(code_to_vk("Digit0"), Some(0x30));
+        assert_eq!(code_to_vk("Digit9"), Some(0x39));
+        assert_eq!(code_to_vk("Numpad0"), Some(0x60));
+
+        // 範囲外・でっち上げは写さない。
+        assert_eq!(code_to_vk("F0"), None);
+        assert_eq!(code_to_vk("F25"), None);
+        assert_eq!(code_to_vk("F01"), None);
+        assert_eq!(code_to_vk("KeyAB"), None);
+        assert_eq!(code_to_vk("Digit10"), None);
+        assert_eq!(code_to_vk(""), None);
+        assert_eq!(code_to_vk("Fn"), None);
+        // ブラウザによっては `Unidentified` が来る。設定に使ってはいけない。
+        assert_eq!(code_to_vk("Unidentified"), None);
+    }
+
+    #[test]
+    fn mapped_codes_round_trip_through_the_existing_labels_and_rules() {
+        // DOM 方式にしても、許可判定と表示名は既存の Rust 側をそのまま通る。
+        let keys = codes_to_vks(&["ControlLeft".into(), "F13".into()]).expect("写せるはず");
+        assert_eq!(keys, vec![0xA2, 0x7C]);
+        assert_eq!(describe_keys(&keys), "左 Ctrl + F13");
+        match decide_capture_combo(&keys) {
+            CaptureOutcome::Accept(combo) => assert_eq!(combo.label(), "左 Ctrl + F13"),
+            other => panic!("採用されなかった: {other:?}"),
+        }
+
+        // 押しっぱなしで実害が出るキーは、DOM 経由でも同じ理由で拒否される。
+        let enter = codes_to_vks(&["Enter".into()]).expect("Enter は写せる");
+        assert!(matches!(
+            decide_capture_combo(&enter),
+            CaptureOutcome::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn an_unmappable_code_is_reported_rather_than_silently_dropped() {
+        // 黙って落とすと「Win + F13」のつもりが「F13」単独で保存される。
+        let err = codes_to_vks(&["MediaPlayPause".into(), "F13".into()])
+            .expect_err("写せない code があれば失敗するはず");
+        assert_eq!(err, "MediaPlayPause");
     }
 
     #[test]

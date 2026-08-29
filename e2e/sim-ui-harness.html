@@ -54,6 +54,9 @@
           formatting_enabled: true,
           injection_enabled: true,
           deep_context: false,
+          // 実 ConfigView にはあるがモックから抜けていた。Object.assign で初回保存時に
+          // 勝手に生えるので今日は動くが、保存前に読むテストを書くと undefined になる。
+          screen_ask_enabled: false,
           // 由来の 3 通り (既定 / 既定を編集 / ユーザー作成) をそろえる。
           // 1 種類だけにすると、バッジの出し分けが検査できない。
           style_profiles: [
@@ -162,6 +165,8 @@
           },
           config,
           failing,
+          /** コマンド名 -> 応答を遅らせるミリ秒。IPC の往復時間を模す。 */
+          delays: {},
           /** 登録済みリスナ: event 名 -> handler id の配列。 */
           listeners: new Map(),
           callbacks: new Map(),
@@ -190,6 +195,24 @@
           },
         };
 
+        /** `hotkey::describe_keys(code_to_vk(..))` の最小の写し。
+         *
+         * 網羅はしない。テストで使う code だけを本物と同じ綴りにする
+         * (綴りがずれると「経過表示と確定後で名前が違う」を見逃す)。 */
+        function describeCodes(codes) {
+          const names = {
+            ControlLeft: "左 Ctrl",
+            ControlRight: "右 Ctrl",
+            ShiftLeft: "左 Shift",
+            AltLeft: "左 Alt",
+            Space: "Space",
+            Enter: "Enter",
+          };
+          return codes
+            .map((c) => names[c] ?? (/^F([1-9]|1\d|2[0-4])$/.test(c) ? c : `VK ${c}`))
+            .join(" + ");
+        }
+
         function handle(cmd, args) {
           if (failing.has(cmd)) {
             // Rust 側の `Result::Err(String)` は文字列として reject される。
@@ -213,7 +236,12 @@
             case "get_config":
               return Promise.resolve(structuredClone(mock.config));
             case "set_config":
+              // Rust の `Config::update` はパッチを反映してから view を返す。
+              // ここも同じように反映しないと、`renderConfig` が元の値で
+              // チェックボックスを上書きしてしまい、「保存しても画面に残らない」
+              // 不具合を検出できない (実機 E2E の代わりにならない穴になる)。
               mock.lastPatch = structuredClone(args.patch);
+              Object.assign(mock.config, args.patch);
               return Promise.resolve(structuredClone(mock.config));
             case "get_history": {
               const start = args.beforeId == null ? 1000 : args.beforeId - 1;
@@ -248,6 +276,35 @@
               return Promise.resolve(10);
             case "cancel_hotkey_capture":
               return Promise.resolve();
+            // --- キー捕獲は DOM 方式 (2026-08-28)。フロントが集めた
+            // `KeyboardEvent.code` の列を Rust へ渡し、VK への変換・許可判定・
+            // 表示名は Rust 側が行う (src-tauri/src/hotkey.rs)。
+            // モックは**同じ入出力の形**だけを真似る。判定の正しさは
+            // Rust の単体テスト側 (hotkey::tests) で見ること。
+            case "describe_hotkey_codes":
+              return Promise.resolve(describeCodes(args.codes ?? []));
+            case "finish_hotkey_capture": {
+              const codes = args.codes ?? [];
+              // 拒否側も再現する。lib::CaptureVerdict と**同じタグ付きの形**で
+              // 返すこと (`Err` ではない — 拒否は捕獲を終わらせない普通の分岐)。
+              //
+              // Enter は「押しっぱなしで入力先へ流れる」、Space 単独は
+              // `is_allowed_hotkey` が許さない。どちらも Rust が拒否する代表例。
+              const rejected =
+                codes.includes("Enter") ? "Enter"
+                : codes.length === 1 && codes[0] === "Space" ? "Space"
+                : null;
+              if (rejected) {
+                return Promise.resolve({
+                  verdict: "rejected",
+                  message: `「${rejected}」はホットキーに使えません。押している間ずっと入力先へ流れてしまいます。`,
+                });
+              }
+              const label = describeCodes(codes);
+              mock.config.hotkey_label = label;
+              mock.emit("nox://hotkey-captured", { label });
+              return Promise.resolve({ verdict: "accepted" });
+            }
             case "clear_hotkey":
               mock.config.clipboard_hotkey_vk = 0;
               mock.config.clipboard_hotkey_mods = [];
@@ -268,7 +325,20 @@
           },
           invoke(cmd, args = {}) {
             mock.invokes.push({ cmd, args: structuredClone(args ?? {}) });
-            return handle(cmd, args ?? {});
+            const result = handle(cmd, args ?? {});
+            // 往復に時間がかかる状況を再現できるようにする。
+            //
+            // 本物の invoke は IPC なので、呼んでから応答が返るまでに
+            // **必ず空白の時間がある**。モックが即座に解決すると、その空白に
+            // 依存する不具合 (「フラグを await の後で立てたせいで、その間の
+            // キーが素通りする」) がテストをすり抜ける。実測でまさにそれが
+            // 起きたので、遅延を注入できるようにした (mock.delays[cmd] = ms)。
+            const delay = mock.delays[cmd];
+            if (!delay) return result;
+            return result.then(
+              (v) => new Promise((r) => setTimeout(() => r(v), delay)),
+              (e) => new Promise((_, j) => setTimeout(() => j(e), delay)),
+            );
           },
         };
         // listen() の unlisten 経路が触る。無いと unlisten で例外になる。
