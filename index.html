@@ -169,7 +169,7 @@
              失敗の報せが消える。 -->
         <p class="error" id="error" role="alert" hidden></p>
 
-        <form id="settings-form">
+        <form id="settings-form" novalidate>
           <!-- ===== ホーム ===================================================== -->
           <section
             class="section"
@@ -905,7 +905,7 @@
                     id="typing-speed"
                     min="10"
                     max="2000"
-                    step="10"
+                    step="1"
                     aria-describedby="typing-speed-note"
                   />
                   <span class="field-note" id="typing-speed-note">

@@ -1282,6 +1282,51 @@ async function main() {
     });
   }
 
+  // --- U15: 設定値がブラウザの検証に引っかかっても保存できる (実機で発生した不具合の回帰)
+  //
+  // 実機では `typing_speed_chars_per_min = 35` が `step="10"` に乗らず :invalid になり、
+  // **その欄が非表示の区画にあったためブラウザがフォーカスできず、理由も出さずに
+  // submit を握り潰していた**。保存ボタンが「押しても何も起きない」状態で、
+  // ログにもエラー帯にも何も出なかった。
+  //
+  // U4 がこれを見逃したのは、モックの値 300 がたまたま刻みに乗っていたから。
+  // ここでは**刻みに乗らない値**を入れ、かつ `requestSubmit()` ではなく
+  // **実際のボタンを押して**、Rust まで届くことを見る。
+  await check("U15 刻みに乗らない設定値でも保存ボタンが Rust まで届く", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      // 実機と同じ「刻みに乗らない」値を欄へ入れる (設定から描かれた状態の再現)。
+      window.__NOX_MOCK__.lastPatch = null;
+      document.querySelector('.nav-item[data-section="app"]').click();
+      await new Promise((r) => setTimeout(r, 150));
+      document.getElementById("typing-speed").value = "35";
+
+      const form = document.getElementById("settings-form");
+      const invalid = [...form.querySelectorAll(":invalid")].map((e) => e.id);
+      // 別区画へ移ってから押す (実機の再現条件: 無効な欄が見えていない)。
+      document.querySelector('.nav-item[data-section="dictionary"]').click();
+      await new Promise((r) => setTimeout(r, 150));
+
+      let submits = 0;
+      form.addEventListener("submit", () => { submits++; }, { once: true });
+      document.querySelector('#savebar button[type=submit]').click();
+      await new Promise((r) => setTimeout(r, 300));
+      return {
+        invalid,
+        submits,
+        speed: window.__NOX_MOCK__.lastPatch?.typing_speed_chars_per_min ?? null,
+        note: document.getElementById("settings-note").textContent,
+      };
+    `);
+    return {
+      ok: r.submits === 1 && r.speed === 35 && r.note === "保存しました",
+      detail:
+        r.submits === 1 && r.speed === 35
+          ? `submit=${r.submits} / 送った打鍵速度=${r.speed} / note="${r.note}" / :invalid=[${r.invalid.join(",")}]`
+          : `submit=${r.submits} / 打鍵速度=${r.speed} / note="${r.note}" / :invalid=[${r.invalid.join(",")}] — 保存が届いていない`,
+    };
+  });
+
   const failed = results.filter((r) => r.verdict === "FAIL");
   console.log(`\n=== PASS ${results.length - failed.length} / FAIL ${failed.length} (全 ${results.length}) ===`);
   console.log("疑似テストなので、緑でも実機 E2E (e2e/hotkey.mjs) の代わりにはならない。");
