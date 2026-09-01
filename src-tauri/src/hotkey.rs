@@ -476,6 +476,18 @@ pub fn key_label(vk: u32) -> String {
         0x1D => "無変換",
         0x1C => "変換",
         0xF3 | 0xF4 => "半角/全角",
+        // 以下は「一覧から選ぶ」UI ([`hotkey_key_catalog`]) に**並べる**ために
+        // 名前が要る。選べないキーも理由つきで一覧へ出す方針なので、名前が無いと
+        // 「VK 0x2C はホットキーに使えません」という、どのキーの話か
+        // 分からない文言が画面に出てしまう。
+        0x5D => "アプリケーション",
+        0x2C => "PrintScreen",
+        0x90 => "NumLock",
+        0x15 => "かな",
+        0x25 => "←",
+        0x26 => "↑",
+        0x27 => "→",
+        0x28 => "↓",
         // F1〜F24。**F13 以降まで名前を持つ**必要がある: `is_allowed_hotkey` は
         // 昔から F24 まで許しているのに、ここは F12 までしか名前を知らず、
         // F13 を選ぶと「VK 0x7C」と表示されていた。DOM 捕獲では F13〜F24 が
@@ -700,6 +712,208 @@ pub fn sanitize_combo(mods: &[u32], vk: u32) -> Option<HotkeyCombo> {
     let mut arr = [0u32; MAX_HOTKEY_MODS];
     arr[..cleaned.len()].copy_from_slice(&cleaned);
     Some(HotkeyCombo { mods: arr, vk })
+}
+
+// --- 一覧から選ぶ (2026-08-31) ----------------------------------------------
+//
+// # なぜ捕獲だけでは足りないのか
+//
+// 捕獲 UI (「キーを押して設定」) は**押せるキーしか設定できない**。
+// Stream Deck のペダルに割り当てた F13 / F14 は物理キーボードに存在せず、
+// DOM の `keydown` が来る道が無い。実際に呼び出し元は config.json を
+// 直接書いて回避していた。設定ファイルを手で書かせるのは UI の敗北なので、
+// 「押さずに選ぶ」経路を足す。
+//
+// # なぜ一覧を Rust で組み立てるのか
+//
+// フロントにキー名の表を持たせると、[`key_label`] / [`is_allowed_hotkey`] /
+// [`is_allowed_combo_key`] を直した日に片方だけが古いままになり、
+// **一覧には出るのに確定できないキー**(あるいは逆)が生まれる。
+// [`code_to_vk`] の doc と同じ理由で、表はこの 1 か所に閉じる。
+
+/// 一覧のカテゴリ。フロントは並び順もこの配列のとおりに描く。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct HotkeyKeyCategory {
+    /// 安定した id ([`HotkeyKeyOption::category`] と対応)。
+    pub id: &'static str,
+    /// 見出しに出す名前。
+    pub label: &'static str,
+    /// そのカテゴリを開いた人への一言 (空なら出さない)。
+    pub hint: &'static str,
+}
+
+/// 一覧に出す 1 キー分。
+///
+/// **「選べるか」を 2 つの真偽値で持つ**のが要点。修飾キーを 1 つも選んで
+/// いない状態と、1 つ以上選んだ状態とで基準が変わる ([`sanitize_combo`]) ので、
+/// フロントは「今チェックされている修飾キーの数」だけを見てどちらかを読めば、
+/// 判定を再実装せずに**選べる/選べないの遷移**を描ける。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct HotkeyKeyOption {
+    pub vk: u32,
+    /// 表示名 ([`key_label`])。捕獲で設定したときのラベルと同じ綴りになる。
+    pub label: String,
+    /// 所属カテゴリ ([`HotkeyKeyCategory::id`])。
+    pub category: &'static str,
+    /// 修飾キー無しの単独トリガーとして選べるか ([`is_allowed_hotkey`])。
+    pub alone: bool,
+    /// 修飾キーを 1 つ以上付ければ選べるか ([`is_allowed_combo_key`])。
+    pub with_mods: bool,
+    /// 修飾キーそのものか ([`is_modifier`])。修飾キーの選択肢にも出す。
+    pub is_modifier: bool,
+    /// 選べないときの理由 (選べるなら空)。
+    ///
+    /// **灰色にするだけにしない**ための文言。「なぜ Enter が選べないのか」に
+    /// 答えられないと、利用者は壊れていると解釈して押し続ける。
+    pub note: String,
+}
+
+const CAT_MODIFIER: &str = "modifier";
+const CAT_FUNCTION: &str = "function";
+const CAT_NUMPAD: &str = "numpad";
+const CAT_EDIT: &str = "edit";
+const CAT_IME: &str = "ime";
+const CAT_ALNUM: &str = "alnum";
+const CAT_OTHER: &str = "other";
+
+/// カテゴリの一覧と並び順。
+///
+/// 並びは**このアプリで実際に選ばれるものが先**。Stream Deck のメニューは
+/// 英数文字が先頭に来るが、nox-voice では文字キーは 1 つも選べない
+/// ([`is_allowed_combo_key`] が拒否する) ので先頭に置く意味が無い。
+/// ペダル運用の本命である F キーを 2 番目に置き、**F13 に 3 クリック
+/// (一覧を開く → F キー → F13) で届く**ようにする。
+pub fn hotkey_key_categories() -> Vec<HotkeyKeyCategory> {
+    vec![
+        HotkeyKeyCategory {
+            id: CAT_MODIFIER,
+            label: "修飾キー (左右を区別)",
+            hint: "単独でも、組み合わせの一部にも使えます",
+        },
+        HotkeyKeyCategory {
+            id: CAT_FUNCTION,
+            label: "F キー (F1〜F24)",
+            hint: "F13〜F24 は物理キーボードに無い分、他アプリと衝突しません (ペダル向き)",
+        },
+        HotkeyKeyCategory {
+            id: CAT_NUMPAD,
+            label: "テンキー",
+            hint: "修飾キーと組み合わせたときだけ選べます",
+        },
+        HotkeyKeyCategory {
+            id: CAT_EDIT,
+            label: "編集・移動キー",
+            hint: "Space 以外は、押している間ずっと入力先へ流れるため選べません",
+        },
+        HotkeyKeyCategory {
+            id: CAT_IME,
+            label: "IME・ロック系",
+            hint: "",
+        },
+        HotkeyKeyCategory {
+            id: CAT_ALNUM,
+            label: "英数字",
+            hint: "文字キーは Ctrl+S のような既存の操作を奪うため、このアプリでは選べません",
+        },
+        HotkeyKeyCategory {
+            id: CAT_OTHER,
+            label: "その他",
+            hint: "",
+        },
+    ]
+}
+
+/// 選べないキーに添える理由。
+///
+/// 既定の文言は [`is_allowed_hotkey`] の doc がそのまま根拠 (押しっぱなしで
+/// 挿入先へ流れ続ける)。**それが理由ではないキーだけ**を個別に言う —
+/// Esc に「入力先へ流れる」と書いても嘘になり、利用者は納得できない。
+fn unusable_reason(vk: u32) -> String {
+    match vk {
+        ESCAPE_VK => "Esc は設定の取り消しと録音のキャンセルに使うため、ホットキーには選べません"
+            .to_string(),
+        // 押すたびに別の VK が来るキー。片方だけ登録すると 2 回に 1 回しか
+        // 効かない ([`is_allowed_hotkey`] の doc)。
+        0xF3 | 0xF4 | 0x15 => {
+            "このキーは押すたびに別のキーコードを送るため、確実に発火しません".to_string()
+        }
+        // 文字を流すわけでも、押すたびに VK が変わるわけでもないキー
+        // (PrintScreen・NumLock)。既定の文言を付けると**理由が嘘になる**ので、
+        // 中立に「対象外」とだけ言う。分からないことを分かった風に書かない。
+        0x2C | 0x90 => "このアプリの許可規則の対象外のキーです".to_string(),
+        _ => "押している間ずっと入力先アプリへ流れ続けるため、ホットキーには選べません".to_string(),
+    }
+}
+
+/// 1 キー分の選択肢を作る。判定は既存の許可規則からしか作らない。
+fn key_option(vk: u32, category: &'static str) -> HotkeyKeyOption {
+    let alone = is_allowed_hotkey(vk);
+    let with_mods = is_allowed_combo_key(vk);
+    HotkeyKeyOption {
+        vk,
+        label: key_label(vk),
+        category,
+        alone,
+        with_mods,
+        is_modifier: is_modifier(vk),
+        note: if with_mods {
+            if alone {
+                String::new()
+            } else {
+                // 状態遷移を言葉で示す。灰色になっている理由と、
+                // それを解く方法が同じ 1 文に入っている必要がある。
+                "修飾キー (Ctrl / Alt / Shift / Win) を 1 つ以上選ぶと使えます".to_string()
+            }
+        } else {
+            unusable_reason(vk)
+        },
+    }
+}
+
+/// 一覧に出すキーの全体。
+///
+/// **選べないキーもあえて載せる**。載せないと「Enter が無いのは不具合か、
+/// 意図か」が分からず、探し続けることになる。載せたうえで
+/// [`HotkeyKeyOption::note`] に理由を添える方が、探す時間も問い合わせも減る。
+pub fn hotkey_key_catalog() -> Vec<HotkeyKeyOption> {
+    let mut out = Vec::new();
+    let mut push = |vk: u32, category: &'static str| out.push(key_option(vk, category));
+
+    // 修飾キー。並びは表示順 ([`modifier_order`]) に合わせる — 一覧と
+    // 確定後のラベル (「左 Ctrl + F13」) で Ctrl / Alt / Shift / Win の
+    // 順序が食い違うと、同じものを見ている気がしなくなる。
+    for vk in [0xA2, 0xA3, 0xA4, 0xA5, 0xA0, 0xA1, 0x5B, 0x5C] {
+        push(vk, CAT_MODIFIER);
+    }
+    // F1〜F24。**この経路の存在理由**なので、範囲で機械的に出す。
+    for vk in 0x70..=0x87 {
+        push(vk, CAT_FUNCTION);
+    }
+    for vk in 0x60..=0x69 {
+        push(vk, CAT_NUMPAD);
+    }
+    for vk in [
+        0x09, 0x20, 0x0D, 0x08, 0x2D, 0x2E, 0x24, 0x23, 0x21, 0x22, 0x25, 0x26, 0x27, 0x28, 0x1B,
+    ] {
+        push(vk, CAT_EDIT);
+    }
+    for vk in [0x14, 0x91, 0x13, 0x1C, 0x1D, 0xF3, 0x15] {
+        push(vk, CAT_IME);
+    }
+    for vk in 0x30..=0x39 {
+        push(vk, CAT_ALNUM);
+    }
+    for vk in 0x41..=0x5A {
+        push(vk, CAT_ALNUM);
+    }
+    // PrintScreen (0x2C) と NumLock (0x90) は**中立の理由**で載せる。
+    // どちらも「押している間ずっと入力先へ流れる」は当てはまらないので、
+    // [`unusable_reason`] 側で分けてある。理由を書き分けられる以上、
+    // 片方だけ載せない扱いにする根拠は無い。
+    for vk in [0x5D, 0x2C, 0x90] {
+        push(vk, CAT_OTHER);
+    }
+    out
 }
 
 /// フックが観測した生のキーイベントの種別。
@@ -1876,6 +2090,152 @@ mod tests {
         assert_eq!(key_label(0x1D), "無変換");
         // 知らないキーでも読める形にする (空文字にしない)。
         assert_eq!(key_label(0xFE), "VK 0xFE");
+    }
+
+    // --- 一覧から選ぶ (2026-08-31) -----------------------------------------
+
+    fn catalog_entry(vk: u32) -> HotkeyKeyOption {
+        hotkey_key_catalog()
+            .into_iter()
+            .find(|k| k.vk == vk)
+            .unwrap_or_else(|| panic!("VK 0x{vk:02X} が一覧に無い"))
+    }
+
+    #[test]
+    fn catalog_is_internally_consistent() {
+        // 生成関数と同じ述語を並べても何も確かめられない (それは書き写しで
+        // あって検査ではない)。ここで固定するのは、**生成方法によらず
+        // 一覧が満たすべき性質**だけにする。
+        let catalog = hotkey_key_catalog();
+        for key in &catalog {
+            // 単独で選べるものは組み合わせでも選べる (規則の包含関係)。
+            // 逆転すると、修飾キーを足した瞬間に選択肢が消える UI になる。
+            assert!(!key.alone || key.with_mods, "{}", key.label);
+            // そのまま選べるなら注記は無し。少しでも制約があるなら
+            // (修飾キーが要る / そもそも選べない) 必ず理由が付く。
+            assert_eq!(key.note.is_empty(), key.alone, "{}", key.label);
+            // 名前が VK の生値のままのキーを一覧に並べない
+            // (「VK 0x2C はホットキーに使えません」では何の話か分からない)。
+            assert!(!key.label.starts_with("VK 0x"), "{}", key.label);
+        }
+        // 同じキーが 2 か所に出ない。重複すると、片方で選んで確定した後に
+        // もう片方が押されていないように見える。
+        let mut vks: Vec<u32> = catalog.iter().map(|k| k.vk).collect();
+        vks.sort_unstable();
+        let count = vks.len();
+        vks.dedup();
+        assert_eq!(vks.len(), count, "同じ VK が一覧に 2 回出ている");
+    }
+
+    #[test]
+    fn catalog_reasons_do_not_lie() {
+        // 「押している間ずっと入力先へ流れる」は文字を流すキーの理由。
+        // 流さないキー (PrintScreen / NumLock) に付けると嘘になる。
+        for key in hotkey_key_catalog() {
+            if matches!(key.vk, 0x2C | 0x90) {
+                assert!(key.note.contains("対象外"), "{} / {}", key.label, key.note);
+                assert!(!key.note.contains("流れ続ける"), "{}", key.label);
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_reaches_f13_in_the_function_category() {
+        // この経路の存在理由。ペダルの F13 / F14 は物理キーが無く、
+        // 捕獲 UI では**押しようがない**。
+        let f13 = catalog_entry(0x7C);
+        assert_eq!(f13.label, "F13");
+        assert_eq!(f13.category, CAT_FUNCTION);
+        assert!(f13.alone, "F13 は単独で選べなければ意味が無い");
+        assert!(f13.note.is_empty());
+        // F1〜F24 が欠けなく並ぶ (途中が飛ぶと「無い」と誤解される)。
+        let fkeys: Vec<u32> = hotkey_key_catalog()
+            .iter()
+            .filter(|k| k.category == CAT_FUNCTION)
+            .map(|k| k.vk)
+            .collect();
+        assert_eq!(fkeys, (0x70..=0x87).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn catalog_explains_why_a_key_cannot_be_chosen() {
+        // Space: 単独は不可、修飾キーを足せば可。**解き方**が理由に入っていること。
+        let space = catalog_entry(0x20);
+        assert!(!space.alone && space.with_mods);
+        assert!(space.note.contains("修飾キー"), "{}", space.note);
+
+        // Enter / 文字キー: どうやっても選べない。理由は許可規則の根拠そのもの。
+        for vk in [0x0D, 0x41] {
+            let key = catalog_entry(vk);
+            assert!(!key.alone && !key.with_mods);
+            assert!(key.note.contains("入力先"), "{}", key.note);
+        }
+
+        // Esc は「入力先へ流れる」が理由ではない。嘘の理由を出さないこと。
+        let esc = catalog_entry(ESCAPE_VK);
+        assert!(esc.note.contains("取り消し"), "{}", esc.note);
+        assert!(!esc.note.contains("流れ続ける"), "{}", esc.note);
+
+        // 半角/全角・かなは「押すたびに VK が変わる」が理由。
+        for vk in [0xF3, 0x15] {
+            let key = catalog_entry(vk);
+            assert!(key.note.contains("キーコード"), "{}", key.note);
+        }
+    }
+
+    #[test]
+    fn catalog_categories_are_declared_and_ordered() {
+        let categories = hotkey_key_categories();
+        // 修飾キー → F キーの順。F13 へ 3 クリック (開く → F キー → F13) で
+        // 届くのは、F キーが先頭付近に居ることが前提。
+        assert_eq!(categories[0].id, CAT_MODIFIER);
+        assert_eq!(categories[1].id, CAT_FUNCTION);
+        let ids: Vec<&str> = categories.iter().map(|c| c.id).collect();
+        // 一覧のキーはすべて宣言済みのカテゴリに属する (フロントが
+        // 描き落とすカテゴリを作らない)。
+        for key in hotkey_key_catalog() {
+            assert!(ids.contains(&key.category), "{} / {}", key.label, key.category);
+        }
+    }
+
+    #[test]
+    fn catalog_agrees_with_the_capture_path() {
+        // **一覧で選べるもの = 捕獲で押して決まるもの**であること。
+        // 入口が 2 つある機能なので、ここが割れると「押せば決まるのに
+        // 一覧では灰色」(あるいはその逆) という説明のつかない差が出る。
+        // 一覧側の真偽値と、捕獲の判定 (decide_capture_combo) の結論を
+        // 突き合わせる — 別々の関数の**結果**を比べるので、書き写しにならない。
+        for key in hotkey_key_catalog() {
+            if key.vk == ESCAPE_VK {
+                // Esc だけは捕獲では「取り消し」に化ける (押して決めることが
+                // 原理的にできない)。一覧側では選べないキーとして出す。
+                assert!(!key.alone && !key.with_mods, "{}", key.label);
+                assert_eq!(decide_capture_combo(&[key.vk]), CaptureOutcome::Cancel);
+                continue;
+            }
+
+            // 単独。
+            let alone = match decide_capture_combo(&[key.vk]) {
+                CaptureOutcome::Accept(combo) => {
+                    assert_eq!(Some(combo), sanitize_combo(&[], key.vk), "{}", key.label);
+                    true
+                }
+                _ => false,
+            };
+            assert_eq!(alone, key.alone, "単独 {}", key.label);
+
+            // 修飾キー付き。トリガー自身とは別の修飾キーで試す
+            // (同じにすると sanitize_combo が落として単独に化ける)。
+            let m = if key.vk == 0xA2 { 0xA0 } else { 0xA2 };
+            let with_mods = match decide_capture_combo(&[m, key.vk]) {
+                CaptureOutcome::Accept(combo) => {
+                    assert_eq!(Some(combo), sanitize_combo(&[m], key.vk), "{}", key.label);
+                    true
+                }
+                _ => false,
+            };
+            assert_eq!(with_mods, key.with_mods, "組み合わせ {}", key.label);
+        }
     }
 
     #[test]

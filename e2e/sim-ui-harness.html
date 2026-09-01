@@ -199,6 +199,8 @@
           historyReturn: 50,
           /** window.confirm の答え。headless ではダイアログが出せないので固定する。 */
           confirmAnswer: true,
+          /** この VK を一覧から選ぶと「他用途と重複」で無効化される (模擬)。 */
+          duplicateVk: null,
           /** lib::StyleSuggestions。テストから差し替えて欠測表示も見る。 */
           styleSuggestions: {
             history_enabled: true,
@@ -255,6 +257,48 @@
           };
           return codes
             .map((c) => names[c] ?? (/^F([1-9]|1\d|2[0-4])$/.test(c) ? c : `VK ${c}`))
+            .join(" + ");
+        }
+
+        /** `lib::list_hotkey_keys` の模擬 (2026-08-31)。
+         *
+         * **判定の規則は真似しない**。ここが真似ると、Rust の許可規則を
+         * 変えた日に両方を直すことになり、しかも「モックが通る」ことしか
+         * 保証しなくなる。ここは `hotkey::HotkeyKeyOption` と**同じ形**の
+         * データを、代表的なキーだけ並べて返す:
+         * - F13 = 単独で選べる (この機能の存在理由。物理キーが無い)
+         * - Space = 修飾キーを足したときだけ選べる (状態遷移の検査用)
+         * - A = どうやっても選べない (理由を出す経路の検査用)
+         * 規則の正しさは Rust の hotkey::tests が見る。 */
+        const hotkeyKeyList = {
+          max_mods: 3,
+          categories: [
+            { id: "modifier", label: "修飾キー (左右を区別)", hint: "単独でも組み合わせにも" },
+            { id: "function", label: "F キー (F1〜F24)", hint: "F13〜F24 は衝突しません" },
+            { id: "edit", label: "編集・移動キー", hint: "" },
+            { id: "alnum", label: "英数字", hint: "" },
+          ],
+          keys: [
+            { vk: 0xa2, label: "左 Ctrl", category: "modifier", alone: true, with_mods: true, is_modifier: true, note: "" },
+            { vk: 0xa0, label: "左 Shift", category: "modifier", alone: true, with_mods: true, is_modifier: true, note: "" },
+            { vk: 0xa5, label: "右 Alt", category: "modifier", alone: true, with_mods: true, is_modifier: true, note: "" },
+            { vk: 0x5b, label: "左 Win", category: "modifier", alone: true, with_mods: true, is_modifier: true, note: "" },
+            { vk: 0x70, label: "F1", category: "function", alone: true, with_mods: true, is_modifier: false, note: "" },
+            { vk: 0x7c, label: "F13", category: "function", alone: true, with_mods: true, is_modifier: false, note: "" },
+            { vk: 0x7d, label: "F14", category: "function", alone: true, with_mods: true, is_modifier: false, note: "" },
+            { vk: 0x20, label: "Space", category: "edit", alone: false, with_mods: true, is_modifier: false,
+              note: "修飾キー (Ctrl / Alt / Shift / Win) を 1 つ以上選ぶと使えます" },
+            { vk: 0x0d, label: "Enter", category: "edit", alone: false, with_mods: false, is_modifier: false,
+              note: "押している間ずっと入力先アプリへ流れ続けるため、ホットキーには選べません" },
+            { vk: 0x41, label: "A", category: "alnum", alone: false, with_mods: false, is_modifier: false,
+              note: "押している間ずっと入力先アプリへ流れ続けるため、ホットキーには選べません" },
+          ],
+        };
+
+        /** `hotkey::describe_keys` の最小の写し (VK 版)。 */
+        function describeVks(vks) {
+          return vks
+            .map((vk) => hotkeyKeyList.keys.find((k) => k.vk === vk)?.label ?? `VK 0x${vk.toString(16)}`)
             .join(" + ");
         }
 
@@ -378,6 +422,56 @@
               mock.config.hotkey_label = label;
               mock.emit("nox://hotkey-captured", { label });
               return Promise.resolve({ verdict: "accepted" });
+            }
+            // --- 一覧から選ぶ (2026-08-31)。捕獲と同じ確定経路を通ることは
+            // ここでは確かめられない (モックなので)。ここで見るのは
+            // 「選んだ VK が Rust へ届き、返ったラベルが画面に出る」往復。
+            case "list_hotkey_keys":
+              return Promise.resolve(structuredClone(hotkeyKeyList));
+            case "describe_hotkey_vks":
+              return Promise.resolve(describeVks(args.vks ?? []));
+            case "set_hotkey_from_list": {
+              const vk = args.vk;
+              // `sanitize_combo` の**結論だけ**を真似る (規則は真似ない):
+              // 修飾キーとして有効なものだけを残し、トリガー自身は除く。
+              const mods = (args.mods ?? []).filter(
+                (m) => m !== vk && hotkeyKeyList.keys.find((k) => k.vk === m)?.is_modifier,
+              );
+              const key = hotkeyKeyList.keys.find((k) => k.vk === vk);
+              const usable = key && (mods.length > 0 ? key.with_mods : key.alone);
+              if (!usable) {
+                return Promise.resolve({
+                  verdict: "invalid",
+                  message: `「${key?.label ?? vk}」はこの組み合わせでは使えません`,
+                });
+              }
+              const target = {
+                inject: "hotkey",
+                clipboard_only: "clipboard_hotkey",
+                screen_ask: "screen_ask_hotkey",
+              }[args.mode ?? "inject"];
+              // 他用途との重複は Rust の `Config::normalize` が解消する。
+              // **そのとき旧い割り当ても残らない** — normalize は該当用途の
+              // `*_vk` を 0 にするので、画面上は「未設定」に戻る。ここを
+              // 「元のまま」に模すと、実機と違う楽観的な絵を検査してしまう。
+              // (貼り付け用は必ず既定へフォールバックするので dropped に
+              // ならない。起きるのは clipboard / screen_ask だけ。)
+              if (mock.duplicateVk === vk) {
+                mock.config[`${target}_vk`] = 0;
+                mock.config[`${target}_mods`] = [];
+                mock.config[`${target}_label`] = "";
+                mock.emit("nox://hotkey-captured", null);
+                return Promise.resolve({
+                  verdict: "dropped",
+                  message: "その組み合わせは他の用途のホットキーと同じなので設定できません",
+                });
+              }
+              const label = describeVks([...mods, vk]);
+              mock.config[`${target}_vk`] = vk;
+              mock.config[`${target}_mods`] = mods;
+              mock.config[`${target}_label`] = label;
+              mock.emit("nox://hotkey-captured", { label });
+              return Promise.resolve({ verdict: "applied", label });
             }
             case "clear_hotkey":
               mock.config.clipboard_hotkey_vk = 0;

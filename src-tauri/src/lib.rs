@@ -564,6 +564,123 @@ fn describe_hotkey_codes(codes: Vec<String>) -> String {
     hotkey::describe_keys(&keys)
 }
 
+/// VK の列を表示名にする (「左 Ctrl + F13」)。一覧選択の途中経過用。
+///
+/// [`describe_hotkey_codes`] の VK 版。一覧 UI は `code` ではなく VK を
+/// 直接持つ (押していないキーを選ぶので `KeyboardEvent` が存在しない) が、
+/// **表示名を組み立てるのは同じく Rust の仕事**。フロントで
+/// 「修飾キー + トリガー」を連結すると、修飾キーの並び順
+/// ([`hotkey::describe_keys`] は Ctrl → Alt → Shift → Win に整える) が
+/// 確定後のラベルと食い違い、同じ組み合わせが 2 通りの綴りで画面に出る。
+#[tauri::command]
+fn describe_hotkey_vks(vks: Vec<u32>) -> String {
+    hotkey::describe_keys(&vks)
+}
+
+/// 一覧選択 UI に出すキーの目録 (カテゴリ + キー)。
+///
+/// 中身はすべて [`hotkey::hotkey_key_catalog`] が既存の許可規則から作る。
+/// **フロントにキー名の表を持たせない**ための入口
+/// (理由は [`hotkey::hotkey_key_catalog`] の doc)。
+#[derive(Debug, Clone, serde::Serialize)]
+struct HotkeyKeyList {
+    categories: Vec<hotkey::HotkeyKeyCategory>,
+    keys: Vec<hotkey::HotkeyKeyOption>,
+    /// 修飾キーの上限 ([`hotkey::MAX_HOTKEY_MODS`])。UI の選択数の上限に使う。
+    max_mods: usize,
+}
+
+#[tauri::command]
+fn list_hotkey_keys() -> HotkeyKeyList {
+    HotkeyKeyList {
+        categories: hotkey::hotkey_key_categories(),
+        keys: hotkey::hotkey_key_catalog(),
+        max_mods: hotkey::MAX_HOTKEY_MODS,
+    }
+}
+
+/// 一覧選択の確定結果。
+///
+/// [`CaptureVerdict`] と同じ考え方で、**例外ではなく値**で返す。
+/// 「その組み合わせは使えない」も「他用途と重複したので無効化された」も
+/// 異常ではなく普通の分岐で、UI の出し方 (一覧を開いたままにするか) が違う。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+enum SelectionVerdict {
+    /// 設定した。`label` は確定後の表示名。
+    Applied { label: String },
+    /// 許可規則が拒む組み合わせ。一覧は開いたまま選び直せる。
+    Invalid { message: String },
+    /// 正規化 (`Config::normalize`) が他用途との重複を解消して無効化した。
+    Dropped { message: String },
+    /// 保存そのものに失敗した。
+    Failed { message: String },
+}
+
+/// 一覧から選んだ組み合わせを設定する。
+///
+/// # 捕獲と同じ経路を通ること (2026-08-31)
+///
+/// 判定は [`hotkey::sanitize_combo`] (捕獲の [`hotkey::decide_capture_combo`]
+/// も最後にこれを通る)、確定は [`commit_combo`]。**フロントで許可判定を
+/// 再実装しない**のはもちろん、ここでも設定の書き込みとフックへの反映を
+/// 書き下ろさない。一覧 UI 固有なのは「キーの決め方がクリックである」
+/// ことだけで、そこから先は捕獲と 1 文字も変えない (**押しっぱなしの
+/// 締め出しも含めて**同じ — `pressed` の doc を参照)。
+///
+/// **録音中は受け付けない**。理由は捕獲と同じ
+/// ([`hotkey::can_begin_capture`]): 押しっぱなしのトリガーを持つ組み合わせを
+/// 差し替えると、フックの押下状態が畳まれて**離しが届かず録音が止まらなくなる**。
+/// ペダルを踏んだままマウスで確定できてしまう以上、ここでも要る。
+#[tauri::command]
+fn set_hotkey_from_list(
+    app: AppHandle,
+    mode: Option<String>,
+    mods: Vec<u32>,
+    vk: u32,
+) -> Result<SelectionVerdict, String> {
+    let mode = parse_mode(mode.as_deref())?;
+    hotkey::can_begin_capture(app.state::<AppState>().is_recording()).map_err(str::to_string)?;
+
+    let Some(combo) = hotkey::sanitize_combo(&mods, vk) else {
+        // 一覧側で選ばせないはずの組み合わせ (フロントの取りこぼし・
+        // 古い画面のまま押した等)。理由はキー名で言う。
+        log::info!("一覧選択: 使えない組み合わせ (トリガー VK 0x{vk:02X} / 修飾子 {mods:?})");
+        return Ok(SelectionVerdict::Invalid {
+            message: format!(
+                "「{}」はこの組み合わせでは使えません。修飾キーを足すか、別のキーを選んでください",
+                hotkey::key_label(vk)
+            ),
+        });
+    };
+
+    // 確定する組み合わせのキーを**そのまま**抑制へ回す。
+    //
+    // 操作はマウスだが、**トリガーが押されたままのことがある**。まさに
+    // この機能の主用途 — ペダル (F13) を踏んだまま、もう片方の手で確定を
+    // 押す — がそれ。抑制を張らないと `set_mode_hotkey` が押下状態を畳んだ
+    // 直後のオートリピート keydown が `Press` として通り、**設定しただけで
+    // 録音が 1 回始まる** (捕獲経路が塞いでいる M1 回帰と同じ穴)。
+    // `can_begin_capture` では防げない: まだホットキーでないキーを踏んでいる
+    // 状態は「録音中」ではない。
+    //
+    // 実際に押されていないキーは [`hotkey::suppress_until_release_keys`] が
+    // `is_physically_down` で落とすので、渡しすぎによる「解除の keyup が
+    // 来ず恒久的に無視される」は起きない (2026-08-31 のレビュー指摘: 当初
+    // 空を渡していたのは、この絞り込みを見落とした誤った論拠だった)。
+    let mut pressed = combo.mods_vec();
+    pressed.push(combo.vk);
+    match commit_combo(&app, mode, &pressed, combo) {
+        Ok(Some(label)) => Ok(SelectionVerdict::Applied { label }),
+        Ok(None) => Ok(SelectionVerdict::Dropped {
+            message: "その組み合わせは他の用途のホットキーと同じなので設定できません".to_string(),
+        }),
+        Err(e) => Ok(SelectionVerdict::Failed {
+            message: format!("ホットキーを保存できません: {e}"),
+        }),
+    }
+}
+
 /// フロントから来た用途名を [`HotkeyMode`] へ。既定は貼り付け。
 fn parse_mode(raw: Option<&str>) -> Result<HotkeyMode, String> {
     match raw.unwrap_or("inject") {
@@ -1006,7 +1123,10 @@ pub fn run() {
             start_hotkey_capture,
             cancel_hotkey_capture,
             describe_hotkey_codes,
+            describe_hotkey_vks,
             finish_hotkey_capture,
+            list_hotkey_keys,
+            set_hotkey_from_list,
             clear_hotkey,
             preview_sound,
             list_sound_presets,
@@ -2687,15 +2807,51 @@ Ctrl / Alt / Shift / Win / CapsLock / F1〜F12 などから選んでください
             }
         }
         hotkey::CaptureOutcome::Accept(combo) => {
-            commit_captured_combo(&app, &keys, combo);
+            // 捕獲を始めたコマンドが残した用途へ書く。用途が増えるたびに
+            // if を足していくと、足し忘れた用途が黙って貼り付け側へ
+            // 書き込む (= 録音キーが勝手に変わる)。スロット番号から機械的に戻す。
+            let mode = HotkeyMode::from_slot(
+                app.state::<AppState>()
+                    .capture_slot
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            );
+            // 戻り値は使わない。捕獲の結果はイベント (`nox://hotkey-captured`)
+            // と、そこから引き直す `get_config` で UI に届く。
+            let _ = commit_combo(&app, mode, &keys, combo);
             CaptureVerdict::Accepted
         }
     }
 }
 
 /// 確定した組み合わせを設定へ書き、実フックへ反映して UI へ返す。
-fn commit_captured_combo(app: &AppHandle, pressed: &[u32], combo: hotkey::HotkeyCombo) {
-    log::info!("捕獲 確定: {} ({combo:?})", combo.label());
+///
+/// # 捕獲と一覧選択で共有する唯一の確定経路 (2026-08-31)
+///
+/// 「設定を書く → [`apply_hotkeys`] でフックへ反映する → イベントで UI へ返す」
+/// の 3 つは**必ずこの順で 3 つとも起きる**必要がある。一覧選択のために
+/// 別実装を作ると、たとえば「保存はされたが `apply_hotkeys` を忘れて、
+/// 再起動するまで効かない」が静かに生まれる。入口 (捕獲 / 一覧) が増えても
+/// ここは 1 本のままにする。
+///
+/// `pressed` は**その時点で物理的に押されているかもしれないキー**。
+/// 押しっぱなしのオートリピートを締め出すために要る
+/// ([`hotkey::suppress_until_release_keys`] が `is_physically_down` で
+/// 実際に押されているものだけへ絞る)。捕獲では観測した全キー、
+/// 一覧選択では確定する組み合わせのキーを渡す — **一覧でもマウス操作だから
+/// 空でよい、ではない**。ペダルを踏んだまま確定を押す運用がまさに主用途で、
+/// 空で渡すと「設定しただけで録音が始まる」が再発する。
+///
+/// 戻り値: `Ok(Some(label))` = 保存できた / `Ok(None)` = 正規化で無効化された
+/// (他用途と重複)。`Err` = 保存そのものに失敗。
+/// **どの分岐でも UI への通知はこの関数が済ませる** — 呼び出し側は
+/// 追加の文脈 (一覧 UI 側の表示など) が要るときだけ戻り値を読む。
+fn commit_combo(
+    app: &AppHandle,
+    mode: HotkeyMode,
+    pressed: &[u32],
+    combo: hotkey::HotkeyCombo,
+) -> Result<Option<String>, String> {
+    log::info!("ホットキー確定 [{}]: {} ({combo:?})", mode.label(), combo.label());
 
     // 抑制を**先に**張ってから捕獲モードを抜ける。逆順だと、その隙間に
     // 押しっぱなしのオートリピートが通常経路へ流れ、設定しただけで録音が
@@ -2706,11 +2862,6 @@ fn commit_captured_combo(app: &AppHandle, pressed: &[u32], combo: hotkey::Hotkey
     hotkey::end_capture(None);
 
     let state = app.state::<AppState>();
-    // 捕獲を始めたコマンドが残した用途へ書く。
-    // 用途が増えるたびに if を足していくと、足し忘れた用途が黙って
-    // 貼り付け側へ書き込む (= 録音キーが勝手に変わる)。スロット番号
-    // から機械的に戻す。
-    let mode = HotkeyMode::from_slot(state.capture_slot.load(std::sync::atomic::Ordering::SeqCst));
     let patch = match mode {
         HotkeyMode::Inject => config::ConfigPatch {
             hotkey_vk: Some(combo.vk),
@@ -2749,13 +2900,20 @@ fn commit_captured_combo(app: &AppHandle, pressed: &[u32], combo: hotkey::Hotkey
                 ),
             };
             match saved {
-                Some(combo) => emit_hotkey_captured_combo(app, &combo),
+                Some(combo) => {
+                    emit_hotkey_captured_combo(app, &combo);
+                    Ok(Some(combo.label()))
+                }
                 None => {
+                    // **黙って消さない。** 正規化 (`Config::normalize`) が
+                    // 他用途との重複を解消した結果なので、消えたこと自体は
+                    // 正しい。伝わらないことだけが問題。
                     emit_error(
                         app,
                         "その組み合わせは他の用途のホットキーと同じなので設定できません",
                     );
                     emit_hotkey_captured(app, None);
+                    Ok(None)
                 }
             }
         }
@@ -2763,6 +2921,7 @@ fn commit_captured_combo(app: &AppHandle, pressed: &[u32], combo: hotkey::Hotkey
             log::error!("ホットキーを保存できません: {e}");
             emit_error(app, &format!("ホットキーを保存できません: {e}"));
             emit_hotkey_captured(app, None);
+            Err(e)
         }
     }
 }

@@ -528,6 +528,346 @@ async function main() {
     };
   });
 
+  // --- U16: 一覧から選ぶ (2026-08-31)
+  //
+  // 捕獲 UI は**押せるキーしか設定できない**。ペダルに割り当てた F13 / F14 は
+  // 物理キーボードに無いので `keydown` が来る道が無く、それだけの理由で
+  // config.json を手で書く羽目になっていた。ここで見るのは往復そのもの:
+  // 一覧を開く → カテゴリ → キー → 確定 → **Rust へ VK が届き、
+  // 返ったラベルが画面に出る**。キー名や許可規則の正しさは Rust の
+  // hotkey::tests が見る (モックは形だけを真似ている)。
+  await check("U16 一覧から F13 を 3 クリックで選び、確定するとラベルが変わる", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      const picker = document.getElementById("hotkey-picker");
+      const pick = document.getElementById("hotkey-pick");
+      const before = { hidden: picker.hidden, expanded: pick.getAttribute("aria-expanded") };
+
+      // 1 クリック目: 一覧を開く。
+      pick.click();
+      await new Promise((r) => setTimeout(r, 200));
+      const opened = {
+        hidden: picker.hidden,
+        expanded: pick.getAttribute("aria-expanded"),
+        cats: [...picker.querySelectorAll(".picker-cat")].map((b) => b.textContent),
+        // 初期カテゴリ (修飾キー) のキーが出ている。
+        keys: [...picker.querySelectorAll(".picker-key")].map((b) => b.textContent),
+        applyDisabled: picker.querySelector(".picker-apply").disabled,
+      };
+
+      // 2 クリック目: F キーのカテゴリ。
+      [...picker.querySelectorAll(".picker-cat")].find((b) => /F キー/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 120));
+      const fkeys = [...picker.querySelectorAll(".picker-key")].map((b) => b.textContent);
+
+      // 3 クリック目: F13。ここまでで「見つけて選べる」。
+      [...picker.querySelectorAll(".picker-key")].find((b) => b.textContent === "F13").click();
+      await new Promise((r) => setTimeout(r, 200));
+      const chosen = {
+        note: picker.querySelector(".picker-note").textContent,
+        applyDisabled: picker.querySelector(".picker-apply").disabled,
+        pressed: [...picker.querySelectorAll('.picker-key[aria-pressed="true"]')].map((b) => b.textContent),
+      };
+
+      picker.querySelector(".picker-apply").click();
+      await new Promise((r) => setTimeout(r, 300));
+      return {
+        before,
+        opened,
+        fkeys,
+        chosen,
+        sent: window.__NOX_MOCK__.lastArgs("set_hotkey_from_list"),
+        label: document.getElementById("hotkey-label").textContent,
+        homeHint: document.getElementById("home-hotkey").textContent,
+        closed: picker.hidden,
+        expandedAfter: pick.getAttribute("aria-expanded"),
+      };
+    `);
+    return {
+      ok:
+        r.before.hidden === true &&
+        r.before.expanded === "false" &&
+        r.opened.hidden === false &&
+        r.opened.expanded === "true" &&
+        r.opened.cats.length >= 2 &&
+        r.opened.keys.includes("左 Ctrl") &&
+        // トリガー未選択のうちは確定できない。
+        r.opened.applyDisabled === true &&
+        r.fkeys.includes("F13") &&
+        r.chosen.note === "選択中: F13" &&
+        r.chosen.applyDisabled === false &&
+        JSON.stringify(r.chosen.pressed) === JSON.stringify(["F13"]) &&
+        // Rust へは VK が届く (0x7C = F13)、修飾キーは空。
+        r.sent?.vk === 0x7c &&
+        JSON.stringify(r.sent?.mods) === JSON.stringify([]) &&
+        r.sent?.mode === "inject" &&
+        // 捕獲で設定したときと同じ見え方 (ラベルもホームの案内も追従)。
+        r.label === "F13" &&
+        r.homeHint === "F13" &&
+        r.closed === true &&
+        r.expandedAfter === "false",
+      detail: JSON.stringify(r),
+    };
+  });
+
+  // --- U16b: 選べない組み合わせは「灰色にするだけ」にしない
+  //
+  // Space は単独では選べず (押しっぱなしで入力先へ流れる)、修飾キーを
+  // 1 つ足すと選べるようになる。その**遷移が見えること**と、選べない間も
+  // 理由を聞けることを固定する。押せない要素 (disabled) にすると理由を
+  // 聞く手段が無くなるので、そうしていないことも併せて見る。
+  await check("U16b 単独では選べないキーは理由が出て、修飾キーを足すと選べる", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      const picker = document.getElementById("hotkey-picker");
+      document.getElementById("hotkey-pick").click();
+      await new Promise((r) => setTimeout(r, 200));
+      [...picker.querySelectorAll(".picker-cat")].find((b) => /編集/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 120));
+      const space = () => [...picker.querySelectorAll(".picker-key")].find((b) => b.textContent === "Space");
+      const enter = () => [...picker.querySelectorAll(".picker-key")].find((b) => b.textContent === "Enter");
+
+      const lone = { space: space().getAttribute("aria-disabled"), enter: enter().getAttribute("aria-disabled") };
+      // 押せる (disabled ではない)。押すと理由が出る。
+      space().click();
+      await new Promise((r) => setTimeout(r, 120));
+      const refused = {
+        note: picker.querySelector(".picker-note").textContent,
+        applyDisabled: picker.querySelector(".picker-apply").disabled,
+      };
+
+      // 修飾キーを 1 つ選ぶ。ここで Space が生きる。
+      const ctrl = [...picker.querySelectorAll(".picker-mod")].find((b) => b.value === "162");
+      ctrl.checked = true;
+      ctrl.dispatchEvent(new Event("change"));
+      await new Promise((r) => setTimeout(r, 200));
+      const withMod = { space: space().getAttribute("aria-disabled"), enter: enter().getAttribute("aria-disabled") };
+
+      space().click();
+      await new Promise((r) => setTimeout(r, 200));
+      const chosen = {
+        note: picker.querySelector(".picker-note").textContent,
+        applyDisabled: picker.querySelector(".picker-apply").disabled,
+      };
+      picker.querySelector(".picker-apply").click();
+      await new Promise((r) => setTimeout(r, 300));
+      return {
+        lone,
+        refused,
+        withMod,
+        chosen,
+        sent: window.__NOX_MOCK__.lastArgs("set_hotkey_from_list"),
+        label: document.getElementById("hotkey-label").textContent,
+      };
+    `);
+    return {
+      ok:
+        r.lone.space === "true" &&
+        r.lone.enter === "true" &&
+        // 理由が「修飾キーを足せば使える」と解き方まで言っていること。
+        /修飾キー/.test(r.refused.note) &&
+        r.refused.applyDisabled === true &&
+        // 修飾キーを足すと Space だけが生きる。Enter はどうやっても選べない。
+        r.withMod.space === null &&
+        r.withMod.enter === "true" &&
+        r.chosen.note === "選択中: 左 Ctrl + Space" &&
+        r.chosen.applyDisabled === false &&
+        r.sent?.vk === 0x20 &&
+        JSON.stringify(r.sent?.mods) === JSON.stringify([0xa2]) &&
+        r.label === "左 Ctrl + Space",
+      detail: JSON.stringify(r),
+    };
+  });
+
+  // --- U16c: 入力経路は 2 つ同時に開かない
+  //
+  // 一覧が開いたまま捕獲へ入ると、一覧のボタンを操作する Space / Enter を
+  // 捕獲側が食う (捕獲は capture フェーズで keydown を奪う)。逆も同じ。
+  await check("U16c 捕獲と一覧は同時に開かない (どちらかを始めると他方が畳まれる)", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      const picker = document.getElementById("hotkey-picker");
+      const label = document.getElementById("hotkey-label");
+      document.getElementById("hotkey-pick").click();
+      await new Promise((r) => setTimeout(r, 200));
+      const pickerOpen = picker.hidden === false;
+
+      // 捕獲を始める → 一覧は畳まれる。
+      document.getElementById("hotkey-capture").click();
+      await new Promise((r) => setTimeout(r, 250));
+      const capturing = { picker: picker.hidden, capturing: label.dataset.capturing };
+
+      // 逆向き: 一覧を開く → 捕獲は取り消される。
+      window.__NOX_MOCK__.reset();
+      document.getElementById("hotkey-pick").click();
+      await new Promise((r) => setTimeout(r, 300));
+      return {
+        pickerOpen,
+        capturing,
+        picked: { picker: picker.hidden, capturing: label.dataset.capturing },
+        cancels: window.__NOX_MOCK__.count("cancel_hotkey_capture"),
+      };
+    `);
+    return {
+      ok:
+        r.pickerOpen === true &&
+        r.capturing.picker === true &&
+        r.capturing.capturing === "true" &&
+        r.picked.picker === false &&
+        r.picked.capturing === undefined &&
+        r.cancels === 1,
+      detail: JSON.stringify(r),
+    };
+  });
+
+  // --- U16d: 他用途と重複したときに黙って消えない
+  //
+  // 重複の解消は Rust の `Config::normalize` に任せる。任せた結果
+  // (無効化された) が画面に出ないと、「設定したのに効かない」だけが残る。
+  //
+  // 用途は **clipboard_only**。貼り付け用 (inject) では起きない — 正規化は
+  // 必ず既定へフォールバックするので `dropped` にならない。実際に起きる
+  // 用途で試さないと、通らない経路を検査していることになる。
+  await check("U16d 他用途と重複した組み合わせは、理由を出して一覧が開いたまま残る", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      window.__NOX_MOCK__.duplicateVk = 0x7d; // F14 は他用途が使っている想定
+      const picker = document.getElementById("clipboard-hotkey-picker");
+      document.getElementById("clipboard-hotkey-pick").click();
+      await new Promise((r) => setTimeout(r, 200));
+      [...picker.querySelectorAll(".picker-cat")].find((b) => /F キー/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 120));
+      [...picker.querySelectorAll(".picker-key")].find((b) => b.textContent === "F14").click();
+      await new Promise((r) => setTimeout(r, 200));
+      picker.querySelector(".picker-apply").click();
+      await new Promise((r) => setTimeout(r, 350));
+      const banner = document.getElementById("error");
+      window.__NOX_MOCK__.duplicateVk = null;
+      return {
+        errorHidden: banner.hidden,
+        error: banner.textContent,
+        note: picker.querySelector(".picker-note").textContent,
+        stillOpen: picker.hidden === false,
+        label: document.getElementById("clipboard-hotkey-label").textContent,
+        clearDisabled: document.getElementById("clipboard-hotkey-clear").disabled,
+        // 貼り付け用は巻き添えにならない。
+        injectLabel: document.getElementById("hotkey-label").textContent,
+      };
+    `);
+    return {
+      ok:
+        r.errorHidden === false &&
+        /他の用途/.test(r.error) &&
+        /他の用途/.test(r.note) &&
+        // 選び直せるよう開いたまま。
+        r.stillOpen === true &&
+        // 正規化は該当用途の割り当てを 0 にする = 画面は「未設定」に戻る。
+        // 捕獲で重複を踏んだときと同じ挙動。
+        r.label === "未設定" &&
+        r.clearDisabled === true &&
+        r.injectLabel === "左 Ctrl + Space",
+      detail: JSON.stringify(r),
+    };
+  });
+
+  // --- U16e: キーボードだけで一覧を使い切れる (2026-08-31 のレビュー指摘)
+  //
+  // 選ぶたびにキーのボタンを作り直していると、**Tab で辿り着いて Enter を
+  // 押した瞬間に押した要素自体が DOM から消え**、activeElement が body へ
+  // 落ちる。文書の先頭から Tab し直さないと確定ボタンへ戻れない。
+  // 音声入力アプリはキーボード / ペダル主体の運用なので、ここは実用に響く。
+  // 閉じたあとにフォーカスが「一覧から選ぶ」へ戻ることも併せて固定する。
+  await check("U16e 一覧はキーボードで通せる (選んでもフォーカスが飛ばず、閉じると開閉ボタンへ戻る)", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      const picker = document.getElementById("hotkey-picker");
+      const pick = document.getElementById("hotkey-pick");
+      pick.focus();
+      pick.click();
+      await new Promise((r) => setTimeout(r, 200));
+      [...picker.querySelectorAll(".picker-cat")].find((b) => /F キー/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 150));
+
+      // キーボードで F13 へ辿り着いた状況を作る (focus してから押す)。
+      const f13 = () => [...picker.querySelectorAll(".picker-key")].find((b) => b.textContent === "F13");
+      f13().focus();
+      const focusedBefore = document.activeElement.dataset.vk;
+      f13().click();
+      await new Promise((r) => setTimeout(r, 250));
+      const afterPick = {
+        active: document.activeElement === document.body ? "BODY" : document.activeElement.dataset.vk,
+        insidePicker: picker.contains(document.activeElement),
+        // 同じ要素が生き残っている = 作り直していない。
+        sameNode: document.activeElement === f13(),
+        pressed: f13().getAttribute("aria-pressed"),
+      };
+
+      // 修飾キーを足しても、選んでいるキーのフォーカスは失わない。
+      const ctrl = [...picker.querySelectorAll(".picker-mod")].find((b) => b.value === "162");
+      ctrl.checked = true;
+      ctrl.dispatchEvent(new Event("change"));
+      await new Promise((r) => setTimeout(r, 250));
+      const afterMod = {
+        sameNode: document.activeElement === f13(),
+        pressed: f13().getAttribute("aria-pressed"),
+      };
+
+      // 「閉じる」を押すと、開いた側のボタンへ戻る。
+      picker.querySelector(".picker-close").focus();
+      picker.querySelector(".picker-close").click();
+      await new Promise((r) => setTimeout(r, 200));
+      const afterClose = {
+        active: document.activeElement === document.body ? "BODY" : document.activeElement.id,
+        hidden: picker.hidden,
+        expanded: pick.getAttribute("aria-expanded"),
+      };
+
+      // 確定して閉じたときも同じ (押した要素が消えて body に落ちない)。
+      pick.click();
+      await new Promise((r) => setTimeout(r, 200));
+      [...picker.querySelectorAll(".picker-cat")].find((b) => /F キー/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 150));
+      [...picker.querySelectorAll(".picker-key")].find((b) => b.textContent === "F14").click();
+      await new Promise((r) => setTimeout(r, 200));
+      const apply = picker.querySelector(".picker-apply");
+      apply.focus();
+      apply.click();
+      await new Promise((r) => setTimeout(r, 350));
+      return {
+        focusedBefore,
+        afterPick,
+        afterMod,
+        afterClose,
+        afterApply: {
+          active: document.activeElement === document.body ? "BODY" : document.activeElement.id,
+          hidden: picker.hidden,
+          label: document.getElementById("hotkey-label").textContent,
+        },
+      };
+    `);
+    return {
+      ok:
+        r.focusedBefore === "124" &&
+        // 押したキーのフォーカスがそのまま残る (body へ落ちない)。
+        r.afterPick.active === "124" &&
+        r.afterPick.insidePicker === true &&
+        r.afterPick.sameNode === true &&
+        r.afterPick.pressed === "true" &&
+        // 修飾キーを足した再描画でも同じ要素が生き残る。
+        r.afterMod.sameNode === true &&
+        r.afterMod.pressed === "true" &&
+        // 閉じたら開閉ボタンへ戻る。
+        r.afterClose.active === "hotkey-pick" &&
+        r.afterClose.hidden === true &&
+        r.afterClose.expanded === "false" &&
+        // 確定して閉じたときも同じ。
+        r.afterApply.active === "hotkey-pick" &&
+        r.afterApply.hidden === true &&
+        r.afterApply.label === "F14",
+      detail: JSON.stringify(r),
+    };
+  });
+
   // --- U3: 区画切替で aria-current が動き、可視区画はちょうど 1 つ
   await check("U3 全 8 区画で「可視はちょうど 1 つ」「aria-current もちょうど 1 つ」", async () => {
     const r = await cdp.run(`

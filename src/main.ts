@@ -299,6 +299,10 @@ function showSection(section: SectionId, focusHeading = false) {
   // ホットキーとして保存されうるので、窓から離れたときと同じ扱いで畳む。
   // (別区画で保存すると renderConfig が捕獲中ラベルを上書きする問題も消える)
   if (capturingMode && section !== "hotkeys") void cancelHotkeyCapture();
+  // 一覧も畳む。開きっぱなしで戻ってくると、前回の選びかけが残ったまま
+  // 「この組み合わせにする」が押せる状態になっていて、何を確定するのか
+  // 分からない (捕獲を畳むのと同じ理由)。
+  if (section !== "hotkeys") closePicker();
 
   for (const node of document.querySelectorAll<HTMLElement>(".section")) {
     node.hidden = node.dataset.section !== section;
@@ -1671,16 +1675,31 @@ interface HotkeyCaptured {
 /** ホットキーの用途。Rust 側 `hotkey::HotkeyMode` と対応。 */
 type HotkeyModeId = "inject" | "clipboard_only" | "screen_ask";
 
-/** 用途ごとの DOM 要素 id。捕獲 UI はこの表だけを見て動く。 */
-const HOTKEY_ELEMENTS: Record<HotkeyModeId, { label: string; button: string }> = {
-  inject: { label: "hotkey-label", button: "hotkey-capture" },
+/** 用途ごとの DOM 要素 id。捕獲 UI と一覧 UI はこの表だけを見て動く。
+ *
+ * `pick` / `picker` は「一覧から選ぶ」ボタンとその中身の器 (2026-08-31)。
+ * 中身は Rust の目録から組み立てるので、HTML 側には空の器だけを置く。 */
+const HOTKEY_ELEMENTS: Record<
+  HotkeyModeId,
+  { label: string; button: string; pick: string; picker: string }
+> = {
+  inject: {
+    label: "hotkey-label",
+    button: "hotkey-capture",
+    pick: "hotkey-pick",
+    picker: "hotkey-picker",
+  },
   clipboard_only: {
     label: "clipboard-hotkey-label",
     button: "clipboard-hotkey-capture",
+    pick: "clipboard-hotkey-pick",
+    picker: "clipboard-hotkey-picker",
   },
   screen_ask: {
     label: "screen-ask-hotkey-label",
     button: "screen-ask-hotkey-capture",
+    pick: "screen-ask-hotkey-pick",
+    picker: "screen-ask-hotkey-picker",
   },
 };
 
@@ -1930,6 +1949,10 @@ async function cancelHotkeyCapture() {
 }
 
 async function toggleHotkeyCapture(mode: HotkeyModeId) {
+  // 入力経路は 2 つ同時に開かない。一覧が開いたまま捕獲へ入ると、
+  // 一覧のボタンを操作する Space / Enter を捕獲側が食ってしまう
+  // (捕獲は capture フェーズで keydown を奪う)。
+  closePicker();
   // 捕獲は排他 (Rust 側も 1 セッションしか持たない)。別の用途のボタンを
   // 押したときは、いま進行中の捕獲を畳んでから始める。
   if (capturingMode) {
@@ -1976,6 +1999,378 @@ async function toggleHotkeyCapture(mode: HotkeyModeId) {
   })();
   captureStartPending = started;
   await started;
+}
+
+/* --- 一覧から選ぶ (2026-08-31) ---------------------------------------------
+ *
+ * 捕獲 UI は**押せるキーしか設定できない**。ペダルに割り当てた F13 / F14 は
+ * 物理キーボードに無いので `keydown` が来る道が無く、それだけが理由で
+ * config.json を手で書く羽目になっていた。押さずに選べる経路を足す。
+ *
+ * # フロントは判定を持たない
+ *
+ * 選択肢 (キー名・カテゴリ・選べるかどうか) は Rust の `list_hotkey_keys` が
+ * 既存の許可規則 (`is_allowed_hotkey` / `is_allowed_combo_key` / `key_label`)
+ * から組み立てたものをそのまま描くだけ。ここに表を持つと、Rust 側の規則を
+ * 直した日に**一覧には出るのに確定できないキー**が生まれる。
+ * 確定も `sanitize_combo` → 捕獲と同じ `commit_combo` を通す。
+ *
+ * このモジュールが自分で決めてよいのは「今チェックされている修飾キーの数が
+ * 0 か 1 以上か」だけで、それに応じて Rust がくれた 2 つの真偽値
+ * (`alone` / `with_mods`) のどちらを読むかを切り替える。 */
+
+/** `hotkey::HotkeyKeyOption`。 */
+interface HotkeyKeyOption {
+  vk: number;
+  label: string;
+  category: string;
+  /** 修飾キー無しの単独トリガーとして選べるか。 */
+  alone: boolean;
+  /** 修飾キーを 1 つ以上付ければ選べるか。 */
+  with_mods: boolean;
+  is_modifier: boolean;
+  /** 選べないときの理由 (選べるなら空)。 */
+  note: string;
+}
+
+/** `hotkey::HotkeyKeyCategory`。 */
+interface HotkeyKeyCategory {
+  id: string;
+  label: string;
+  hint: string;
+}
+
+/** `lib::HotkeyKeyList`。 */
+interface HotkeyKeyList {
+  categories: HotkeyKeyCategory[];
+  keys: HotkeyKeyOption[];
+  max_mods: number;
+}
+
+/** `lib::SelectionVerdict`。捕獲と同じく**例外ではなく値**で返る。 */
+type SelectionVerdict =
+  | { verdict: "applied"; label: string }
+  | { verdict: "invalid"; message: string }
+  | { verdict: "dropped"; message: string }
+  | { verdict: "failed"; message: string };
+
+/** Rust から取った目録 (プロセスの生存中は変わらないので 1 回だけ取る)。 */
+let hotkeyKeyList: HotkeyKeyList | null = null;
+/** 一覧を開いている用途 (`null` なら閉じている)。**捕獲と同時には開かない**。 */
+let pickerMode: HotkeyModeId | null = null;
+/** 選択中の修飾キー。 */
+let pickerMods: number[] = [];
+/** 選択中のトリガー (`null` は未選択)。 */
+let pickerVk: number | null = null;
+/** 表示中のカテゴリ id。 */
+let pickerCategory = "";
+/** 選択中の表示名を取りに行った世代。応答の追い越しを捨てる。 */
+let pickerPreviewSeq = 0;
+
+/** いま選べるキーか。**判定そのものは Rust が計算済み**で、ここでは
+ * 「修飾キーを選んだか」でどちらの真偽値を読むかを切り替えるだけ。 */
+function pickerKeyUsable(key: HotkeyKeyOption): boolean {
+  return pickerMods.length > 0 ? key.with_mods : key.alone;
+}
+
+/** 一覧の中身を組み立てる。目録は Rust から来たものだけを使う。 */
+function buildPicker(mode: HotkeyModeId, list: HotkeyKeyList): HTMLElement | null {
+  const root = el<HTMLElement>(HOTKEY_ELEMENTS[mode].picker);
+  if (!root) return null;
+  root.replaceChildren();
+
+  const lead = document.createElement("p");
+  lead.className = "hint";
+  lead.textContent =
+    `修飾キーを 0〜${list.max_mods} 個選び、トリガーを 1 つ選びます。` +
+    "押せないキー (F13〜F24 など) もここから設定できます。";
+  root.append(lead);
+
+  // --- 修飾キー (チェックボックス群)
+  const modsBox = document.createElement("fieldset");
+  modsBox.className = "picker-mods";
+  const legend = document.createElement("legend");
+  legend.textContent = `修飾キー (最大 ${list.max_mods} 個)`;
+  modsBox.append(legend);
+  for (const key of list.keys.filter((k) => k.is_modifier)) {
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.className = "picker-mod";
+    box.value = String(key.vk);
+    box.addEventListener("change", () => {
+      pickerMods = box.checked
+        ? [...pickerMods, key.vk]
+        : pickerMods.filter((vk) => vk !== key.vk);
+      // 修飾キーの数が変わると、選べるトリガーの集合が変わる
+      // (Space・テンキーがここで生きる)。その遷移を必ず描き直す。
+      void renderPicker(mode);
+    });
+    label.append(box, document.createTextNode(` ${key.label}`));
+    modsBox.append(label);
+  }
+  root.append(modsBox);
+
+  // --- カテゴリ (Stream Deck の ▸ に相当。ここでは横並びのボタン)
+  const cats = document.createElement("div");
+  cats.className = "picker-cats";
+  cats.setAttribute("role", "group");
+  cats.setAttribute("aria-label", "キーの種類");
+  for (const category of list.categories) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "picker-cat";
+    button.dataset.category = category.id;
+    button.textContent = category.label;
+    button.addEventListener("click", () => {
+      pickerCategory = category.id;
+      void renderPicker(mode);
+    });
+    cats.append(button);
+  }
+  root.append(cats);
+
+  const catHint = document.createElement("p");
+  catHint.className = "hint picker-cat-hint";
+  root.append(catHint);
+
+  // --- キー (カテゴリを切り替えるたびに中身を入れ替える)
+  const keys = document.createElement("div");
+  keys.className = "picker-keys";
+  keys.setAttribute("role", "group");
+  keys.setAttribute("aria-label", "トリガーキー");
+  root.append(keys);
+
+  // 選択中の組み合わせと、選べない理由を出す 1 行。
+  // **同じ場所に出す**のが要点: 理由が別の場所に出ると、押しても何も
+  // 起きないように見えたまま画面のどこかで文字だけが増える。
+  const note = document.createElement("p");
+  note.className = "picker-note";
+  note.setAttribute("aria-live", "polite");
+  root.append(note);
+
+  const actions = document.createElement("div");
+  actions.className = "picker-actions";
+  const apply = document.createElement("button");
+  apply.type = "button";
+  apply.className = "picker-apply";
+  apply.textContent = "この組み合わせにする";
+  apply.addEventListener("click", () => void applyPickerSelection(mode));
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "picker-close";
+  close.textContent = "閉じる";
+  close.addEventListener("click", () => closePicker());
+  actions.append(apply, close);
+  root.append(actions);
+  return root;
+}
+
+/** 選択状態を画面へ反映する (カテゴリ・選べる/選べない・確定ボタンの活性)。 */
+async function renderPicker(mode: HotkeyModeId) {
+  const list = hotkeyKeyList;
+  const root = el<HTMLElement>(HOTKEY_ELEMENTS[mode].picker);
+  if (!list || !root) return;
+
+  const full = pickerMods.length >= list.max_mods;
+  root.querySelectorAll<HTMLInputElement>(".picker-mod").forEach((box) => {
+    const vk = Number(box.value);
+    box.checked = pickerMods.includes(vk);
+    // 上限に達したら、まだ選んでいない修飾キーは触れなくする。
+    // 黙って切り捨てると、押したはずの修飾キーが確定後に消える。
+    box.disabled = full && !box.checked;
+  });
+
+  root.querySelectorAll<HTMLButtonElement>(".picker-cat").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.category === pickerCategory));
+  });
+  const category = list.categories.find((c) => c.id === pickerCategory);
+  const catHint = root.querySelector<HTMLElement>(".picker-cat-hint");
+  if (catHint) {
+    catHint.textContent = category?.hint ?? "";
+    catHint.hidden = !category?.hint;
+  }
+
+  const keysBox = root.querySelector<HTMLElement>(".picker-keys");
+  if (keysBox) {
+    // # キーのボタンは作り直さない (2026-08-31 のレビュー指摘)
+    //
+    // 選ぶたびに `replaceChildren()` していると、**Tab で辿り着いて Enter を
+    // 押した瞬間に押した要素自体が DOM から消え**、`activeElement` が body へ
+    // 落ちる。文書の先頭から Tab し直さないと「この組み合わせにする」へ
+    // 戻れない。音声入力アプリ = キーボード / ペダル主体の運用なので、
+    // これは「使えるが苦痛」で済まない。中身を入れ替えるのは**カテゴリが
+    // 変わったときだけ**にして、選択の反映は属性の更新で行う。
+    if (keysBox.dataset.category !== pickerCategory) {
+      keysBox.replaceChildren();
+      for (const key of list.keys.filter((k) => k.category === pickerCategory)) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "picker-key";
+        button.dataset.vk = String(key.vk);
+        button.textContent = key.label;
+        button.addEventListener("click", () => {
+          if (!pickerKeyUsable(key)) {
+            // 選べない理由を出すだけ。選択状態は変えない。
+            setPickerNote(mode, key.note);
+            return;
+          }
+          pickerVk = key.vk;
+          void renderPicker(mode);
+        });
+        keysBox.append(button);
+      }
+      keysBox.dataset.category = pickerCategory;
+    }
+    // 選べる / 選べない と、どれを選んでいるかは毎回描き直す。
+    // 修飾キーを足すと選択肢が増える (Space・テンキー) ので、
+    // ここは選択のたびに評価し直す必要がある。
+    for (const button of keysBox.querySelectorAll<HTMLButtonElement>(".picker-key")) {
+      const key = list.keys.find((k) => String(k.vk) === button.dataset.vk);
+      if (!key) continue;
+      button.setAttribute("aria-pressed", String(pickerVk === key.vk));
+      if (pickerKeyUsable(key)) {
+        // `disabled` は使わない。**押せない要素は理由を聞けない**ので、
+        // 「灰色になっているが why が分からない」で終わってしまう。
+        // 押したら理由が出る形にして、フォーカスも当たるままにする。
+        button.removeAttribute("aria-disabled");
+        button.removeAttribute("title");
+      } else {
+        button.setAttribute("aria-disabled", "true");
+        button.title = key.note;
+      }
+    }
+  }
+
+  const selected = list.keys.find((k) => k.vk === pickerVk);
+  const ready = Boolean(selected && pickerKeyUsable(selected));
+  const apply = root.querySelector<HTMLButtonElement>(".picker-apply");
+  if (apply) apply.disabled = !ready;
+
+  if (!selected) {
+    setPickerNote(mode, "トリガーにするキーを 1 つ選んでください。");
+    return;
+  }
+  if (!ready) {
+    // 選んだ後で修飾キーを外すと、Space のように「組み合わせ限定」の
+    // キーは選べない側へ戻る。「選択中: Space」のまま確定だけ死ぬと
+    // 理由が分からないので、ここでも理由を出す。
+    setPickerNote(mode, selected.note);
+    return;
+  }
+  // 表示名は Rust に作らせる。ここで連結すると、修飾キーの並び順が
+  // 確定後のラベルと食い違い、同じ組み合わせが 2 通りの綴りで出る。
+  // トリガー自身が修飾キーのときは重複を除く (Rust の sanitize_combo も
+  // 「トリガーは修飾に含めない」と正規化する)。
+  const vks = [...pickerMods.filter((vk) => vk !== selected.vk), selected.vk];
+  // 応答順は保証されない。素早く F13 → F14 と選ぶと、遅れて返った F13 が
+  // 後から上書きして**選んだものと違う名前が残る** (捕獲の経過表示が
+  // `captureProgressSeq` で捨てているのと同じ問題)。世代で捨てる。
+  const seq = ++pickerPreviewSeq;
+  try {
+    const label = await invoke<string>("describe_hotkey_vks", { vks });
+    if (seq !== pickerPreviewSeq || pickerMode !== mode) return;
+    setPickerNote(mode, `選択中: ${label}`);
+  } catch {
+    // 表示名が作れないだけ。選択と確定は続けられる。
+    if (seq === pickerPreviewSeq) setPickerNote(mode, "");
+  }
+}
+
+function setPickerNote(mode: HotkeyModeId, text: string) {
+  const note = el<HTMLElement>(HOTKEY_ELEMENTS[mode].picker)?.querySelector<HTMLElement>(
+    ".picker-note",
+  );
+  if (note) note.textContent = text;
+}
+
+/** 一覧を閉じる (選択は捨てる)。 */
+function closePicker() {
+  if (!pickerMode) return;
+  const ids = HOTKEY_ELEMENTS[pickerMode];
+  const root = el<HTMLElement>(ids.picker);
+  const pick = el<HTMLButtonElement>(ids.pick);
+  // 閉じるボタンも確定ボタンも**この中に居る**。隠すだけだと
+  // `activeElement` が body へ落ち、キーボード操作では文書の先頭から
+  // Tab し直すことになる。開いた側のボタン (`aria-expanded` を持つ方) へ
+  // 返すのが、開閉ボタンの作法どおりで戻り先としても自然。
+  const hadFocus = Boolean(root && document.activeElement && root.contains(document.activeElement));
+  if (root) {
+    root.hidden = true;
+    // 次に開いたときにカテゴリを描き直させる (中身は作り直す)。
+    const keysBox = root.querySelector<HTMLElement>(".picker-keys");
+    if (keysBox) delete keysBox.dataset.category;
+  }
+  pick?.setAttribute("aria-expanded", "false");
+  // 区画切替や捕獲の開始で畳んだときは触らない。フォーカスが一覧の外に
+  // あるのに引き戻すと、利用者が今触っているものを奪う。
+  if (hadFocus) pick?.focus();
+  pickerMode = null;
+  pickerMods = [];
+  pickerVk = null;
+}
+
+/** 「一覧から選ぶ」ボタン。捕獲とは**同時に開かない**。 */
+async function toggleHotkeyPicker(mode: HotkeyModeId) {
+  if (pickerMode === mode) {
+    closePicker();
+    return;
+  }
+  closePicker();
+  // 捕獲中に一覧を開くと、一覧のボタンを押した Space / Enter が
+  // 捕獲側に食われる (捕獲は capture フェーズで keydown を奪う)。
+  if (capturingMode) await cancelHotkeyCapture();
+  showSection("hotkeys");
+
+  if (!hotkeyKeyList) {
+    try {
+      hotkeyKeyList = await invoke<HotkeyKeyList>("list_hotkey_keys");
+    } catch (e) {
+      showError(`キーの一覧を取得できません: ${e}`);
+      return;
+    }
+  }
+  pickerMods = [];
+  pickerVk = null;
+  // 初期カテゴリは先頭 (修飾キー)。F キーはその隣なので、
+  // 「一覧を開く → F キー → F13」の 3 クリックで届く。
+  pickerCategory = hotkeyKeyList.categories[0]?.id ?? "";
+  pickerMode = mode;
+  const root = buildPicker(mode, hotkeyKeyList);
+  if (root) root.hidden = false;
+  el(HOTKEY_ELEMENTS[mode].pick)?.setAttribute("aria-expanded", "true");
+  await renderPicker(mode);
+}
+
+/** 選んだ組み合わせを Rust へ渡す。判定・保存・フックへの反映は Rust 側。 */
+async function applyPickerSelection(mode: HotkeyModeId) {
+  if (pickerVk === null) return;
+  try {
+    const result = await invoke<SelectionVerdict>("set_hotkey_from_list", {
+      mode,
+      mods: pickerMods,
+      vk: pickerVk,
+    });
+    if (result.verdict === "applied") {
+      closePicker();
+      // ラベル・解除ボタンの活性・修飾キー単独の注意は、捕獲で設定した
+      // ときと同じ経路 (renderConfig) で揃える。Rust も
+      // `nox://hotkey-captured` を出すので二重に描かれるが、
+      // 出処によらず同じ絵になることの方が大事。
+      renderConfig(await invoke<ConfigView>("get_config"));
+      return;
+    }
+    // 使えない / 他用途と重複 / 保存失敗。**一覧は開いたままにして**
+    // 選び直せるようにし、理由をその場と帯の両方に出す。
+    showError(result.message);
+    setPickerNote(mode, result.message);
+    if (result.verdict !== "invalid") {
+      renderConfig(await invoke<ConfigView>("get_config"));
+    }
+  } catch (e) {
+    // 録音中など、そもそも受け付けられない状況。
+    showError(`${e}`);
+  }
 }
 
 /** 用途に割り当てたホットキーを解除する (録音用は Rust 側が拒否する)。 */
@@ -2093,6 +2488,16 @@ window.addEventListener("DOMContentLoaded", async () => {
   el("screen-ask-hotkey-clear")?.addEventListener(
     "click",
     () => void clearHotkey("screen_ask"),
+  );
+  // 一覧から選ぶ (押せないキー用)。3 用途とも同じ扱い。
+  el("hotkey-pick")?.addEventListener("click", () => void toggleHotkeyPicker("inject"));
+  el("clipboard-hotkey-pick")?.addEventListener(
+    "click",
+    () => void toggleHotkeyPicker("clipboard_only"),
+  );
+  el("screen-ask-hotkey-pick")?.addEventListener(
+    "click",
+    () => void toggleHotkeyPicker("screen_ask"),
   );
   el("screen-ask-enabled")?.addEventListener("change", syncScreenAskEnabled);
   el("sound-volume")?.addEventListener("input", syncSoundVolumeLabel);

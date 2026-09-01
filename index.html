@@ -679,8 +679,19 @@
                       >左 Ctrl + Space</output
                     >
                     <button type="button" id="hotkey-capture">キーを押して設定</button>
+                    <!-- 押せないキー (F13〜F24 など物理キーの無いもの) はここから。
+                         中身は Rust の一覧 (list_hotkey_keys) から組み立てる。 -->
+                    <button
+                      type="button"
+                      id="hotkey-pick"
+                      aria-expanded="false"
+                      aria-controls="hotkey-picker"
+                    >
+                      一覧から選ぶ
+                    </button>
                   </span>
                 </div>
+                <div class="hotkey-picker" id="hotkey-picker" hidden></div>
                 <p class="warn warn-block" id="hotkey-lone-mod-warn" hidden>
                   <svg class="warn-icon" aria-hidden="true"><use href="#icon-warn" /></svg>
                   <span id="hotkey-lone-mod-warn-text"></span>
@@ -717,9 +728,18 @@
                     <button type="button" id="clipboard-hotkey-capture">
                       キーを押して設定
                     </button>
+                    <button
+                      type="button"
+                      id="clipboard-hotkey-pick"
+                      aria-expanded="false"
+                      aria-controls="clipboard-hotkey-picker"
+                    >
+                      一覧から選ぶ
+                    </button>
                     <button type="button" id="clipboard-hotkey-clear">解除</button>
                   </span>
                 </div>
+                <div class="hotkey-picker" id="clipboard-hotkey-picker" hidden></div>
                 <p class="warn warn-block" id="clipboard-hotkey-lone-mod-warn" hidden>
                   <svg class="warn-icon" aria-hidden="true"><use href="#icon-warn" /></svg>
                   <span id="clipboard-hotkey-lone-mod-warn-text"></span>
@@ -752,9 +772,18 @@
                     <button type="button" id="screen-ask-hotkey-capture">
                       キーを押して設定
                     </button>
+                    <button
+                      type="button"
+                      id="screen-ask-hotkey-pick"
+                      aria-expanded="false"
+                      aria-controls="screen-ask-hotkey-picker"
+                    >
+                      一覧から選ぶ
+                    </button>
                     <button type="button" id="screen-ask-hotkey-clear">解除</button>
                   </span>
                 </div>
+                <div class="hotkey-picker" id="screen-ask-hotkey-picker" hidden></div>
                 <p class="warn warn-block" id="screen-ask-hotkey-state" hidden>
                   <svg class="warn-icon" aria-hidden="true"><use href="#icon-warn" /></svg>
                   <span id="screen-ask-hotkey-state-text"></span>
