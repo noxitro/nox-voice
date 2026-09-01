@@ -11,6 +11,7 @@
     "release": "npm run build && cargo build --release --features tauri/custom-protocol --manifest-path src-tauri/Cargo.toml",
     "e2e:hotkey": "node e2e/hotkey.mjs",
     "e2e:single-instance": "node e2e/single-instance.mjs",
+    "e2e:picker-live": "node e2e/hotkey-picker-live.mjs",
     "sim": "npm run sim:instance && npm run sim:ui",
     "sim:instance": "cargo test --manifest-path src-tauri/Cargo.toml --lib instance::sim -- --nocapture",
     "sim:ui": "node e2e/sim-ui.mjs"
