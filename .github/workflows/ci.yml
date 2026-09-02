@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 同じブランチへの連続 push は古い方を止める (Windows ランナーは高くつく)。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    # このアプリは Win32 API (WH_KEYBOARD_LL / UIA / DWM) に直接依存するため、
+    # ubuntu では cargo check すら通らない。windows-latest 一択。
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: npm ci
+        run: npm ci
+
+      - name: フロントエンド型検査 + ビルド
+        run: npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: cargo clippy (0 警告)
+        # --all-features は使わない: local-stt は whisper.cpp のビルドに CMake /
+        # C++ ツールチェーンを要り、本体の CI を人質に取らせない設計 (Cargo.toml 参照)。
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --lib --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: 疑似 E2E (headless Edge, モック Tauri)
+        run: node e2e/sim-ui.mjs
