@@ -14,6 +14,15 @@
   box-sizing: border-box;
 }
 
+/* `hidden` 属性は常に勝たせる。UA スタイルシートの `[hidden] { display: none }`
+   と `.foo { display: grid/flex }` は詳細度が同じ (0,1,0) なので、後から来る
+   author スタイルの方が勝ってしまう — `hidden` を立てたのに枠だけ残った空箱が
+   見えるままになる (実際に .warn / .hotkey-picker で発生した)。個別クラスに
+   `[hidden]` の上書きを足して回るのはこの先も漏れるので、ここで一括して勝たせる。 */
+[hidden] {
+  display: none !important;
+}
+
 html {
   font-family: var(--font-ui);
   font-size: 16px;
