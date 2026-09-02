@@ -1316,7 +1316,10 @@ mod tests {
         assert_eq!(&out[8..11], &[255, 0, 0], "下端が青のまま来ていない");
         // アルファは全部 255。0 のままだと乗算済みアルファとして
         // 真っ黒に解釈され、OCR が必ず 0 文字を返す。
-        assert!(out.chunks_exact(4).all(|px| px[3] == 255));
+        // (`chunks_exact` ではなく alpha バイトだけを直接 step_by で拾う:
+        // clippy の `chunks_exact_to_as_chunks` は Rust 1.98 以降にしか無く、
+        // それ未満のツールチェーンではこの書き方の方が両立する)
+        assert!(out.iter().skip(3).step_by(4).all(|&alpha| alpha == 255));
     }
 
     #[test]
