@@ -31,6 +31,11 @@
      被らない色相にして、いつもの書き取りと絵だけでは見分けが付かない
      という報告 (押し間違いに気付けない) に応える。 */
   --pill-screen-ask: #9d8cf6;
+  /* クリップボードへ入っただけ (未貼付) の完了色。緑 (完了) と混同させない
+     ためだけの色で、画面質問の紫とは無関係 — 録音中に紫だったものが
+     完了時も紫のままだと「そのまま何も終わっていない」ように読めるため、
+     ここだけは別の色にする。 */
+  --pill-pending: #6ab7f0;
 }
 
 *,
@@ -94,6 +99,16 @@ body {
     fade 260ms ease-in 320ms forwards;
 }
 
+/* クリップボードどまりは文字を残す分、普段の余白に戻す。フェードの
+   開始も Rust 側 OVERLAY_CLIPBOARD_LINGER (2.4s) に合わせて遅らせる —
+   短いままだと「コピーしました」を読み切る前に消え始める。 */
+.pill[data-state="done"][data-pending="clipboard"] {
+  padding: 9px 14px;
+  animation:
+    rise var(--duration-base) var(--ease-out),
+    fade 260ms ease-in 2050ms forwards;
+}
+
 @keyframes fade {
   to {
     opacity: 0;
@@ -155,6 +170,21 @@ body {
   animation: draw 220ms var(--ease-out) both;
 }
 
+/* クリップボードのみ / 画面質問モードの完了。貼り付けをしない設計 (design.md)
+   なので、チェックではなくクリップボードの絵にして「まだ Ctrl+V が要る」と
+   一目で分かるようにする。green (完了) ではなく専用色にして、
+   「これは完了ではなく、次の一手が要る状態」であることも色で言う。 */
+.pill[data-state="done"][data-pending="clipboard"] .icon {
+  color: var(--pill-pending);
+}
+.pill[data-state="done"][data-pending="clipboard"] .glyph-check {
+  display: none;
+  animation: none;
+}
+.pill[data-state="done"][data-pending="clipboard"] .glyph-clipboard {
+  display: block;
+}
+
 .pill[data-state="error"] .icon {
   color: var(--pill-danger);
 }
@@ -189,8 +219,11 @@ body {
 
 /* 完了はアイコン 1 つだけで語る。テキストは最初から組み立てさせない
    (overlay.ts) が、二重の保険としてここでも描かせない。カプセルは
-   .pill の width: fit-content によりアイコンだけの幅まで縮む。 */
-.pill[data-state="done"] .body {
+   .pill の width: fit-content によりアイコンだけの幅まで縮む。
+   ただしクリップボードどまり (data-pending="clipboard") は例外 — まだ
+   Ctrl+V が要ることに気付けないと「何も起きなかった」ように見えるので、
+   ここだけ一言だけ残す (overlay.ts の "コピーしました")。 */
+.pill[data-state="done"]:not([data-pending="clipboard"]) .body {
   display: none;
 }
 
@@ -273,5 +306,8 @@ body {
   /* 動きを止めても完了表示は消えないと困るので、透明化だけは残す。 */
   .pill[data-state="done"] {
     animation: fade 260ms ease-in 320ms forwards;
+  }
+  .pill[data-state="done"][data-pending="clipboard"] {
+    animation: fade 260ms ease-in 2050ms forwards;
   }
 }

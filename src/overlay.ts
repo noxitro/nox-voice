@@ -50,17 +50,22 @@ function setState(
   label: string,
   detail?: string,
   screenAsk = false,
+  pendingClipboard = false,
 ) {
   const pill = el("pill");
   if (pill) {
     pill.dataset.state = state;
     // 普段の書き取りと画面質問は同じアイコン (mic / spinner) なので、
     // 色を変えないと押し間違いに気づけない (実際に紛らわしいと報告があった)。
-    // done / error はモードに関わらず同じ絵で終える (質問の結果だけ特別扱い
-    // すると、今度は「毎回何かが違う」という別の紛らわしさになる)。
     pill.dataset.mode = screenAsk && (state === "recording" || state === "processing")
       ? "screen_ask"
       : "";
+    // クリップボードのみモードと画面質問モードは**貼り付けをしない**設計
+    // (design.md)。チェックだけ光らせて消えると、クリップボードに答えが
+    // 待っていることに気付かないまま「何も起きなかった」と見える
+    // (実際にこの順で報告があった)。貼付済みと見分けが付く絵にして、
+    // 消えるまでの時間も Rust 側 (OVERLAY_CLIPBOARD_LINGER) で長くしてある。
+    pill.dataset.pending = state === "done" && pendingClipboard ? "clipboard" : "";
     pill.hidden = false;
   }
   const labelEl = el("label");
@@ -150,13 +155,16 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (fill) fill.style.transform = `scaleX(${Math.min(1, Math.max(0, event.payload))})`;
   });
 
-  await listen<ResultPayload>("nox://result", () => {
-    // 完了はテキストを出さない (PRODUCT.md「成功は静かに」)。何が挿入されたか・
-    // 貼付できずクリップボードに留まったか等は履歴 (main.ts の履歴区画) で
-    // いつでも確認できる。小窓はアイコンが一瞬光るだけで語らせる。
-    // 小窓を畳むのは Rust 側 (overlay::hide_after)。
-    // webview に持たせると、次の録音で出した直後に前回のタイマーが消してしまう。
-    setState("done", "");
+  await listen<ResultPayload>("nox://result", (event) => {
+    // 貼付済みなら完了はテキストを出さない (PRODUCT.md「成功は静かに」)。
+    // 何が挿入されたかは履歴 (main.ts の履歴区画) でいつでも確認できる。
+    //
+    // ただしクリップボードどまり (クリップボードのみモード・画面質問モードは
+    // 設計上ここに必ず入る) は話が別: 貼付というもう一段の作業が**まだ残って
+    // いる**ので、静かに消えると「クリップボードに答えが用意された」こと
+    // 自体に気付けない。ここだけは一言添える。
+    const pending = !event.payload.injected;
+    setState("done", pending ? "コピーしました" : "", undefined, false, pending);
   });
 
   await listen<ErrorPayload>("nox://error", (event) => {

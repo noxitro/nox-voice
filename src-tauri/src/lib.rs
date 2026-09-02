@@ -104,12 +104,21 @@ const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2
 /// 以後そのキーで録音とトグルが暴発する。必ず時間で畳む。
 const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// 結果を見せてから小窓を畳むまで。
+/// 結果を見せてから小窓を畳むまで (前景アプリへ貼り付いた場合)。
 ///
 /// 完了表示はテキストを出さずアイコンが一瞬光るだけ (overlay.css) なので、
 /// 読む時間を確保する必要が無い。CSS 側のフェード (320ms 後に開始・260ms で
 /// 完了 = 580ms) が終わり切ってから畳む、という順序だけ守れば足りる。
 const OVERLAY_RESULT_LINGER: std::time::Duration = std::time::Duration::from_millis(650);
+/// 結果を見せてから小窓を畳むまで (クリップボードへ入れただけの場合)。
+///
+/// クリップボードのみモードと画面質問モードは**貼り付けをしない**
+/// (design.md「画面質問モード」節の確定仕様)。貼付済みと同じ短さで畳むと、
+/// 「クリップボードに答えが入って待っている」ことに気付く前に消え、
+/// 結果として「何も起きなかった」ように見える (この関数の少し上の
+/// コメント「画面に出さないと『何も起きなかった』ように見える」がまさに
+/// この状況を指している)。読んで Ctrl+V する時間を見込んで長めに残す。
+const OVERLAY_CLIPBOARD_LINGER: std::time::Duration = std::time::Duration::from_millis(2_400);
 /// エラー表示を残す時間 (読む時間が要る)。
 const OVERLAY_ERROR_LINGER: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -2107,7 +2116,14 @@ fn transcribe_and_format(
             }
             // 結果を少し見せてから畳む。次の録音で表示が更新されれば、
             // このタイマーは世代違いで何もしない。
-            overlay::hide_after(app, OVERLAY_RESULT_LINGER);
+            overlay::hide_after(
+                app,
+                if payload.injected {
+                    OVERLAY_RESULT_LINGER
+                } else {
+                    OVERLAY_CLIPBOARD_LINGER
+                },
+            );
             emit_history_changed(app);
             // 常駐したままでも保持期限が守られるよう、録音のたびに執行する。
             enforce_retention(app, cfg.history_retention_days);
@@ -2372,7 +2388,18 @@ fn answer_screen_question(
     if let Err(e) = app.emit(EVENT_RESULT, &payload) {
         log::warn!("結果イベントの送出に失敗: {e}");
     }
-    overlay::hide_after(app, OVERLAY_RESULT_LINGER);
+    // 画面質問モードは設計上 (`inject::copy_only`) 常にクリップボードどまりで
+    // 貼り付けない。`payload.injected` を見て決めているのは他の呼び出し元と
+    // 判定を 1 か所 (このモジュールの慣習) に揃えるため — 将来ここが
+    // 貼り付けにも対応しても、この分岐は書き換えずに済む。
+    overlay::hide_after(
+        app,
+        if payload.injected {
+            OVERLAY_RESULT_LINGER
+        } else {
+            OVERLAY_CLIPBOARD_LINGER
+        },
+    );
 }
 
 /// 採用テキストを前景アプリへ注入し、結果を `payload` に反映する。
