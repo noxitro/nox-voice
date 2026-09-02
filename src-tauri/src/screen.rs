@@ -244,6 +244,14 @@ pub enum SkipReason {
     /// タイトルが無い。ほぼ全てが不可視のメッセージ専用ウィンドウ。
     Untitled,
     TooSmall,
+    /// 手前のウィンドウに**完全に覆われて**いて、画面に 1 px も見えていない。
+    ///
+    /// この窓はユーザーの目にも入らず、スクリーンショットにも写らない。
+    /// **資料に載せる理由が無い**うえ、載せると「読めなかった窓」として
+    /// [`needs_screenshot`] を発火させ、**他の全ウィンドウが正しく読めて
+    /// いてもモニタ全体の画像をクラウドへ送らせてしまう** (実機で再現:
+    /// 常駐アプリの窓 1 つのために画像が送られた)。
+    Covered,
 }
 
 impl SkipReason {
@@ -257,6 +265,7 @@ impl SkipReason {
             SkipReason::ToolWindow => "ツールウィンドウ",
             SkipReason::Untitled => "タイトル無し",
             SkipReason::TooSmall => "小さすぎる",
+            SkipReason::Covered => "手前の窓に完全に隠れている",
         }
     }
 }
@@ -313,6 +322,257 @@ pub fn is_usable_text(text: &str, route: ContextSource) -> bool {
         return false;
     }
     text.trim().chars().count() >= MIN_USABLE_CHARS
+}
+
+/// もうこれ以上 UIA の木を降りる必要が無い、と言い切れる読み取りか。
+///
+/// # なぜ [`is_usable_text`] で止めてはいけないか
+///
+/// 木の下降は**浅いところから**進む ([`win32`] の幅優先)。Chromium の
+/// ウィンドウで最初に当たる本文っぽい要素は**アドレスバー**で、URL は
+/// `ValuePattern` から平気で 40 文字以上返る。`is_usable_text` で打ち切ると、
+/// その窓は「URL が読めたので読めた窓」に分類され、**記事本文にも
+/// スクリーンショットにも辿り着かないまま資料が確定する** — 今より悪い。
+///
+/// そこで打ち切りの線は別に引く: **`TextPattern` から本文相当の量が
+/// 取れたときだけ**。ページ本文・エディタ・ターミナルはここに当たり、
+/// アドレスバーや検索欄は当たらない。当たらなければ予算まで木を降り続け、
+/// その間に見つけた最良の読み取りが残る (壊れるのは速度だけで、正しさではない)。
+pub fn is_conclusive_text(text: &str, route: ContextSource) -> bool {
+    matches!(route, ContextSource::TextPattern)
+        && text.trim().chars().count() >= CONCLUSIVE_CHARS
+}
+
+/// [`is_conclusive_text`] の閾値。
+///
+/// [`MIN_USABLE_CHARS`] (40) より一桁大きい。アドレスバーの URL・タブ名・
+/// パンくずは 40 は超えても 400 は超えない。逆に「読み終わってよい」と
+/// 言うにはページ 1 画面ぶんは欲しい。
+pub const CONCLUSIVE_CHARS: usize = 400;
+
+/// ローカル OCR の結果を「読めた」と認めるか。
+///
+/// [`is_usable_text`] とは**別の関数**にしてある。OCR は UIA の経路では
+/// ないので、あちらの `route` の並びに混ぜると「UIA で読めた」の意味が
+/// 濁る。閾値は同じ [`MIN_USABLE_CHARS`] を使う — 数文字しか起こせなかった
+/// ウィンドウ (ほぼ画像・グラフの窓) は、無理に文字にするより
+/// スクリーンショットに任せた方が答えられる。ここを緩めると、
+/// **「OCR で埋まったから画像は要らない」と判断して手がかりを失う**。
+pub fn is_usable_ocr_text(text: &str) -> bool {
+    text.trim().chars().count() >= MIN_USABLE_CHARS
+}
+
+/// OCR にかける最小の一辺 (px)。これ未満は起こせる文字がほぼ無い。
+pub const OCR_MIN_EDGE: i32 = 64;
+
+/// 2 つの矩形 `(x, y, 幅, 高さ)` が 1 px でも重なるか (純関数)。
+pub fn rects_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
+    let (ax, ay, aw, ah) = a;
+    let (bx, by, bw, bh) = b;
+    if aw <= 0 || ah <= 0 || bw <= 0 || bh <= 0 {
+        return false;
+    }
+    ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah
+}
+
+/// `outer` が `inner` を**完全に**含むか (純関数)。
+pub fn rect_contains(outer: (i32, i32, i32, i32), inner: (i32, i32, i32, i32)) -> bool {
+    let (ox, oy, ow, oh) = outer;
+    let (ix, iy, iw, ih) = inner;
+    if ow <= 0 || oh <= 0 || iw <= 0 || ih <= 0 {
+        return false;
+    }
+    ox <= ix && oy <= iy && ox + ow >= ix + iw && oy + oh >= iy + ih
+}
+
+/// 手前のウィンドウにどれだけ覆われているか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Occlusion {
+    /// どの手前の窓とも重なっていない。**OCR してよい唯一の状態**。
+    Clear,
+    /// 一部が覆われている。
+    Partial,
+    /// 手前の窓 1 つに完全に覆われ、画面に 1 px も見えていない。
+    Covered,
+}
+
+/// ある窓が、**それより手前にある窓たち**にどう覆われているかを決める (純関数)。
+///
+/// `fronts` は Z オーダーで手前にある窓の矩形 (`EnumWindows` の順に積んだもの)。
+///
+/// # 3 状態を分ける理由
+///
+/// - [`Occlusion::Covered`]: **候補から外す。** ユーザーの目にも入らず、
+///   スクリーンショットにも写らないので、資料に載せる理由が無い。しかも
+///   載せると「読めなかった窓」として [`needs_screenshot`] を発火させ、
+///   **他の全ウィンドウが正しく読めていてもモニタ全体の画像を送らせる**。
+///   実機で再現した挙動そのもので、この機能の目的 (送るものを減らす) を
+///   常駐アプリの窓 1 つが丸ごと無効化していた
+/// - [`Occlusion::Partial`]: **資料には載せるが OCR はしない。** OCR は
+///   画面から見えているものを撮るので、覆われた部分には手前の窓の中身が
+///   写る。それを奥の窓のテキストとして載せると**中身が別のウィンドウの
+///   ものにすり替わる** — 「読めなかった」よりたちが悪い (LLM は嘘を
+///   資料として扱う)。この窓は従来どおりモニタ全体の画像に任せる
+/// - [`Occlusion::Clear`]: OCR してよい
+///
+/// # 完全被覆は「手前の窓 1 つ」で見る
+///
+/// 複数の窓が寄り集まって覆っている場合 (和集合による被覆) は見ない。
+/// 判定に矩形の集合演算が要るうえ、**間違えたときに「見えている窓を
+/// 資料から落とす」方向へ倒れる**。1 つの窓に完全に含まれる、という
+/// 保守的な条件だけを見る — 最大化ウィンドウが常駐窓を覆う実運用の
+/// ケースはこれで拾える。
+pub fn occlusion(rect: (i32, i32, i32, i32), fronts: &[(i32, i32, i32, i32)]) -> Occlusion {
+    let mut partial = false;
+    for front in fronts {
+        if rect_contains(*front, rect) {
+            return Occlusion::Covered;
+        }
+        if rects_overlap(rect, *front) {
+            partial = true;
+        }
+    }
+    if partial {
+        Occlusion::Partial
+    } else {
+        Occlusion::Clear
+    }
+}
+
+/// 読み取り候補 `found` が、いま最良の `best` を置き換えるべきか (純関数)。
+///
+/// **順序は「本文として読めたか → 経路のランク → 長さ」。**
+///
+/// # なぜランクを先に見てはいけないか
+///
+/// ランクだけを先に見ると、**20 文字の `TextPattern` が 105 文字の
+/// `ValuePattern` に勝つ**。本文が `ValuePattern` でしか出ないアプリ
+/// (スパイクの実測: Typeless.exe は Text=0 / Value=105) では、木のどこかに
+/// ある無関係な小さい入力欄が本文を追い出し、**読めているのに
+/// 「読めない窓」として画像送りになる**。
+///
+/// 「読めた」を先に見れば、読めているものが読めていないものに負けない。
+/// 読めたもの同士では従来どおりランク (本文に近い経路) を優先し、
+/// 同ランクなら長い方を採る。
+pub fn is_better_read(found: (&str, ContextSource), best: (&str, ContextSource)) -> bool {
+    let key = |(text, route): (&str, ContextSource)| {
+        (
+            is_usable_text(text, route),
+            route_rank(route),
+            text.chars().count(),
+        )
+    };
+    key(found) > key(best)
+}
+
+/// 経路の望ましさ。大きいほど本文に近い。
+pub fn route_rank(source: ContextSource) -> u8 {
+    match source {
+        ContextSource::TextPattern => 4,
+        ContextSource::ValuePattern => 3,
+        // MSAA 経由。UIA ネイティブの 2 経路が両方 0 を返す相手向けの保険で、
+        // 返るのは本文なので `ElementName` (ラベル) より上に置く。
+        ContextSource::Legacy => 2,
+        ContextSource::ElementName => 1,
+        _ => 0,
+    }
+}
+
+/// ウィンドウ矩形をモニタ矩形で切り取る (純関数)。
+///
+/// 画面外へはみ出した部分を `BitBlt` で撮ると、ドライバによっては
+/// 黒や前回の内容が返る。**撮る前に画面の中へ収める。**
+/// 収めた結果が [`OCR_MIN_EDGE`] 未満なら `None` (OCR しない)。
+pub fn clip_to_monitor(
+    win: (i32, i32, i32, i32),
+    monitor: (i32, i32, i32, i32),
+) -> Option<(i32, i32, i32, i32)> {
+    let (wx, wy, ww, wh) = win;
+    let (mx, my, mw, mh) = monitor;
+    let left = wx.max(mx);
+    let top = wy.max(my);
+    let right = (wx + ww).min(mx + mw);
+    let bottom = (wy + wh).min(my + mh);
+    let (w, h) = (right - left, bottom - top);
+    (w >= OCR_MIN_EDGE && h >= OCR_MIN_EDGE).then_some((left, top, w, h))
+}
+
+/// `GetDIBits` の BGRA (下から上) を、上から下の BGRA へ並べ替える。
+///
+/// あわせて**アルファを 255 で埋める**。32bpp `BI_RGB` のアルファは
+/// 未定義で、実際には 0 が入る。`SoftwareBitmap` は Bgra8 を
+/// **乗算済みアルファ**として解釈するので、0 のまま渡すと画像全体が
+/// 透明 = 真っ黒になり、**OCR が必ず 0 文字を返す** (「動いているのに
+/// 何も読めない」という切り分けの難しい失敗になる)。
+pub fn bgra_bottom_up_to_top_down(src: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    let (w, h) = (width as usize, height as usize);
+    if w == 0 || h == 0 || src.len() < w * h * 4 {
+        return None;
+    }
+    let mut out = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let src_row = (h - 1 - y) * w * 4;
+        let dst_row = y * w * 4;
+        out[dst_row..dst_row + w * 4].copy_from_slice(&src[src_row..src_row + w * 4]);
+        for x in 0..w {
+            out[dst_row + x * 4 + 3] = 255;
+        }
+    }
+    Some(out)
+}
+
+/// OCR の単語をつなぐ区切り (純関数)。
+///
+/// `Windows.Media.Ocr` は認識結果を**単語単位**で返す。英語のように
+/// 空白で区切る言語はそのまま空白でつなげばよいが、**日本語・中国語を
+/// 空白でつなぐと「本 文 が こ の よ う に」なる** — 資料としては読めるが、
+/// 固有名詞が割れてクラウド側の理解を確実に落とす。言語タグで分ける。
+pub fn ocr_word_separator(language_tag: &str) -> &'static str {
+    let tag = language_tag.to_ascii_lowercase();
+    // 前方一致で見るのは、実際に返るのが "ja-JP" / "zh-Hans-CN" のような
+    // 地域つきのタグだから。"ja" 完全一致で書くと日本語で空白が入る。
+    // 韓国語は分かち書きするので**入れない**。「CJK だから」で 3 言語を
+    // まとめると、韓国語だけ単語が全部くっつく。
+    if tag.starts_with("ja") || tag.starts_with("zh") {
+        ""
+    } else {
+        " "
+    }
+}
+
+/// OCR の単語列を 1 行につなぐ (純関数)。
+///
+/// 区切りが空 (日本語・中国語) のときも、**両隣が ASCII 英数字なら空白を
+/// 入れる**。入れないと日本語の行に混ざった英単語が
+/// 「Windows Update を実行」→「WindowsUpdateを実行」のように潰れる。
+/// 固有名詞・コマンド名・エラーコードは画面質問でまさに訊かれる対象なので、
+/// ここが潰れると答えの精度に直接効く。
+pub fn join_ocr_words(words: &[String], separator: &str) -> String {
+    let mut out = String::new();
+    for word in words {
+        if word.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            let left_ascii = out.chars().next_back().is_some_and(is_ascii_wordish);
+            let right_ascii = word.chars().next().is_some_and(is_ascii_wordish);
+            if separator.is_empty() && left_ascii && right_ascii {
+                out.push(' ');
+            } else {
+                out.push_str(separator);
+            }
+        }
+        out.push_str(word);
+    }
+    out
+}
+
+/// 空白を挟むべき「語の一部」に見える ASCII か。
+///
+/// 記号は入れない。`(Windows)` のような囲みや `-` で切れた語の間に
+/// 空白を差し込むと、今度はそちらが壊れる。
+fn is_ascii_wordish(c: char) -> bool {
+    c.is_ascii_alphanumeric()
 }
 
 /// スクリーンショットを撮るべきか。
@@ -609,6 +869,10 @@ impl ScanHandle {
 mod tests {
     use super::*;
 
+    fn words(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
     fn window(text: &str) -> ScannedWindow {
         ScannedWindow {
             title: "タイトル".to_string(),
@@ -769,6 +1033,7 @@ mod tests {
             SkipReason::ToolWindow,
             SkipReason::Untitled,
             SkipReason::TooSmall,
+            SkipReason::Covered,
         ] {
             assert!(!reason.label().is_empty(), "{reason:?}");
         }
@@ -819,6 +1084,9 @@ mod tests {
     fn unreadable_routes_never_count() {
         for route in [
             ContextSource::ElementName,
+            // OCR は UIA の経路ではない。ここに混ぜて「UIA で読めた」に
+            // すると、UIA の成否を測る指標が意味を失う。
+            ContextSource::Ocr,
             ContextSource::Unavailable,
             ContextSource::PasswordSkipped,
             ContextSource::TimedOut,
@@ -829,6 +1097,285 @@ mod tests {
                 "{route:?} を読めた扱いにしている"
             );
         }
+    }
+
+    // --- 木の下降をどこで打ち切るか ---
+
+    #[test]
+    fn an_address_bar_does_not_end_the_descent() {
+        // ここが要点。Chromium の木を浅い方から降りると、本文より先に
+        // アドレスバーに当たる。URL は 40 文字を平気で超えるので
+        // `is_usable_text` で打ち切ると、記事本文にもスクリーンショットにも
+        // 辿り着かないまま「読めた窓」として資料が確定する。
+        let url = "https://example.com/articles/2026/09/very-long-slug-for-a-page?ref=nav";
+        assert!(url.chars().count() > MIN_USABLE_CHARS);
+        assert!(is_usable_text(url, ContextSource::ValuePattern));
+        assert!(!is_conclusive_text(url, ContextSource::ValuePattern));
+        assert!(!is_conclusive_text(url, ContextSource::TextPattern));
+    }
+
+    #[test]
+    fn a_page_body_ends_the_descent() {
+        let body = "あ".repeat(CONCLUSIVE_CHARS);
+        assert!(is_conclusive_text(&body, ContextSource::TextPattern));
+        // TextPattern 以外は「本文をまるごと持っている」保証が無いので
+        // 打ち切らない (量が同じでも降り続ける)。
+        assert!(!is_conclusive_text(&body, ContextSource::ValuePattern));
+        assert!(!is_conclusive_text(&body, ContextSource::Legacy));
+        assert!(!is_conclusive_text(&body, ContextSource::ElementName));
+    }
+
+    #[test]
+    fn the_descent_threshold_is_well_above_the_usable_one() {
+        // 逆転すると「読めた」より先に打ち切りが来て、上の防御が消える。
+        const { assert!(CONCLUSIVE_CHARS > MIN_USABLE_CHARS) };
+    }
+
+    // --- ローカル OCR ---
+
+    #[test]
+    fn ocr_text_is_judged_by_its_own_rule() {
+        // OCR は UIA の経路ではない。`is_usable_text` に混ぜると
+        // 「UIA で読めた」の意味が濁る。
+        let body = "あ".repeat(MIN_USABLE_CHARS);
+        assert!(is_usable_ocr_text(&body));
+        assert!(!is_usable_text(&body, ContextSource::Ocr));
+    }
+
+    #[test]
+    fn a_handful_of_characters_is_not_worth_calling_readable() {
+        // ほぼ画像の窓から数文字だけ起こして「読めた」にすると、
+        // 画像が付かないまま手がかりを失う。
+        assert!(!is_usable_ocr_text(&"あ".repeat(MIN_USABLE_CHARS - 1)));
+        assert!(!is_usable_ocr_text("   "));
+    }
+
+    // --- 手前の窓に覆われた窓の扱い ---
+
+    #[test]
+    fn a_fully_covered_window_is_dropped_from_the_material() {
+        // これがレビューで実機再現した不具合。常駐アプリの窓 1 つが
+        // 最大化ウィンドウの裏に完全に隠れているだけで「読めなかった窓」に
+        // 数えられ、他の全ウィンドウが正しく読めていてもモニタ全体の画像が
+        // クラウドへ送られていた。**見えない窓は資料に載せる理由が無い。**
+        let maximized = (0, 0, 1920, 1080);
+        let hidden = (400, 300, 300, 200);
+        assert_eq!(occlusion(hidden, &[maximized]), Occlusion::Covered);
+        // 縁がぴったり一致していても「覆われている」。
+        assert_eq!(occlusion(maximized, &[maximized]), Occlusion::Covered);
+    }
+
+    #[test]
+    fn a_partly_covered_window_stays_but_is_not_ocred() {
+        // 一部だけ覆われた窓は**ユーザーに見えている**ので資料には残す。
+        // ただし OCR すると覆われた部分に手前の窓の中身が写り、
+        // 中身が別のウィンドウのものにすり替わる。
+        let front = (0, 0, 800, 600);
+        assert_eq!(occlusion((700, 500, 800, 600), &[front]), Occlusion::Partial);
+    }
+
+    #[test]
+    fn an_unobstructed_window_is_clear() {
+        let front = (0, 0, 800, 600);
+        assert_eq!(occlusion((800, 0, 800, 600), &[front]), Occlusion::Clear);
+        assert_eq!(occlusion((0, 0, 800, 600), &[]), Occlusion::Clear);
+    }
+
+    #[test]
+    fn full_coverage_wins_over_a_partial_overlap_elsewhere() {
+        // 順序に依存して「一部重なり」で確定してしまうと、
+        // 完全に隠れた窓が資料に残り、画像を強制する。
+        let nibble = (0, 0, 100, 100);
+        let cover = (0, 0, 1920, 1080);
+        let window = (50, 50, 300, 200);
+        assert_eq!(occlusion(window, &[nibble, cover]), Occlusion::Covered);
+        assert_eq!(occlusion(window, &[cover, nibble]), Occlusion::Covered);
+    }
+
+    #[test]
+    fn coverage_needs_a_single_window_that_contains_it() {
+        // 2 つの窓が寄り集まって覆っている場合は「完全被覆」と見ない。
+        // 間違えると**見えている窓を資料から落とす**方向へ倒れる。
+        let left = (0, 0, 500, 1080);
+        let right = (500, 0, 500, 1080);
+        assert_eq!(occlusion((100, 100, 800, 200), &[left, right]), Occlusion::Partial);
+    }
+
+    #[test]
+    fn containment_is_not_confused_with_mere_overlap() {
+        assert!(rect_contains((0, 0, 100, 100), (10, 10, 10, 10)));
+        assert!(!rect_contains((0, 0, 100, 100), (90, 90, 20, 20)));
+        // 空の矩形は誰も含まないし、誰にも含まれない。
+        assert!(!rect_contains((0, 0, 0, 100), (0, 0, 0, 100)));
+    }
+
+    // --- どの読み取りを採るか ---
+
+    #[test]
+    fn a_readable_value_pattern_beats_an_unreadable_text_pattern() {
+        // スパイクの実測: Typeless.exe は Text=0 / Value=105。木のどこかに
+        // ある無関係な小さい入力欄 (TextPattern・20 字) が本文を追い出すと、
+        // **読めているのに「読めない窓」として画像送りになる**。
+        let body = ("あ".repeat(105), ContextSource::ValuePattern);
+        let scrap = ("あ".repeat(20), ContextSource::TextPattern);
+        assert!(is_better_read(
+            (&body.0, body.1),
+            (&scrap.0, scrap.1)
+        ));
+        assert!(!is_better_read((&scrap.0, scrap.1), (&body.0, body.1)));
+    }
+
+    #[test]
+    fn among_readable_reads_the_route_still_decides() {
+        let text = "あ".repeat(200);
+        let value = "い".repeat(500);
+        // どちらも読めているなら、本文に近い経路を採る (長さより優先)。
+        assert!(is_better_read(
+            (&text, ContextSource::TextPattern),
+            (&value, ContextSource::ValuePattern)
+        ));
+    }
+
+    #[test]
+    fn among_equal_routes_the_longer_read_wins() {
+        let short = "あ".repeat(50);
+        let long = "あ".repeat(500);
+        assert!(is_better_read(
+            (&long, ContextSource::TextPattern),
+            (&short, ContextSource::TextPattern)
+        ));
+        assert!(!is_better_read(
+            (&short, ContextSource::TextPattern),
+            (&long, ContextSource::TextPattern)
+        ));
+    }
+
+    #[test]
+    fn a_title_never_displaces_a_body() {
+        let title = "設計ドキュメントの読み方について — 社内 Wiki — Google Chrome";
+        let body = "あ".repeat(MIN_USABLE_CHARS);
+        assert!(!is_better_read(
+            (title, ContextSource::ElementName),
+            (&body, ContextSource::Legacy)
+        ));
+    }
+
+    #[test]
+    fn overlapping_windows_are_never_ocred() {
+        let front = (0, 0, 800, 600);
+        // 1 px でも重なれば駄目。覆われた部分には手前の窓の中身が写り、
+        // それを奥の窓のテキストとして載せると中身がすり替わる。
+        assert!(rects_overlap(front, (799, 599, 400, 300)));
+        assert!(rects_overlap(front, (100, 100, 50, 50)), "内包も重なり");
+        // 辺が接するだけなら重なっていない。
+        assert!(!rects_overlap(front, (800, 0, 400, 300)));
+        assert!(!rects_overlap(front, (0, 600, 400, 300)));
+        // 空の矩形は誰とも重ならない (0 除算ではなく素通しにする)。
+        assert!(!rects_overlap(front, (100, 100, 0, 300)));
+    }
+
+    #[test]
+    fn window_rects_are_clipped_into_the_monitor() {
+        let monitor = (0, 0, 1920, 1080);
+        // 左と上へはみ出した窓。
+        assert_eq!(
+            clip_to_monitor((-200, -100, 800, 600), monitor),
+            Some((0, 0, 600, 500))
+        );
+        // 完全に画面内ならそのまま。
+        assert_eq!(
+            clip_to_monitor((100, 100, 800, 600), monitor),
+            Some((100, 100, 800, 600))
+        );
+        // 2 枚目のモニタでも原点を跨がない。
+        let second = (1920, 0, 1920, 1080);
+        assert_eq!(
+            clip_to_monitor((1800, 0, 400, 600), second),
+            Some((1920, 0, 280, 600))
+        );
+    }
+
+    #[test]
+    fn a_sliver_of_a_window_is_not_worth_ocring() {
+        let monitor = (0, 0, 1920, 1080);
+        assert_eq!(clip_to_monitor((-790, 0, 800, 600), monitor), None);
+        assert_eq!(clip_to_monitor((5000, 0, 800, 600), monitor), None);
+    }
+
+    #[test]
+    fn the_ocr_buffer_is_flipped_and_made_opaque() {
+        // 2x2。ボトムアップなので入力の 1 行目が出力の下端になる。
+        let mut src = vec![0u8; 2 * 2 * 4];
+        for x in 0..2 {
+            src[x * 4] = 255; // 下端: 青
+            src[(2 + x) * 4 + 2] = 255; // 上端: 赤
+        }
+        let out = bgra_bottom_up_to_top_down(&src, 2, 2).expect("変換できる");
+        // 出力の 0 行目 (上端) は赤。B=0 G=0 R=255。
+        assert_eq!(&out[0..3], &[0, 0, 255]);
+        assert_eq!(&out[8..11], &[255, 0, 0], "下端が青のまま来ていない");
+        // アルファは全部 255。0 のままだと乗算済みアルファとして
+        // 真っ黒に解釈され、OCR が必ず 0 文字を返す。
+        assert!(out.chunks_exact(4).all(|px| px[3] == 255));
+    }
+
+    #[test]
+    fn a_truncated_ocr_buffer_is_rejected_instead_of_panicking() {
+        assert!(bgra_bottom_up_to_top_down(&[0u8; 4], 100, 100).is_none());
+        assert!(bgra_bottom_up_to_top_down(&[0u8; 16], 0, 2).is_none());
+    }
+
+    #[test]
+    fn japanese_ocr_words_are_joined_without_spaces() {
+        // 空白でつなぐと「本 文 が こ の よ う に」なり、固有名詞が割れる。
+        assert_eq!(ocr_word_separator("ja-JP"), "");
+        assert_eq!(ocr_word_separator("zh-Hans-CN"), "");
+        // 地域つきタグで返るので、完全一致で書くと日本語に空白が入る。
+        assert_eq!(ocr_word_separator("JA"), "");
+    }
+
+    #[test]
+    fn western_ocr_words_keep_their_spaces() {
+        assert_eq!(ocr_word_separator("en-US"), " ");
+        assert_eq!(ocr_word_separator("de-DE"), " ");
+        // 韓国語は分かち書きする。CJK でまとめると単語が全部くっつく。
+        assert_eq!(ocr_word_separator("ko-KR"), " ");
+        assert_eq!(ocr_word_separator(""), " ");
+    }
+
+    #[test]
+    fn ascii_words_inside_a_japanese_line_keep_their_space() {
+        // 「Windows Update を実行」が「WindowsUpdateを実行」になると、
+        // 固有名詞・コマンド名・エラーコードが潰れる — 画面質問で
+        // まさに訊かれる対象なので、答えの精度に直接効く。
+        let words = words(&["Windows", "Update", "を", "実行"]);
+        assert_eq!(join_ocr_words(&words, ""), "Windows Updateを実行");
+    }
+
+    #[test]
+    fn japanese_words_are_still_joined_tightly() {
+        let words = words(&["本", "文", "が", "この", "ように"]);
+        assert_eq!(join_ocr_words(&words, ""), "本文がこのように");
+    }
+
+    #[test]
+    fn symbols_do_not_gain_spaces() {
+        // 囲みや区切り記号の隣に空白を差し込むと、今度はそちらが壊れる。
+        let words = words(&["(", "Windows", ")", "の", "設定"]);
+        assert_eq!(join_ocr_words(&words, ""), "(Windows)の設定");
+    }
+
+    #[test]
+    fn a_space_separated_language_is_joined_as_before() {
+        let words = words(&["Open", "the", "settings"]);
+        assert_eq!(join_ocr_words(&words, " "), "Open the settings");
+    }
+
+    #[test]
+    fn empty_words_do_not_leave_double_separators() {
+        let words = words(&["Open", "", "settings"]);
+        assert_eq!(join_ocr_words(&words, " "), "Open settings");
+        assert_eq!(join_ocr_words(&[], " "), "");
     }
 
     // --- スクリーンショットの要否 ---
@@ -1187,14 +1734,20 @@ mod tests {
                 window.text.chars().count()
             );
         }
+        let by_ocr = scan
+            .windows
+            .iter()
+            .filter(|w| w.route == ContextSource::Ocr)
+            .count();
+        println!("OCR    : {by_ocr} ウィンドウ (UIA で読めなかった分の埋め合わせ)");
         match &scan.screenshot {
             Some(shot) => println!(
-                "画像   : {}x{} / {} KB",
+                "画像   : {}x{} / {} KB **これがクラウドへ送られる**",
                 shot.width,
                 shot.height,
                 shot.png.len() / 1024
             ),
-            None => println!("画像   : なし (全ウィンドウを UIA で読めた)"),
+            None => println!("画像   : なし (全ウィンドウを UIA か OCR で読めた)"),
         }
         if let Some(reason) = &scan.failure {
             println!("失敗   : {reason}");

@@ -1,17 +1,27 @@
 //! [`crate::screen`] の Win32 実装。
 //!
 //! ここは実機でしか動かない層なので、**判断は一切持たせない**。
-//! 「どの窓を読むか」「読めたと認めるか」「画像が要るか」は親モジュールの
-//! 純関数 ([`scan_decision`] / [`is_usable_text`] / [`needs_screenshot`]) にあり、
+//! 「どの窓を読むか」「覆われ方をどう扱うか」「どの読み取りを採るか」
+//! 「読めたと認めるか」「画像が要るか」は親モジュールの純関数
+//! ([`scan_decision`] / [`occlusion`] / [`is_better_read`] /
+//! [`is_conclusive_text`] / [`is_usable_text`] / [`is_usable_ocr_text`] /
+//! [`needs_screenshot`]) にあり、
 //! ここは値を集めて渡し、結果を組み立てるだけにしてある。
 //! そうしないと、この機能の判断部分が丸ごとテスト不能になる。
 
+use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::core::BOOL;
+use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
+use windows::Media::Ocr::OcrEngine;
+use windows::Storage::Streams::DataWriter;
+use windows_future::AsyncOperationCompletedHandler;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, ReleaseDC, SelectObject, BITMAPINFO,
@@ -22,28 +32,66 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
-use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation, IUIAutomationElement};
+use windows::Win32::UI::Accessibility::{
+    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
-    GetWindowRect, IsIconic, IsWindowVisible, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
+    EnumWindows, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, IsIconic,
+    IsWindowVisible, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
 };
 
 use super::{
-    cap_total_text, describe_position, downscale_bgra_bottom_up, encode_png, is_usable_text,
-    claim_scan, may_release_scan, needs_screenshot, now_ms, plan_scale, scan_decision, MonitorPick,
-    ScanDecision, ScanHandle, ScannedWindow, ScreenScan, Screenshot, SkipReason, WindowCandidate,
-    MAX_IMAGE_EDGE, MAX_TEXT_PER_WINDOW, MAX_TOTAL_TEXT, MAX_WINDOWS, SCAN_BUDGET, SCAN_IN_FLIGHT,
-    STALE_AFTER,
+    bgra_bottom_up_to_top_down, cap_total_text, clip_to_monitor, describe_position,
+    downscale_bgra_bottom_up, encode_png, is_better_read, is_conclusive_text, is_usable_ocr_text,
+    is_usable_text, claim_scan, join_ocr_words, may_release_scan, needs_screenshot, now_ms,
+    occlusion, ocr_word_separator, plan_scale, scan_decision, MonitorPick, Occlusion, ScanDecision,
+    ScanHandle, ScannedWindow, ScreenScan, Screenshot, SkipReason, WindowCandidate, MAX_IMAGE_EDGE,
+    MAX_TEXT_PER_WINDOW, MAX_TOTAL_TEXT, MAX_WINDOWS, SCAN_BUDGET, SCAN_IN_FLIGHT, STALE_AFTER,
 };
-use crate::context::ContextSource;
+use crate::context::{ContextSource, Keep};
 
 use std::sync::atomic::Ordering;
 
-/// 1 ウィンドウあたりに見る子ウィンドウの数。
+/// 1 ウィンドウの UIA 木の下降に使ってよい時間。
 ///
-/// 本文を持つコントロールは普通いちばん手前の数個に見つかる。
-/// 上限が無いと、コントロールを何百個も持つアプリ 1 つで予算を食い潰す。
-const MAX_CHILDREN_PER_WINDOW: usize = 24;
+/// # なぜスパイクの値をそのまま持ってこないのか
+///
+/// 検証スパイク ([`crate::uia_spike`]) は要素 30,000・深さ 40 で
+/// Wikipedia 記事を 2.5〜3 秒かけて**完走**した。だがあれは「1 窓だけを、
+/// 他に何もしていない状態で」測った値である。ここは違う:
+///
+/// - 走査は**録音と並行**して走る。COM のプロセス跨ぎ呼び出しを数万回
+///   撃つと、録音とホットキーフックのスレッドと CPU を取り合う
+/// - 全体予算 ([`SCAN_BUDGET`] = 4 秒) で**最大 12 窓**を回す。1 窓に
+///   3 秒使えば 2 窓目以降は手つかずになり、`needs_screenshot` の
+///   「読まなかった窓も読めなかった窓と同じ」規則でどのみち画像が付く。
+///   **1 窓を完璧に読むより、多くの窓をそこそこ読む方がこの機能には効く**
+///
+/// 全体予算はウィンドウとウィンドウの間でしか見られないので、
+/// **1 窓の上限がそのまま打ち切りの粒度**になる。600ms なら 4 秒の中で
+/// 最低 6 窓は回る。
+const WINDOW_READ_BUDGET: Duration = Duration::from_millis(600);
+
+/// 1 ウィンドウの木で見る要素数の上限。
+///
+/// 実際に効くのは上の時間予算で、こちらは**時計が当てにならない場合の
+/// 暴走止め**。1 要素につき最大 4 回の COM 呼び出しが走るので、
+/// 1,200 要素で約 5,000 回。到達する前にたいてい時間が尽きる。
+const MAX_ELEMENTS_PER_WINDOW: usize = 1_200;
+
+/// 木の深さ上限。
+///
+/// スパイクの実測では 40 で Chromium の DOM が収まった。本文を持つ
+/// `Document` はもっと浅い位置にあるので、32 は「実測の範囲内で、
+/// 異常に深い木を切る」ための値。
+const MAX_DEPTH_PER_WINDOW: usize = 32;
+
+/// ローカル OCR 1 回を見切る時間。
+///
+/// [`WINDOW_READ_BUDGET`] より長いのは、OCR が「相手アプリ次第」ではなく
+/// **画素数次第**で、4K の窓 1 枚は素で数百 ms かかるため。走査全体の
+/// [`SCAN_BUDGET`] を超えないよう、窓の間で必ず予算を見直す。
+const OCR_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 /// 画面の走査を**開始する**。呼び出し側はブロックしない。
 ///
@@ -155,9 +203,23 @@ fn scan_monitor(started: Instant) -> ScreenScan {
     let candidates = collect_candidates(monitor, rect);
     let candidate_count = candidates.len();
     let mut windows = Vec::new();
+    // OCR エンジンは要ると分かってから 1 度だけ作る。生成は数十 ms かかり、
+    // UIA で全部読めた画面 (段階 1 のあと、これが普通の状態) では 1 回も
+    // 要らない。`Option<Option<_>>` の外側が「まだ試していない」。
+    let mut ocr: Option<Option<Ocr>> = None;
+    let mut ocr_filled = 0usize;
 
     match automation() {
         Some(automation) => {
+            // ControlView の walker。Raw ではなく Control を使うのは、
+            // Raw が装飾用の要素まで含んで木が数倍になるため
+            // (スパイクで両方を測った結果)。
+            // SAFETY: automation は有効。取れなければ木を降りずに
+            // トップレベル要素だけを見る (従来と同じ挙動へ落ちる)。
+            let walker = unsafe { automation.ControlViewWalker() }.ok();
+            if walker.is_none() {
+                log::warn!("UIA の TreeWalker を取得できません (トップレベル要素だけ読みます)");
+            }
             for candidate in candidates {
                 if windows.len() >= MAX_WINDOWS {
                     log::debug!("ウィンドウ数の上限 ({MAX_WINDOWS}) に達したので打ち切ります");
@@ -169,14 +231,38 @@ fn scan_monitor(started: Instant) -> ScreenScan {
                     log::info!("画面走査が予算を超えたので、読めたところまでで確定します");
                     break;
                 }
-                let (text, route) = read_window(&automation, candidate.hwnd);
-                let usable = is_usable_text(&text, route);
+                let (text, route) = read_window(&automation, walker.as_ref(), candidate.hwnd);
+                let mut text = if is_usable_text(&text, route) {
+                    text
+                } else {
+                    String::new()
+                };
+                let mut route = route;
+
+                // **UIA で読めなかった窓だけ、クラウドへ画像を送る前に
+                // ローカル OCR を試す。** ここで埋まった分だけ、送る画像から
+                // 情報が減る (全部埋まればモニタ画像そのものが不要になる)。
+                // **残り予算を渡す。** 予算末尾で始まった OCR が全体予算を
+                // 超えて返ると、`ScanHandle::wait` が先に見切り、UIA で
+                // 読めていたテキストも撮ってあった画像も丸ごと捨てられる。
+                let remaining = SCAN_BUDGET.saturating_sub(started.elapsed());
+                if text.is_empty() && candidate.ocr_safe && !remaining.is_zero() {
+                    let engine = ocr.get_or_insert_with(ocr_engine);
+                    if let Some(engine) = engine.as_ref() {
+                        if let Some(read) = ocr_window(engine, candidate.rect, rect, remaining) {
+                            text = read;
+                            route = ContextSource::Ocr;
+                            ocr_filled += 1;
+                        }
+                    }
+                }
+
                 windows.push(ScannedWindow {
                     title: candidate.title,
                     process: crate::foreground::process_image_name(candidate.process_id)
                         .unwrap_or_else(|| "<unknown>".to_string()),
                     position: candidate.position,
-                    text: if usable { text } else { String::new() },
+                    text,
                     route,
                 });
             }
@@ -215,9 +301,10 @@ fn scan_monitor(started: Instant) -> ScreenScan {
     let failure = (windows.iter().all(|w| w.text.trim().is_empty()) && screenshot.is_none())
         .then(|| "画面から読み取れる内容がありませんでした".to_string());
 
-    // 中身は絶対に出さない。件数と量だけ。
+    // 中身は絶対に出さない。件数と量だけ。**OCR で起こしたテキストも
+    // 画面の中身なので、当然ここには出さない** (件数だけ)。
     log::info!(
-        "画面走査完了: {} ({} ウィンドウ (未走査 {unscanned}) / {} 文字 / 画像 {} / {} ms)",
+        "画面走査完了: {} ({} ウィンドウ (未走査 {unscanned} / OCR {ocr_filled}) / {} 文字 / 画像 {} / {} ms)",
         pick.label(),
         windows.len(),
         windows.iter().map(|w| w.text.chars().count()).sum::<usize>(),
@@ -315,6 +402,12 @@ struct Candidate {
     title: String,
     process_id: u32,
     position: String,
+    /// スクリーン座標の矩形 `(x, y, 幅, 高さ)`。OCR の切り取りに使う。
+    rect: (i32, i32, i32, i32),
+    /// **手前のどの候補にも覆われていない**か。OCR してよい条件
+    /// ([`rects_overlap`] の doc)。覆われた窓を撮ると、手前の窓の中身が
+    /// この窓のテキストとして資料に載る。
+    ocr_safe: bool,
 }
 
 /// `EnumWindows` のコールバックへ渡す作業領域。
@@ -424,16 +517,37 @@ fn collect_one(hwnd: HWND, state: &mut EnumState) {
 
     match scan_decision(&candidate, state.own_process_id) {
         ScanDecision::Scan => {
-            let position = describe_position(
-                (rect.left, rect.top, candidate.width, candidate.height),
-                state.monitor_rect,
-            );
-            state.found.push(Candidate {
-                hwnd: candidate.hwnd,
-                title: candidate.title,
-                process_id: candidate.process_id,
-                position,
-            });
+            let window_rect = (rect.left, rect.top, candidate.width, candidate.height);
+            let position = describe_position(window_rect, state.monitor_rect);
+            // 重なり判定と OCR の切り取りには**見た目の枠**を使う。
+            // `GetWindowRect` は Windows 11 では不可視のリサイズ枠 (影の分)
+            // まで含むので、**左右に並べたウィンドウ同士が「重なっている」
+            // ことになる** — 一番 OCR が効くはずの並べた画面で、毎回
+            // 画像へ落ちてしまう。
+            let visible_rect = visible_frame(hwnd).unwrap_or(window_rect);
+            // `EnumWindows` は Z オーダー順 (手前から) なので、**今までに
+            // 積んだ候補は全部この窓より手前**にある。判断は純関数
+            // [`occlusion`] に任せる (3 状態の意味はそちらの doc)。
+            let fronts: Vec<(i32, i32, i32, i32)> =
+                state.found.iter().map(|front| front.rect).collect();
+            match occlusion(visible_rect, &fronts) {
+                Occlusion::Covered => {
+                    // **完全に隠れている窓は候補にしない。** ユーザーの目にも
+                    // 入らず、スクリーンショットにも写らないので資料に載せる
+                    // 理由が無い。載せると「読めなかった窓」として
+                    // `needs_screenshot` を発火させ、他の全ウィンドウが
+                    // 読めていてもモニタ全体の画像をクラウドへ送らせる。
+                    state.skipped.push(SkipReason::Covered);
+                }
+                other => state.found.push(Candidate {
+                    hwnd: candidate.hwnd,
+                    title: candidate.title,
+                    process_id: candidate.process_id,
+                    position,
+                    rect: visible_rect,
+                    ocr_safe: other == Occlusion::Clear,
+                }),
+            }
         }
         ScanDecision::Skip(reason) => {
             // **どの窓を外したかは出さない。** 出すにはタイトルが要り、
@@ -459,6 +573,31 @@ fn summarize_skips(skipped: &[SkipReason]) -> String {
         .map(|(r, n)| format!("{}={n}", r.label()))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// 画面に見えているとおりのウィンドウ枠 `(x, y, 幅, 高さ)`。
+///
+/// `GetWindowRect` は Windows 11 では**不可視のリサイズ枠**(影のぶん、
+/// 左右下に数 px)まで含む。重なり判定と OCR の切り取りにそれを使うと、
+/// 左右に並べただけのウィンドウが「重なっている」ことになり、
+/// **一番 OCR が効くはずの並べた画面が毎回画像へ落ちる**。
+/// 取れなければ呼び出し側が `GetWindowRect` の値へ落とす。
+fn visible_frame(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
+    let mut rect = RECT::default();
+    // SAFETY: hwnd は有効。出力先はスタック上の RECT で、サイズも一致させている。
+    let result = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut RECT as *mut std::ffi::c_void,
+            std::mem::size_of::<RECT>() as u32,
+        )
+    };
+    if result.is_err() {
+        return None;
+    }
+    let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+    (w > 0 && h > 0).then_some((rect.left, rect.top, w, h))
 }
 
 /// DWM から見て隠されているか (仮想デスクトップの別ページ、未表示の UWP)。
@@ -499,35 +638,98 @@ fn automation() -> Option<IUIAutomation> {
 /// 1 ウィンドウ分のテキストを読む。
 ///
 /// トップレベル要素の `Name` はウィンドウタイトルにすぎないので、
-/// **本文が読めるかは子コントロールまで降りないと分からない**
-/// (design.md Q1 の実測)。降りても駄目なら、そのウィンドウはスクリーン
-/// ショット側に任せる。
-fn read_window(automation: &IUIAutomation, hwnd: isize) -> (String, ContextSource) {
+/// **本文が読めるかは中まで降りないと分からない** (design.md Q1 の実測)。
+///
+/// # なぜ子ウィンドウ (`EnumChildWindows`) ではなく UIA の木なのか
+///
+/// **Chromium (Chrome / Electron 全般) は本文を 1 つの HWND
+/// (`Chrome_RenderWidgetHostHWND`) の内側に UIA 要素ツリーとして持ち、
+/// 子 HWND を作らない。** 子ウィンドウを列挙する実装は、Chrome や
+/// Electron アプリの本文を**構造的に 0 文字と誤判定**し、「読めないから」
+/// としてモニタ全体のスクリーンショットをクラウドへ送っていた —
+/// **読めるのに読めないと判断して画像を送っていた**わけで、この機能で
+/// 一番大きな情報漏えいの原因だった。`IUIAutomationTreeWalker` で降りれば
+/// Chromium の中まで届く (検証スパイク [`crate::uia_spike`] の実測)。
+///
+/// # 幅優先で降りる
+///
+/// 本文を持つ大きな要素 (`Document` / `Pane`) は木の**浅い**ところにある。
+/// 深さ優先だとツールバーやメニューの奥から降りてしまい、時間予算を
+/// 使い切ってから本文に到達する。幅優先なら数十要素で本文に当たる。
+///
+/// 降りても駄目なら、そのウィンドウは OCR とスクリーンショット側に任せる。
+/// **Chromium は非アクティブなタブを木に出さない**ので、「読めなかった」は
+/// 異常ではなく普通に起きる。エラーにはしない。
+fn read_window(
+    automation: &IUIAutomation,
+    walker: Option<&IUIAutomationTreeWalker>,
+    hwnd: isize,
+) -> (String, ContextSource) {
+    // **予算はルート要素を読む前から数える。** `ElementFromHandle` と
+    // ルートの読み取りも相手プロセスへの問い合わせで、遅い相手ではここだけで
+    // 数百 ms かかる。木の下降だけを計ると、doc の「1 窓 600ms」が嘘になる。
+    let deadline = Instant::now() + WINDOW_READ_BUDGET;
     let hwnd = HWND(hwnd as *mut _);
     // SAFETY: automation と hwnd は有効。相手が応答しなければ Err。
-    let Ok(element) = (unsafe { automation.ElementFromHandle(hwnd) }) else {
+    let Ok(root) = (unsafe { automation.ElementFromHandle(hwnd) }) else {
         return (String::new(), ContextSource::Unavailable);
     };
 
-    let mut best = read_one(&element);
-    if is_usable_text(&best.0, best.1) {
+    // ルートだけは `Name` (= ウィンドウタイトル) までの経路で読む。
+    // 何も読めなかったときに「そこに窓があった」ことは資料に残るべきで、
+    // それを持っているのはタイトルだけだから。
+    let mut best = read_one(&root, true);
+    if is_conclusive_text(&best.0, best.1) {
         return best;
     }
+    let Some(walker) = walker else {
+        return best;
+    };
 
-    for child in child_windows(hwnd) {
-        // SAFETY: child は列挙で得た有効な HWND。
-        let Ok(child_element) = (unsafe { automation.ElementFromHandle(child) }) else {
+    let mut queue: VecDeque<(IUIAutomationElement, usize)> = VecDeque::new();
+    queue.push_back((root, 0));
+    let mut seen = 0usize;
+
+    while let Some((element, depth)) = queue.pop_front() {
+        if seen >= MAX_ELEMENTS_PER_WINDOW || Instant::now() >= deadline {
+            break;
+        }
+        if depth > 0 {
+            seen += 1;
+            // 子孫では `Name` を使わない。`Name` に返るのは**ラベルであって
+            // 内容ではない** ([`crate::context::read_body`] の doc)。木の中の
+            // ボタン名やツールチップを拾って「読めた」ことにすると、
+            // 画像も付かないまま中身の無い資料が確定する。
+            let found = read_one(&element, false);
+            // 「読めたか → ランク → 長さ」の順で比べる ([`is_better_read`])。
+            // ランクを先に見ると、20 文字の TextPattern が 105 文字の
+            // ValuePattern に勝ち、**読めているのに読めない窓になる**。
+            if is_better_read((&found.0, found.1), (&best.0, best.1)) {
+                best = found;
+            }
+            if is_conclusive_text(&best.0, best.1) {
+                break; // 本文が丸ごと取れた。これ以上降りる理由が無い。
+            }
+        }
+        if depth >= MAX_DEPTH_PER_WINDOW {
+            continue;
+        }
+
+        // 子を左から順に積む。
+        // SAFETY: walker / element は有効。子が無ければ Err。
+        let Ok(mut child) = (unsafe { walker.GetFirstChildElement(&element) }) else {
             continue;
         };
-        let found = read_one(&child_element);
-        if route_rank(found.1) > route_rank(best.1)
-            || (route_rank(found.1) == route_rank(best.1)
-                && found.0.chars().count() > best.0.chars().count())
-        {
-            best = found;
-        }
-        if is_usable_text(&best.0, best.1) {
-            break; // 十分読めた。これ以上降りる理由が無い。
+        loop {
+            if queue.len() + seen > MAX_ELEMENTS_PER_WINDOW {
+                break; // 兄弟が数千いる木で確保だけが膨らむのを止める。
+            }
+            queue.push_back((child.clone(), depth + 1));
+            // SAFETY: child は有効。次が無ければ Err。
+            match unsafe { walker.GetNextSiblingElement(&child) } {
+                Ok(next) => child = next,
+                Err(_) => break,
+            }
         }
     }
     best
@@ -535,10 +737,12 @@ fn read_window(automation: &IUIAutomation, hwnd: isize) -> (String, ContextSourc
 
 /// 1 要素からテキストを読み、上限まで切り詰める。
 ///
-/// deep context は「キャレット付近 = 末尾」を残すが、こちらは**先頭を残す**。
-/// 画面は上から読むもので、一覧の先頭が消えたら「一覧を出して」の答えに
-/// ならないため。
-fn read_one(element: &IUIAutomationElement) -> (String, ContextSource) {
+/// deep context は「キャレット付近 = 末尾」を残すが、こちらは**先頭を残す**
+/// ([`Keep::Head`])。画面は上から読むもので、一覧の先頭が消えたら
+/// 「一覧を出して」の答えにならないため。
+///
+/// `allow_name` はルート要素だけ `true`。
+fn read_one(element: &IUIAutomationElement, allow_name: bool) -> (String, ContextSource) {
     // パスワード欄は絶対に読まない。deep context と**同じ判定**を通す
     // ([`crate::context::must_not_read`])。片方だけが避けていると、UI の
     // 「パスワード欄は読み取りません」という約束が用途によって嘘になる。
@@ -548,51 +752,187 @@ fn read_one(element: &IUIAutomationElement) -> (String, ContextSource) {
     if crate::context::must_not_read(element) {
         return (String::new(), ContextSource::PasswordSkipped);
     }
-    let context = crate::context::read_element(element);
-    let text: String = context
-        .text
-        .replace('\r', "")
-        .chars()
-        .take(MAX_TEXT_PER_WINDOW)
-        .collect();
-    (text.trim().to_string(), context.source)
-}
-
-/// 経路の望ましさ。大きいほど本文に近い。
-fn route_rank(source: ContextSource) -> u8 {
-    match source {
-        ContextSource::TextPattern => 4,
-        ContextSource::ValuePattern => 3,
-        // MSAA 経由。UIA ネイティブの 2 経路が両方 0 を返す相手向けの保険で、
-        // 返るのは本文なので `ElementName` (ラベル) より上に置く。
-        ContextSource::Legacy => 2,
-        ContextSource::ElementName => 1,
-        _ => 0,
+    if allow_name {
+        let context =
+            crate::context::read_element_capped(element, MAX_TEXT_PER_WINDOW, Keep::Head);
+        return (context.text, context.source);
+    }
+    match crate::context::read_body(element, MAX_TEXT_PER_WINDOW) {
+        Some((text, source)) => (
+            crate::context::trim_to(&text, MAX_TEXT_PER_WINDOW, Keep::Head),
+            source,
+        ),
+        None => (String::new(), ContextSource::Unavailable),
     }
 }
 
-/// 子ウィンドウを深さ 1 段だけ列挙する (上限つき)。
-fn child_windows(parent: HWND) -> Vec<HWND> {
-    let mut found: Vec<HWND> = Vec::new();
+// ---------------------------------------------------------------------------
+// ローカル OCR (`Windows.Media.Ocr`)
+//
+// UIA で読めなかったウィンドウの**最後の砦**。ここで文字が起こせた分だけ、
+// クラウドへ送る画像から情報が減る。全ウィンドウが UIA か OCR で埋まれば、
+// **画像は 1 枚も送られない** ([`needs_screenshot`])。
+//
+// OCR は完全にローカルで走る (Windows 同梱の言語パック)。ネットワークにも
+// 出ないし、認識したテキストも**ログには出さない** — 画面の中身だから。
+// ---------------------------------------------------------------------------
 
-    unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        // SAFETY: lparam には child_windows が載せた &mut Vec<HWND> が入る。
-        // EnumChildWindows は同期的なので参照先は列挙中ずっと有効。
-        let found = unsafe { &mut *(lparam.0 as *mut Vec<HWND>) };
-        if found.len() >= MAX_CHILDREN_PER_WINDOW {
-            return false.into(); // 打ち切る。
+/// OCR エンジンと、その認識言語で決まる単語の区切り。
+///
+/// 区切りを**エンジンと一緒に 1 度だけ**決めるのは、`RecognizerLanguage()`
+/// が COM 呼び出しだから。認識中に窓ごと・呼び出しごとに引き直しても
+/// 答えは変わらない (エンジンの言語は生成時に固定される)。
+struct Ocr {
+    engine: OcrEngine,
+    separator: &'static str,
+}
+
+/// OCR エンジンを 1 つ作る。使えなければ `None`。
+///
+/// **使えないことは失敗ではない。** 言語パックが入っていない環境では
+/// 素直に諦め、従来どおりモニタ全体のスクリーンショットへ落ちる。
+/// ここでエラーを上げると、OCR が無い環境で画面質問モードごと死ぬ。
+fn ocr_engine() -> Option<Ocr> {
+    // まずユーザーのプロファイル言語で作る。「この人が読んでいる言語」が
+    // 画面に出ている言語である可能性が一番高い。
+    match OcrEngine::TryCreateFromUserProfileLanguages() {
+        Ok(engine) => {
+            // 実際にどの言語で認識するかは単語の連結規則に効くので、
+            // 生成時に 1 度だけログへ出す (言語タグは画面の中身ではない)。
+            let tag = ocr_language_tag(&engine);
+            let separator = ocr_word_separator(&tag);
+            log::info!("ローカル OCR を使います (認識言語: {tag})");
+            Some(Ocr { engine, separator })
         }
-        found.push(hwnd);
-        true.into()
+        Err(e) => {
+            // 言語パック未導入。**黙って画像経路へ落ちる**のが正しい。
+            log::info!("ローカル OCR は使えません ({e})。画像を送る経路のままです");
+            None
+        }
+    }
+}
+
+/// エンジンが実際に使う言語タグ (例: `ja-JP`)。取れなければ空。
+fn ocr_language_tag(engine: &OcrEngine) -> String {
+    engine
+        .RecognizerLanguage()
+        .and_then(|lang| lang.LanguageTag())
+        .map(|tag| tag.to_string())
+        .unwrap_or_default()
+}
+
+/// ウィンドウ 1 枚を撮って OCR にかける。読めなければ `None`。
+///
+/// 撮るのは**そのウィンドウの矩形だけ**でモニタ全体ではない。切り取りは
+/// [`clip_to_monitor`] で画面内に収める。
+///
+/// `budget` は走査全体の**残り時間**。これを渡さずに固定の
+/// [`OCR_TIMEOUT`] だけで待つと、予算の末尾で始まった OCR が
+/// [`SCAN_BUDGET`] を超えて返り、`ScanHandle::wait` 側が先に見切る —
+/// **UIA で読めていたテキストも、撮ってあった画像も、全部捨てられて
+/// 「読み取れませんでした」になる**。1 窓を欲張って全部を失う形。
+fn ocr_window(
+    ocr: &Ocr,
+    window: (i32, i32, i32, i32),
+    monitor: (i32, i32, i32, i32),
+    budget: Duration,
+) -> Option<String> {
+    let (x, y, width, height) = clip_to_monitor(window, monitor)?;
+
+    // 画像サイズの上限はエンジンが持っている (この機械では 10,000px)。
+    // 超える画像を渡すと例外になるので、事前に外す。縮小して渡す案は
+    // 採らない — 縮めた画面の文字は OCR が最初に落とす。
+    let max_edge = OcrEngine::MaxImageDimension().unwrap_or(0) as i32;
+    if max_edge > 0 && (width > max_edge || height > max_edge) {
+        return None;
     }
 
-    // SAFETY: コールバックは上の定義。parent は有効な HWND。
-    // 列挙は同期的なので、found はコールバックが走る間ずっと生きている。
-    let ptr = &raw mut found;
-    unsafe {
-        let _ = EnumChildWindows(Some(parent), Some(collect), LPARAM(ptr as isize));
+    // SAFETY: None は画面全体の DC。対で ReleaseDC する。
+    let screen = unsafe { GetDC(None) };
+    if screen.is_invalid() {
+        return None;
     }
-    found
+    let pixels = grab_pixels(screen, x, y, width, height);
+    // SAFETY: 上の GetDC と対。
+    unsafe { ReleaseDC(None, screen) };
+
+    let bgra = bgra_bottom_up_to_top_down(&pixels?, width as u32, height as u32)?;
+    let text = recognize(ocr, &bgra, width as u32, height as u32, budget)?;
+    is_usable_ocr_text(&text).then_some(text)
+}
+
+/// BGRA (上から下) を `SoftwareBitmap` にして OCR を回す。
+///
+/// # 非同期 API を同期的に待つ
+///
+/// `RecognizeAsync` は WinRT の非同期 API。ここは**専用の走査スレッド**
+/// なので、待つこと自体は問題ない (UI スレッドは止まらない)。
+/// ただし**待ちっぱなしにはしない**: 完了ハンドラをチャネルへ繋いで
+/// [`OCR_TIMEOUT`] と**走査全体の残り時間の短い方**で見切る。走査全体には
+/// [`SCAN_BUDGET`] があるのに、その内側の 1 呼び出しだけ長く待てるままだと、
+/// 返ってこない OCR 1 回で `STALE_AFTER` (60 秒) まで占有が塞がるうえ、
+/// 予算末尾で始まった 1 回が**走査の成果を丸ごと道連れにする**。
+/// UIA 呼び出しについて `SCAN_IN_FLIGHT` の doc が書いているのと同じ罠を、
+/// 新しい経路で作り直さない。
+fn recognize(
+    ocr: &Ocr,
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    budget: Duration,
+) -> Option<String> {
+    let writer = DataWriter::new().ok()?;
+    writer.WriteBytes(bgra).ok()?;
+    let buffer = writer.DetachBuffer().ok()?;
+    let bitmap = SoftwareBitmap::CreateCopyFromBuffer(
+        &buffer,
+        BitmapPixelFormat::Bgra8,
+        width as i32,
+        height as i32,
+    )
+    .ok()?;
+
+    let operation = ocr.engine.RecognizeAsync(&bitmap).ok()?;
+    let (tx, rx) = crossbeam_channel::bounded::<()>(1);
+    operation
+        .SetCompleted(&AsyncOperationCompletedHandler::new(move |_, _| {
+            // 受信側が既に見切っていれば送信は失敗する。それでよい。
+            let _ = tx.send(());
+            Ok(())
+        }))
+        .ok()?;
+    let wait = OCR_TIMEOUT.min(budget);
+    if rx.recv_timeout(wait).is_err() {
+        // **見切った側から取り消しを頼む。** 放っておいても走査は先へ
+        // 進めるが、返ってこない認識が裏で画像 1 枚分の資源を掴んだままに
+        // なる。止まる保証は無い (WinRT の Cancel は「要求」) ので、
+        // 戻り値は待たない。
+        let _ = operation.Cancel();
+        log::warn!("ローカル OCR が {} ms 以内に返りませんでした", wait.as_millis());
+        return None;
+    }
+    let result = operation.GetResults().ok()?;
+
+    // `OcrResult::Text()` は使わない。あれは単語を常に空白でつなぐので、
+    // **日本語が「本 文 が こ の よ う に」になる**。行と単語を自分で
+    // 組み立てて、区切りを言語で決める ([`ocr_word_separator`])。
+    let mut lines: Vec<String> = Vec::new();
+    for line in result.Lines().ok()? {
+        let words: Vec<String> = line
+            .Words()
+            .ok()?
+            .into_iter()
+            .filter_map(|word| word.Text().ok().map(|t| t.to_string()))
+            .collect();
+        let joined = join_ocr_words(&words, ocr.separator);
+        if !joined.trim().is_empty() {
+            lines.push(joined);
+        }
+    }
+    // 行は改行でつなぐ。一覧・表・ログはどれも行が意味を持つ。
+    let text = lines.join("\n");
+    let text = crate::context::trim_to(&text, MAX_TEXT_PER_WINDOW, Keep::Head);
+    (!text.is_empty()).then_some(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -629,6 +969,31 @@ fn capture_with_screen_dc(
     width: i32,
     height: i32,
 ) -> Option<Screenshot> {
+    let pixels = grab_pixels(screen, x, y, width, height)?;
+    let (dw, dh) = plan_scale(width as u32, height as u32, MAX_IMAGE_EDGE);
+    let rgb = downscale_bgra_bottom_up(&pixels, width as u32, height as u32, dw, dh)?;
+    match encode_png(&rgb, dw, dh) {
+        Ok(png) => Some(Screenshot {
+            png,
+            width: dw,
+            height: dh,
+        }),
+        Err(e) => {
+            log::warn!("スクリーンショットを PNG にできません: {e}");
+            None
+        }
+    }
+}
+
+/// 画面の矩形 1 つを 32bpp BGRA (ボトムアップ) として吸い出す。
+///
+/// **スクリーンショットとローカル OCR の共通の入り口。** 撮り方
+/// (`CAPTUREBLT` の要否、`GetDIBits` を呼ぶ前に選択を外すこと) は
+/// どちらでも同じで、片方にだけ直した規則があると必ず腐る。
+fn grab_pixels(screen: HDC, x: i32, y: i32, width: i32, height: i32) -> Option<Vec<u8>> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
     // SAFETY: screen は有効な DC。対で DeleteDC する。
     let mem = unsafe { CreateCompatibleDC(Some(screen)) };
     if mem.is_invalid() {
@@ -672,20 +1037,7 @@ fn capture_with_screen_dc(
         let _ = DeleteDC(mem);
     }
 
-    let pixels = pixels?;
-    let (dw, dh) = plan_scale(width as u32, height as u32, MAX_IMAGE_EDGE);
-    let rgb = downscale_bgra_bottom_up(&pixels, width as u32, height as u32, dw, dh)?;
-    match encode_png(&rgb, dw, dh) {
-        Ok(png) => Some(Screenshot {
-            png,
-            width: dw,
-            height: dh,
-        }),
-        Err(e) => {
-            log::warn!("スクリーンショットを PNG にできません: {e}");
-            None
-        }
-    }
+    pixels
 }
 
 /// DIB として画素を吸い出す (32bpp BGRA、ボトムアップ)。
@@ -731,4 +1083,57 @@ fn read_bitmap_pixels(
         return None;
     }
     Some(pixels)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **実機でローカル OCR が使えるかを確かめる診断。**
+    ///
+    /// 出すのは環境の情報だけ (エンジンの有無・認識言語・利用可能な言語・
+    /// 画像サイズの上限)。**画面は一切読まないし、ネットワークにも出ない。**
+    /// ここで「使えます」と出れば、UIA で読めなかったウィンドウは
+    /// クラウドへ画像を送る前に OCR を通る。
+    ///
+    /// 実行: `cargo test --lib -- --ignored --nocapture live_ocr_engine`
+    #[test]
+    #[ignore = "実機の OCR エンジンを叩く。導入済みの言語パックに依存する"]
+    fn live_ocr_engine() {
+        // OCR は WinRT。COM を初期化していないスレッドでは生成に失敗する。
+        // SAFETY: このテストスレッドで初期化し、最後に対で解放する。
+        let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        assert!(com.is_ok(), "COM を初期化できない");
+
+        println!(
+            "画像サイズ上限 : {} px",
+            OcrEngine::MaxImageDimension().unwrap_or(0)
+        );
+        match OcrEngine::AvailableRecognizerLanguages() {
+            Ok(languages) => {
+                let tags: Vec<String> = languages
+                    .into_iter()
+                    .filter_map(|lang| lang.LanguageTag().ok().map(|t| t.to_string()))
+                    .collect();
+                println!("利用可能な言語 : {}", tags.join(", "));
+            }
+            Err(e) => println!("利用可能な言語 : 取得できません ({e})"),
+        }
+
+        match super::ocr_engine() {
+            Some(ocr) => {
+                println!("認識言語       : {}", ocr_language_tag(&ocr.engine));
+                println!("単語の区切り   : {:?}", ocr.separator);
+                println!("=> UIA で読めなかったウィンドウは OCR を通ります");
+            }
+            None => {
+                // **失敗ではない。** 言語パックが無い環境では従来どおり
+                // モニタ全体のスクリーンショットを送るだけ。
+                println!("=> このマシンでは OCR は使えません (画像を送る経路のままです)");
+            }
+        }
+
+        // SAFETY: 上の CoInitializeEx と対。
+        unsafe { CoUninitialize() };
+    }
 }

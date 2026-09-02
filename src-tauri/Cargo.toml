@@ -33,6 +33,11 @@ hound = "3.5"
 # 辞書の自動学習 (learn.rs) が UIA のイベントハンドラを実装するため、
 # **本番ビルドにも要る** (かつては uia_spike 用に dev-dependencies だけだった)。
 windows-core = "0.62"
+# WinRT の非同期 (`IAsyncOperation`) の完了ハンドラ型。ローカル OCR の
+# `RecognizeAsync` を**時間を切って**待つのに要る (screen/win32.rs)。
+# `windows` 0.62 はこれを再エクスポートしていないので、`windows-core` と
+# 同じ理由で直接の依存を持つ。バージョンは lock で共有される 0.3.x。
+windows-future = "0.3"
 # 本アプリは Windows 11 専用(WH_KEYBOARD_LL / 前景 HWND 取得に依存)。
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -54,6 +59,21 @@ windows = { version = "0.62", features = [
     # 同: DWMWA_CLOAKED。IsWindowVisible だけでは、別の仮想デスクトップに
     # 置いてあるウィンドウまで「見えている」ことになってしまう。
     "Win32_Graphics_Dwm",
+    # ローカル OCR (screen/win32.rs)。UIA で読めなかったウィンドウを、
+    # クラウドへ画像を送る**前に**その場で文字に起こすため。
+    # ここは Win32 ではなく WinRT の名前空間なので接頭辞が付かない。
+    # - Media_Ocr        : OcrEngine 本体
+    # - Graphics_Imaging : SoftwareBitmap (画素をエンジンへ渡す器)
+    # - Storage_Streams  : DataWriter (Vec<u8> → IBuffer)
+    # - Foundation       : 非同期 (RecognizeAsync) の待ち合わせ
+    # - Globalization    : OcrEngine::RecognizerLanguage() の戻り値 Language。
+    #                      認識言語で単語の連結規則を変えるので要る
+    #                      (日本語を空白でつなぐと固有名詞が割れる)
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "Foundation",
+    "Globalization",
     "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

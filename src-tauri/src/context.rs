@@ -72,6 +72,14 @@ pub enum ContextSource {
     /// Text=68 / Value=0、Typeless.exe は Text=0 / Value=105。
     /// 片方だけ見ていると、相手によって「読めない」が起きる。
     Legacy,
+    /// ローカル OCR (`Windows.Media.Ocr`) で画素から起こした。
+    ///
+    /// **UIA の経路ではない。** [`crate::screen`] の走査だけが使う。
+    /// UIA で読めなかったウィンドウを、クラウドへ画像を送る前にもう一度
+    /// 拾うための最後の砦で、成否の判定も専用
+    /// ([`crate::screen::is_usable_ocr_text`]) — UIA の「読めた」を
+    /// 緩めて画像を止めてしまうと、読めていないのに読めたことになる。
+    Ocr,
     /// 要素名しか取れなかった。
     ElementName,
     /// フォーカス要素がパスワード欄だったので読まなかった。
@@ -89,6 +97,7 @@ impl ContextSource {
             ContextSource::TextPattern => "TextPattern",
             ContextSource::ValuePattern => "ValuePattern",
             ContextSource::Legacy => "LegacyIAccessible",
+            ContextSource::Ocr => "ローカル OCR",
             ContextSource::ElementName => "要素名",
             ContextSource::PasswordSkipped => "パスワード欄のためスキップ",
             ContextSource::TimedOut => "タイムアウト",
@@ -241,21 +250,49 @@ pub(crate) fn must_not_read(element: &IUIAutomationElement) -> bool {
     }
 }
 
+/// 切り詰めるときにどちらの端を残すか。
+///
+/// deep context は**末尾**を残す — キャレット付近は文書の後ろ側にあり、
+/// 今書いている話題に近い。[`crate::screen`] の画面質問は**先頭**を残す —
+/// 画面は上から読むもので、一覧の先頭が消えたら「一覧を出して」の答えに
+/// ならない。**用途で逆向きになる**ので、読み取り関数を共有するなら
+/// 引数で受けるほかない (定数を 2 つ置いて片方が腐るのを避ける)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Keep {
+    Head,
+    Tail,
+}
+
+/// 要素からテキストを読む (deep context 用。上限 [`MAX_CONTEXT_CHARS`]、末尾を残す)。
+pub(crate) fn read_element(element: &IUIAutomationElement) -> ScreenContext {
+    read_element_capped(element, MAX_CONTEXT_CHARS, Keep::Tail)
+}
+
 /// 要素からテキストを読む。対応パターンを上から順に試す。
 ///
 /// 診断テストからも、[`crate::screen`] のモニタ単位の走査からも同じ経路を
 /// 通せるよう切り出してある。**読み方を 2 か所に書かない**
 /// (design.md「同じ判断を 2 箇所で書いたら、片方は必ず更新から取り残される」)。
-pub(crate) fn read_element(element: &IUIAutomationElement) -> ScreenContext {
-    if let Some((text, source)) = read_body(element, MAX_CONTEXT_CHARS) {
+///
+/// `cap` と `keep` を呼び出し側から受けるのは、共有しているのが
+/// 「どの経路をどの順に試すか」であって「どれだけ持ち帰るか」ではないため。
+/// 画面質問モードは 1 ウィンドウあたり [`crate::screen::MAX_TEXT_PER_WINDOW`]
+/// まで持ち帰る — ここを deep context の上限に固定していたころは、
+/// **Chrome の記事本文が 2,000 字で切られたうえ末尾だけが残っていた**。
+pub(crate) fn read_element_capped(
+    element: &IUIAutomationElement,
+    cap: usize,
+    keep: Keep,
+) -> ScreenContext {
+    if let Some((text, source)) = read_body(element, cap) {
         return ScreenContext {
-            text: trim_context(&text),
+            text: trim_to(&text, cap, keep),
             source,
         };
     }
     if let Some(text) = text_from_name(element) {
         return ScreenContext {
-            text: trim_context(&text),
+            text: trim_to(&text, cap, keep),
             source: ContextSource::ElementName,
         };
     }
@@ -341,17 +378,23 @@ fn text_from_name(element: &IUIAutomationElement) -> Option<String> {
     (!name.trim().is_empty()).then_some(name)
 }
 
-/// 上限まで切り詰める。**末尾を残す** — キャレット付近は文書の後ろ側に
-/// あることが多く、今書いている話題に近い。
-pub fn trim_context(text: &str) -> String {
+/// `cap` 文字まで切り詰め、`\r` を落として前後の空白を削る (純関数)。
+///
+/// **どちらの端を残すかは呼び出し側が決める** ([`Keep`])。
+pub(crate) fn trim_to(text: &str, cap: usize, keep: Keep) -> String {
     let normalized = text.replace('\r', "");
     let count = normalized.chars().count();
-    if count <= MAX_CONTEXT_CHARS {
+    if count <= cap {
         return normalized.trim().to_string();
     }
+    let skip = match keep {
+        Keep::Head => 0,
+        Keep::Tail => count - cap,
+    };
     normalized
         .chars()
-        .skip(count - MAX_CONTEXT_CHARS)
+        .skip(skip)
+        .take(cap)
         .collect::<String>()
         .trim()
         .to_string()
@@ -383,21 +426,45 @@ mod tests {
     fn trimming_keeps_the_tail() {
         // キャレット付近 = 末尾。頭を捨てて末尾を残す。
         let text: String = (0..MAX_CONTEXT_CHARS + 500).map(|_| 'あ').collect();
-        let trimmed = trim_context(&text);
+        let trimmed = trim_to(&text, MAX_CONTEXT_CHARS, Keep::Tail);
         assert_eq!(trimmed.chars().count(), MAX_CONTEXT_CHARS);
 
         let tail = format!("{}末尾の目印", "あ".repeat(MAX_CONTEXT_CHARS));
-        assert!(trim_context(&tail).ends_with("末尾の目印"));
+        assert!(trim_to(&tail, MAX_CONTEXT_CHARS, Keep::Tail).ends_with("末尾の目印"));
+    }
+
+    #[test]
+    fn trimming_can_keep_the_head_instead() {
+        // 画面質問モードはこちら。一覧の先頭が消えると
+        // 「一覧を出して」の答えにならない。
+        let text = format!("先頭の目印{}", "あ".repeat(500));
+        let head = trim_to(&text, 10, Keep::Head);
+        assert_eq!(head.chars().count(), 10);
+        assert!(head.starts_with("先頭の目印"));
+        // 同じ入力でも Tail なら末尾が残る。向きが引数で効いていること。
+        assert!(!trim_to(&text, 10, Keep::Tail).starts_with("先頭の目印"));
+    }
+
+    #[test]
+    fn trimming_respects_the_caller_s_cap() {
+        // 上限を呼び出し側から受けていないと、画面質問モードの本文が
+        // deep context の 2,000 字で黙って切られる。
+        let text = "あ".repeat(3_000);
+        assert_eq!(trim_to(&text, 3_000, Keep::Head).chars().count(), 3_000);
+        assert_eq!(trim_to(&text, 100, Keep::Head).chars().count(), 100);
     }
 
     #[test]
     fn short_text_is_returned_as_is() {
-        assert_eq!(trim_context("  短い文章  "), "短い文章");
+        assert_eq!(trim_to("  短い文章  ", MAX_CONTEXT_CHARS, Keep::Tail), "短い文章");
     }
 
     #[test]
     fn carriage_returns_are_normalized() {
-        assert_eq!(trim_context("一行目\r\n二行目"), "一行目\n二行目");
+        assert_eq!(
+            trim_to("一行目\r\n二行目", MAX_CONTEXT_CHARS, Keep::Tail),
+            "一行目\n二行目"
+        );
     }
 
     #[test]
@@ -426,6 +493,7 @@ mod tests {
             ContextSource::TextPattern,
             ContextSource::ValuePattern,
             ContextSource::Legacy,
+            ContextSource::Ocr,
             ContextSource::ElementName,
             ContextSource::PasswordSkipped,
             ContextSource::TimedOut,
