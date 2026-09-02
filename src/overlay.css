@@ -27,6 +27,10 @@
   --pill-processing: #e2a33c;
   --pill-ok: #5cc98b;
   --pill-danger: #f2818a;
+  /* 画面質問モードの専用色。赤(録音)・琥珀(認識)・緑(完了)のどれとも
+     被らない色相にして、いつもの書き取りと絵だけでは見分けが付かない
+     という報告 (押し間違いに気付けない) に応える。 */
+  --pill-screen-ask: #9d8cf6;
 }
 
 *,
@@ -129,6 +133,16 @@ body {
   display: block;
   animation: spin 900ms linear infinite;
   transform-origin: 50% 50%;
+}
+
+/* 画面質問モード中の録音/認識は、書き取りと同じアイコンのまま色だけ
+   差し替える (data-mode は setState が recording/processing のときだけ
+   立てる。done/error まで塗ると「毎回何色か違う」で余計に紛らわしい)。 */
+.pill[data-mode="screen_ask"] .icon {
+  color: var(--pill-screen-ask);
+}
+.pill[data-mode="screen_ask"] .meter-fill {
+  background: var(--pill-screen-ask);
 }
 
 .pill[data-state="done"] .icon {

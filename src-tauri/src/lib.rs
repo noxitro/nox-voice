@@ -788,6 +788,9 @@ fn overlay_ready(app: AppHandle, listeners: usize) {
             status,
             message: None,
             origin: StatusOrigin::Recording,
+            // 起動直後の同期であり、Idle 以外で拾われることはまず無い
+            // (拾えたとしても、どの用途だったかを覚えていない再接続時の同期)。
+            screen_ask: false,
         },
     ) {
         log::warn!("オーバーレイへの初期状態送出に失敗: {e}");
@@ -1420,7 +1423,7 @@ fn start_hotkey_controller(app: &AppHandle) {
                                                 cfg.effective_sound_volume(),
                                             );
                                             emit_error(&app, &e);
-                                            set_status(&app, Status::Idle, Some(e));
+                                            set_status(&app, Status::Idle, Some(e), false);
                                             interpreter.reset();
                                             active_mode = None;
                                         }
@@ -1435,7 +1438,7 @@ fn start_hotkey_controller(app: &AppHandle) {
                                     if let Err(e) = request_finalize(&app) {
                                         log::error!("録音を確定できません: {e}");
                                         emit_error(&app, &e);
-                                        set_status(&app, Status::Idle, Some(e));
+                                        set_status(&app, Status::Idle, Some(e), false);
                                     }
                                 }
                                 None => {}
@@ -1569,7 +1572,7 @@ fn start_recording(app: &AppHandle, mode: HotkeyMode) -> Result<(), String> {
         });
     }
 
-    set_status(app, Status::Recording, None);
+    set_status(app, Status::Recording, None, mode == HotkeyMode::ScreenAsk);
     // ここから録音中。キャンセルキーを武装する (停止系の全経路で解除する)。
     hotkey::set_recording_active(true);
 
@@ -1678,7 +1681,12 @@ fn request_finalize(app: &AppHandle) -> Result<(), String> {
         });
 
     stop_level_emitter(app);
-    set_status(app, Status::Processing, None);
+    set_status(
+        app,
+        Status::Processing,
+        None,
+        pending.mode == HotkeyMode::ScreenAsk,
+    );
 
     state
         .finalize_tx
@@ -1719,6 +1727,7 @@ fn cancel_recording(app: &AppHandle) {
         Status::Idle,
         Some("録音をキャンセルしました".into()),
         StatusOrigin::Recording,
+        false,
     );
     // 小窓は idle への遷移では自分で畳まない (overlay.ts 参照)。
     // 結果イベントも飛ばないので、エラー表示と同じ対で畳みを予約する。
@@ -1803,7 +1812,7 @@ fn finalize_worker(app: AppHandle, rx: Receiver<WorkerJob>) {
                 // 出どころを Background にして、オーバーレイには映さない
                 // (映すと完了イベントが来ず「認識中…」で固まる)。
                 if !app.state::<AppState>().is_recording() {
-                    set_status_from(&app, Status::Processing, None, StatusOrigin::Background);
+                    set_status_from(&app, Status::Processing, None, StatusOrigin::Background, false);
                 }
                 if guard_panic("再転写", || retranscribe(&app, id)).is_none() {
                     emit_background_error(&app, "再転写中に内部エラーが発生しました");
@@ -1819,7 +1828,7 @@ fn finalize_worker(app: AppHandle, rx: Receiver<WorkerJob>) {
         // 無条件に戻すと、録音 B の最中に録音 A の後処理が終わった瞬間、
         // 表示が「待機中」に化ける。
         if !app.state::<AppState>().is_recording() {
-            set_status(&app, Status::Idle, None);
+            set_status(&app, Status::Idle, None, false);
             // 小窓は結果を少し見せてから自分で消える (overlay.ts 側)。
             // ここでは録音が続いていないことだけ確かめる。
         }
@@ -3270,7 +3279,7 @@ fn handle_length_limit(app: &AppHandle, interpreter: &mut PttInterpreter) {
 
     if let Err(e) = request_finalize(app) {
         log::error!("上限到達時の停止に失敗: {e}");
-        set_status(app, Status::Idle, Some(e));
+        set_status(app, Status::Idle, Some(e), false);
     }
     // ユーザーはまだキーを押している可能性が高い。その離しは捨てる。
     interpreter.reset();
@@ -3336,12 +3345,21 @@ fn finalize_on_exit(app: &AppHandle) {
 }
 
 /// 状態を更新し、トレイ表示とフロントへ反映する (録音由来)。
-fn set_status(app: &AppHandle, status: Status, message: Option<String>) {
-    set_status_from(app, status, message, StatusOrigin::Recording);
+///
+/// `screen_ask` は小窓の色分け用 ([`StatusPayload::screen_ask`] の doc)。
+/// 用途を問わない遷移 (Idle 化など) では `false` を渡してよい。
+fn set_status(app: &AppHandle, status: Status, message: Option<String>, screen_ask: bool) {
+    set_status_from(app, status, message, StatusOrigin::Recording, screen_ask);
 }
 
 /// 出どころを明示して状態を更新する。
-fn set_status_from(app: &AppHandle, status: Status, message: Option<String>, origin: StatusOrigin) {
+fn set_status_from(
+    app: &AppHandle,
+    status: Status,
+    message: Option<String>,
+    origin: StatusOrigin,
+    screen_ask: bool,
+) {
     let state = app.state::<AppState>();
     if let Ok(mut slot) = state.status.lock() {
         *slot = status;
@@ -3357,6 +3375,7 @@ fn set_status_from(app: &AppHandle, status: Status, message: Option<String>, ori
             status,
             message,
             origin,
+            screen_ask,
         },
     ) {
         log::warn!("状態イベントの送出に失敗: {e}");

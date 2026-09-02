@@ -177,4 +177,12 @@ pub struct StatusPayload {
     /// 補足メッセージ (エラー理由など)。無ければ `None`。
     pub message: Option<String>,
     pub origin: StatusOrigin,
+    /// 画面質問モードでの録音かどうか。
+    ///
+    /// 小窓 (overlay.ts) が普段の書き取りと見分けを付けられるようにするための
+    /// もの。通常の書き取りと画面質問は同じ「録音中」アイコンなので、色を
+    /// 変えないと押し間違いに気づけない (実際にユーザーから紛らわしいと
+    /// 報告があった)。`Status::Idle` への遷移では意味を持たないので `false`
+    /// で送って構わない。
+    pub screen_ask: bool,
 }

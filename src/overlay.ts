@@ -17,6 +17,8 @@ interface StatusPayload {
   status: Status;
   message: string | null;
   origin: StatusOrigin;
+  /** 画面質問モードでの録音か。小窓の色分けに使う (overlay.css)。 */
+  screen_ask: boolean;
 }
 
 interface ErrorPayload {
@@ -47,10 +49,18 @@ function setState(
   state: "recording" | "processing" | "done" | "error",
   label: string,
   detail?: string,
+  screenAsk = false,
 ) {
   const pill = el("pill");
   if (pill) {
     pill.dataset.state = state;
+    // 普段の書き取りと画面質問は同じアイコン (mic / spinner) なので、
+    // 色を変えないと押し間違いに気づけない (実際に紛らわしいと報告があった)。
+    // done / error はモードに関わらず同じ絵で終える (質問の結果だけ特別扱い
+    // すると、今度は「毎回何かが違う」という別の紛らわしさになる)。
+    pill.dataset.mode = screenAsk && (state === "recording" || state === "processing")
+      ? "screen_ask"
+      : "";
     pill.hidden = false;
   }
   const labelEl = el("label");
@@ -108,12 +118,22 @@ window.addEventListener("DOMContentLoaded", async () => {
 
     switch (event.payload.status) {
       case "recording":
-        setState("recording", "録音中");
+        setState(
+          "recording",
+          event.payload.screen_ask ? "画面に質問" : "録音中",
+          undefined,
+          event.payload.screen_ask,
+        );
         startElapsed();
         break;
       case "processing":
         stopElapsed();
-        setState("processing", "認識中…");
+        setState(
+          "processing",
+          event.payload.screen_ask ? "画面を確認中…" : "認識中…",
+          undefined,
+          event.payload.screen_ask,
+        );
         break;
       case "idle":
         stopElapsed();
