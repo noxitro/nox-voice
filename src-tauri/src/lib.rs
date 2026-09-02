@@ -105,7 +105,11 @@ const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2
 const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 結果を見せてから小窓を畳むまで。
-const OVERLAY_RESULT_LINGER: std::time::Duration = std::time::Duration::from_millis(1_600);
+///
+/// 完了表示はテキストを出さずアイコンが一瞬光るだけ (overlay.css) なので、
+/// 読む時間を確保する必要が無い。CSS 側のフェード (320ms 後に開始・260ms で
+/// 完了 = 580ms) が終わり切ってから畳む、という順序だけ守れば足りる。
+const OVERLAY_RESULT_LINGER: std::time::Duration = std::time::Duration::from_millis(650);
 /// エラー表示を残す時間 (読む時間が要る)。
 const OVERLAY_ERROR_LINGER: std::time::Duration = std::time::Duration::from_secs(5);
 

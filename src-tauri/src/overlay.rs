@@ -55,9 +55,14 @@ use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 /// オーバーレイウィンドウのラベル。
 pub const WINDOW_LABEL: &str = "overlay";
 
-/// 小窓の大きさ (論理ピクセル)。
-const WIDTH: f64 = 320.0;
-const HEIGHT: f64 = 72.0;
+/// 小窓 (透明なウィンドウ) の大きさ (論理ピクセル)。
+///
+/// 見えるカプセル自体はこれより小さい — CSS 側で `width: fit-content` に
+/// して状態ごとに縮む (overlay.css)。ここは「どの状態のカプセルも
+/// クリップされずに収まる当たり判定」の外枠で、内容の一番大きい
+/// 「録音中」(アイコン+ラベル+経過時間+レベルメーター) が基準。
+const WIDTH: f64 = 260.0;
+const HEIGHT: f64 = 60.0;
 /// 画面下端からの余白。タスクバーに隠れない程度に上げる。
 const BOTTOM_MARGIN: f64 = 96.0;
 

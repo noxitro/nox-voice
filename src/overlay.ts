@@ -95,11 +95,6 @@ function stopElapsed() {
   window.clearInterval(elapsedTimer);
 }
 
-/** ミリ秒を「0.4s」形式に。 */
-function seconds(ms: number): string {
-  return `${(ms / 1000).toFixed(1)}s`;
-}
-
 window.addEventListener("DOMContentLoaded", async () => {
   await listen<StatusPayload>("nox://status", (event) => {
     // 再転写などの裏方作業は映さない。映すと完了イベントが来ず
@@ -135,24 +130,13 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (fill) fill.style.transform = `scaleX(${Math.min(1, Math.max(0, event.payload))})`;
   });
 
-  await listen<ResultPayload>("nox://result", (event) => {
-    const r = event.payload;
-    // 挿入されたテキストの先頭を見せる。何が入ったか一目で分かるように。
-    const preview = r.text.replace(/\s+/g, " ").trim().slice(0, 24);
-    const detail = [
-      `転写 ${seconds(r.stt_ms)} / 整形 ${seconds(r.format_ms)}` +
-        (r.degraded ? "(整形なし)" : ""),
-    ];
-    // 貼付が相手に届いていなくても Ctrl+V でやり直せることを知らせる。
-    // **トーストは増やさない** — 毎回鳴ると無意味になるので、もともと
-    // 目に入る小窓へ一言添えるだけにする (R6 の通知と同じ考え方)。
-    if (r.clipboard_state === "holds_injected_text") {
-      detail.push("クリップボードにコピー済み");
-    }
-    const label = preview ? `「${preview}${r.text.length > 24 ? "…" : ""}」` : "完了";
+  await listen<ResultPayload>("nox://result", () => {
+    // 完了はテキストを出さない (PRODUCT.md「成功は静かに」)。何が挿入されたか・
+    // 貼付できずクリップボードに留まったか等は履歴 (main.ts の履歴区画) で
+    // いつでも確認できる。小窓はアイコンが一瞬光るだけで語らせる。
     // 小窓を畳むのは Rust 側 (overlay::hide_after)。
     // webview に持たせると、次の録音で出した直後に前回のタイマーが消してしまう。
-    setState("done", label, detail.join(" ・ "));
+    setState("done", "");
   });
 
   await listen<ErrorPayload>("nox://error", (event) => {
