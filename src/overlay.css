@@ -212,7 +212,7 @@ body {
 .body {
   flex: 1;
   min-width: 0;
-  max-width: 190px;
+  max-width: 270px;
   display: grid;
   gap: 4px;
 }
@@ -247,6 +247,105 @@ body {
   color: var(--pill-fg-dim);
   font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
+}
+
+/* --- 相手ウィンドウ ------------------------------------------------------- */
+
+/* 「どこに貼られるか」を録音中に見せる 1 行。押し間違い (別ウィンドウを
+   見ながら喋った) は貼られた後にしか気づけないのが一番痛いので、
+   話し終える前に気づけるようにする。
+   1 行に収め、溢れたら省略する — 2 行に伸びると小窓が「読ませる箱」に
+   なってしまい、作業の邪魔をしないという前提が崩れる。 */
+.target {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: var(--text-xs);
+  line-height: 1.35;
+}
+
+/* 前景を掴めなかったとき。**黙って空にしない** (PRODUCT.md「失敗は騒がしく」)。
+   赤 (--pill-danger) まで上げないのは、まだ失敗しておらず、
+   「貼れないかもしれない」という予告だから。 */
+.target[data-unknown="true"] {
+  color: var(--pill-processing);
+}
+
+/* アイコンの枠。届く前も届いた後も同じ 14px を占める。 */
+.target-icon {
+  position: relative;
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--pill-fg-dim);
+}
+
+.target-glyph,
+.target-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* 枠の色を落とすのは普段だけ。特定できなかったときは行ごと琥珀で言うので、
+   グリフにも同じ色を回す (ここが dim のままだと絵だけが黙る)。 */
+.target[data-unknown="true"] .target-icon {
+  color: inherit;
+}
+
+/* アイコンは静かに現れ、入れ替わりに窓グリフが引く。位置も大きさも
+   動かさず透明度だけなので、レイアウトは 1px も跳ねない。 */
+.target-img {
+  opacity: 0;
+  object-fit: contain;
+}
+
+.target-img,
+.target-glyph {
+  transition: opacity var(--duration-fast) var(--ease-out);
+}
+
+.target[data-icon="true"] .target-img {
+  opacity: 1;
+}
+
+.target[data-icon="true"] .target-glyph {
+  opacity: 0;
+}
+
+.target-name {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.target-app {
+  font-weight: 500;
+}
+
+/* タイトルは一段落とす。アプリ名が読めれば貼り先の判断は付き、
+   タイトルは確証を足すだけの情報だから。 */
+.target-title {
+  color: var(--pill-fg-dim);
+}
+
+/* 区切りはタイトルがあるときだけ。空のときに「Chrome ·」が残らない。 */
+.target-title:not(:empty)::before {
+  content: " · ";
+}
+
+/* 画面質問モードで、モニタが 2 枚以上あるときだけ出る補足。
+   1 枚の環境では間違えようがないので Rust 側が送ってこない。 */
+.hint {
+  color: var(--pill-fg-dim);
+  font-size: var(--text-xs);
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* --- 入力レベル ----------------------------------------------------------- */
@@ -300,7 +399,9 @@ body {
   .glyph {
     animation: none;
   }
-  .meter-fill {
+  .meter-fill,
+  .target-img,
+  .target-glyph {
     transition: none;
   }
   /* 動きを止めても完了表示は消えないと困るので、透明化だけは残す。 */

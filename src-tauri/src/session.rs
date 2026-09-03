@@ -4,6 +4,7 @@
 //! M2 は `wav_bytes` を Groq の Whisper へ送り、`target_hwnd` / `target_process` は
 //! M3 の挿入時フォーカス照合 (設計 R7) でそのまま使う。
 
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -46,6 +47,14 @@ pub struct TargetWindow {
     pub process_name: String,
     /// ウィンドウタイトル。取得失敗時は空文字。
     pub window_title: String,
+    /// 実行ファイルのフルパス。取得失敗時は `None`。
+    ///
+    /// 小窓に出すアプリ表示名とアイコン ([`crate::app_icon`]) を引くのに要る。
+    /// ベース名 (`process_name`) では版情報もアイコンも引けない。
+    /// **挿入の照合 (R7) には使わない** — あちらはこれまでどおり
+    /// `hwnd` と `process_name` だけで判断する。
+    #[serde(skip)]
+    pub process_path: Option<PathBuf>,
 }
 
 impl TargetWindow {
@@ -59,6 +68,7 @@ impl TargetWindow {
             process_id: 0,
             process_name: "<unknown>".to_string(),
             window_title: String::new(),
+            process_path: None,
         }
     }
 
@@ -88,6 +98,13 @@ pub struct PendingRecording {
     pub mode: crate::hotkey::HotkeyMode,
     /// deep context で読んだ画面テキスト。無効なら空。
     pub context: crate::context::ScreenContext,
+    /// 小窓に出している相手ウィンドウ ([`TargetView`])。
+    ///
+    /// **開始時に組み立てたものをそのまま持ち回す。** 処理中 (Processing)
+    /// への遷移でも同じものを送るためで、そこで組み直すと「どのモニタを
+    /// 読むか」が**録音終了時の前景**で決まってしまい、走査が見た画面
+    /// (録音開始時) と食い違う。
+    pub target_view: Option<TargetView>,
     /// 画面質問モードの走査 (この用途以外では `None`)。
     ///
     /// **結果ではなく待ち受け口を持つ。** 走査は録音と並行して進み、
@@ -185,4 +202,124 @@ pub struct StatusPayload {
     /// 報告があった)。`Status::Idle` への遷移では意味を持たないので `false`
     /// で送って構わない。
     pub screen_ask: bool,
+    /// 録音開始時に掴んだ「相手ウィンドウ」。**小窓の表示専用**。
+    ///
+    /// クリップボードのみモードと `Status::Idle` では `None`
+    /// ([`TargetView`] の doc に理由)。
+    pub target: Option<TargetView>,
+}
+
+/// 小窓に出す「相手ウィンドウ」。
+///
+/// 出す理由: 通常モードの貼付先は**録音開始時の前景ウィンドウ**で固定される
+/// (design.md R7)。押し間違い (別ウィンドウを見ながら喋った・フォーカスが
+/// 思っていた場所に無かった) は、貼られた後にしか気づけないのが一番痛い。
+/// 録音中に相手の名前が出ていれば、話し終える前に気づける。
+///
+/// **クリップボードのみモードでは出さない。** あちらは貼らない設計
+/// (フォーカス無し運用が前提) なので、相手を出すと「そこに貼られる」と
+/// 読めてしまう — 出さないことが正しい情報になる。
+///
+/// **画面質問モードは前景ではなくモニタ 1 枚が対象**であり、前景は
+/// モニタ選択にしか効かない (`screen/win32.rs::choose_monitor`)。
+/// そこで「前景アプリ + どのモニタを読むか」を出す。
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetView {
+    /// 相手ウィンドウのハンドル。**アイコン到着イベントとの突き合わせ用**
+    /// (`nox://target-icon`)。古い録音の遅れて届いたアイコンを弾く。
+    pub hwnd: isize,
+    /// 前景を掴めたか。`false` なら小窓は「挿入先を特定できません」を出す。
+    pub known: bool,
+    /// アプリの表示名。**録音開始を待たせないため、ここに入るのは
+    /// 即座に出せる値**(キャッシュ済みの版情報、無ければ exe のベース名)。
+    /// 版情報を引き終えたら `nox://target-icon` で上書きされる。
+    pub app_name: String,
+    /// ウィンドウタイトル (末尾のアプリ名は落としてある)。
+    pub title: String,
+    /// アプリアイコン (`data:image/png;base64,...`)。**キャッシュが当たった
+    /// ときだけ** Some で、外れたら `nox://target-icon` で後追いする。
+    pub icon: Option<String>,
+    /// 画面質問モードで**複数モニタのときだけ** Some。「どのモニタを読むか」。
+    pub monitor: Option<String>,
+}
+
+/// タイトル末尾の ` - アプリ名` を 1 回だけ落とす。
+///
+/// 小窓は「アプリ名 · タイトル」の形で出すので、`設計メモ - Google Chrome`
+/// をそのまま出すとアプリ名が 2 度並ぶ。狭い 1 行の半分がその重複で埋まる。
+///
+/// 区切りは ASCII ハイフン・em dash・en dash の 3 種 (Chrome / Edge /
+/// エディタで実際に使われている)。**完全一致 (タイトルがアプリ名そのもの)
+/// のときは落とさない** — 空文字にすると「タイトルが取れなかった」のと
+/// 見分けが付かなくなる。
+pub fn trim_app_suffix(title: &str, app_name: &str) -> String {
+    let title = title.trim();
+    let app_name = app_name.trim();
+    if app_name.is_empty() {
+        return title.to_string();
+    }
+    for separator in [" - ", " — ", " – "] {
+        // 大小無視で末尾を見る。`.rfind` ではなく長さで切るのは、
+        // タイトル中に同じ並びがあっても**末尾のものだけ**を落とすため。
+        let suffix_len = separator.len() + app_name.len();
+        if title.len() <= suffix_len {
+            continue;
+        }
+        let cut = title.len() - suffix_len;
+        // **バイト位置で切らない。** 日本語タイトルでは境界の途中に落ちうる
+        // (`split_at` ならそこで panic する)。`get` は境界外なら None を返す。
+        let (Some(head), Some(tail)) = (title.get(..cut), title.get(cut..)) else {
+            continue;
+        };
+        if tail.eq_ignore_ascii_case(&format!("{separator}{app_name}")) {
+            return head.trim_end().to_string();
+        }
+    }
+    title.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trim_app_suffix;
+
+    #[test]
+    fn it_drops_the_app_name_from_the_end_of_a_title() {
+        assert_eq!(
+            trim_app_suffix("設計ドキュメント — Wiki - Google Chrome", "Google Chrome"),
+            "設計ドキュメント — Wiki"
+        );
+        // em dash / en dash 区切りも同じように落とす。
+        assert_eq!(trim_app_suffix("メモ — Notepad", "Notepad"), "メモ");
+        assert_eq!(trim_app_suffix("メモ – Notepad", "Notepad"), "メモ");
+        // 大小は無視する (アプリによって表記がぶれる)。
+        assert_eq!(trim_app_suffix("メモ - notepad", "Notepad"), "メモ");
+    }
+
+    #[test]
+    fn it_drops_only_the_last_occurrence() {
+        // タイトルの途中に同じ並びがあっても、落とすのは末尾だけ。
+        assert_eq!(
+            trim_app_suffix("Notepad - の使い方 - Notepad", "Notepad"),
+            "Notepad - の使い方"
+        );
+    }
+
+    #[test]
+    fn it_keeps_a_title_that_is_only_the_app_name() {
+        // 空にすると「タイトルが取れなかった」と区別が付かなくなる。
+        assert_eq!(trim_app_suffix("Google Chrome", "Google Chrome"), "Google Chrome");
+    }
+
+    #[test]
+    fn it_does_nothing_without_an_app_name() {
+        assert_eq!(trim_app_suffix("メモ - Notepad", ""), "メモ - Notepad");
+        assert_eq!(trim_app_suffix("  メモ  ", "Notepad"), "メモ");
+    }
+
+    #[test]
+    fn it_survives_a_multibyte_title() {
+        // バイト位置で切ると文字境界の途中に落ちて panic しうる。
+        assert_eq!(trim_app_suffix("あいうえお", "え"), "あいうえお");
+        assert_eq!(trim_app_suffix("あいう - メモ帳", "メモ帳"), "あいう");
+    }
 }

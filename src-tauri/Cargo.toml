@@ -74,6 +74,12 @@ windows = { version = "0.62", features = [
     "Storage_Streams",
     "Foundation",
     "Globalization",
+    # 小窓に出す相手アプリの表示名とアイコン (app_icon.rs)。
+    # - Win32_UI_Shell           : SHGetFileInfoW (exe → 16px のアイコン)
+    # - Win32_Storage_FileSystem : GetFileVersionInfoW / VerQueryValueW
+    #                              (版情報の FileDescription = 「Google Chrome」)
+    "Win32_UI_Shell",
+    "Win32_Storage_FileSystem",
     "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

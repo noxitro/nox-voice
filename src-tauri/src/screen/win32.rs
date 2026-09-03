@@ -23,10 +23,10 @@ use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
-    GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, ReleaseDC, SelectObject, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, HBITMAP, HDC, HMONITOR, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, SRCCOPY,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, EnumDisplayMonitors,
+    GetDC, GetDIBits, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, ReleaseDC, SelectObject,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, HBITMAP, HDC, HMONITOR,
+    MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, SRCCOPY,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
@@ -354,12 +354,8 @@ fn scan_monitor(started: Instant) -> ScreenScan {
 fn choose_monitor() -> Option<(HMONITOR, MonitorPick)> {
     // SAFETY: 引数なし。NULL でありうるので下でチェックする。
     let foreground = unsafe { GetForegroundWindow() };
-    if !foreground.0.is_null() {
-        // SAFETY: hwnd は非 NULL。DEFAULTTONEAREST は常に有効なモニタを返す。
-        let monitor = unsafe { MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) };
-        if !monitor.is_invalid() {
-            return Some((monitor, MonitorPick::Foreground));
-        }
+    if let Some(picked) = monitor_for_window(foreground) {
+        return Some(picked);
     }
 
     let mut point = POINT::default();
@@ -375,6 +371,99 @@ fn choose_monitor() -> Option<(HMONITOR, MonitorPick)> {
     // SAFETY: DEFAULTTOPRIMARY は座標を問わず主モニタを返す。
     let primary = unsafe { MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY) };
     (!primary.is_invalid()).then_some((primary, MonitorPick::Primary))
+}
+
+/// 指定ウィンドウの載っているモニタ。NULL や無効なら `None`。
+fn monitor_for_window(hwnd: HWND) -> Option<(HMONITOR, MonitorPick)> {
+    if hwnd.0.is_null() {
+        return None;
+    }
+    // SAFETY: hwnd は非 NULL。DEFAULTTONEAREST は常に有効なモニタを返す。
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    (!monitor.is_invalid()).then_some((monitor, MonitorPick::Foreground))
+}
+
+/// 小窓に出す「どのモニタを読むか」。**モニタが 1 枚なら `None`**。
+///
+/// 画面質問モードは前景ウィンドウではなく**モニタ 1 枚**を読む
+/// ([`choose_monitor`])。ユーザーから見て「どっちの画面が読まれるのか」は
+/// 押し間違いに直結するが、**モニタが 1 枚しかない環境では間違えようが
+/// ない** — 出さないほうが小窓は静かで、情報の密度も上がる。
+///
+/// `target_hwnd` は録音開始時に掴んだ前景 (0 = 掴めなかった)。ここで
+/// `GetForegroundWindow` を引き直さないのは、呼ばれるのが録音開始の直後で
+/// あっても**掴んだ瞬間の前景と食い違いうる**から。走査が実際に見る
+/// モニタと小窓の表示がずれるくらいなら、掴んだ値を使う。
+///
+/// **録音開始の経路から同期に呼んでよい** (モニタ列挙と `GetMonitorInfoW`
+/// だけで、数十 µs)。アイコンや版情報とは違ってファイルもシェルも触らない。
+pub fn monitor_hint(target_hwnd: isize) -> Option<String> {
+    if monitor_count() < 2 {
+        return None;
+    }
+    let (monitor, pick) = monitor_for_window(HWND(target_hwnd as *mut _))
+        .or_else(choose_monitor)?;
+    // 番号で言えるならそちらを使う (Windows の表示設定と同じ番号)。
+    // 取れなければ「なぜそのモニタを選んだか」で言う。
+    match monitor_device_name(monitor).as_deref().and_then(super::display_label) {
+        Some(display) => Some(format!("{display} を読む")),
+        None => Some(format!("{}を読む", pick.label())),
+    }
+}
+
+/// 接続されているモニタの枚数。
+fn monitor_count() -> usize {
+    let mut count = 0usize;
+    // SAFETY: コールバックは下の count_proc。LPARAM には count への
+    // 生ポインタを載せる。EnumDisplayMonitors は同期的に完了する。
+    let ptr = &raw mut count;
+    let _ = unsafe { EnumDisplayMonitors(None, None, Some(count_proc), LPARAM(ptr as isize)) };
+    count
+}
+
+/// [`monitor_count`] のコールバック。**必ず `true` を返して列挙を続ける。**
+unsafe extern "system" fn count_proc(
+    _monitor: HMONITOR,
+    _dc: HDC,
+    _rect: *mut RECT,
+    lparam: LPARAM,
+) -> BOOL {
+    // panic を FFI 境界で止める (`enum_proc` と同じ扱い)。
+    let counted = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: lparam には monitor_count が載せた &mut usize が入る。
+        let count = unsafe { &mut *(lparam.0 as *mut usize) };
+        *count += 1;
+    }));
+    if counted.is_err() {
+        log::warn!("モニタ列挙中に内部エラーが発生しました (この 1 件は飛ばします)");
+    }
+    true.into()
+}
+
+/// モニタのデバイス名 (`\\.\DISPLAY2`)。取れなければ `None`。
+fn monitor_device_name(monitor: HMONITOR) -> Option<String> {
+    let mut info = MONITORINFOEXW {
+        monitorInfo: MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // SAFETY: monitor は有効。cbSize に MONITORINFOEXW の大きさを入れて
+    // あるので、API はデバイス名まで書き込む。
+    let ok = unsafe {
+        GetMonitorInfoW(
+            monitor,
+            &mut info as *mut MONITORINFOEXW as *mut MONITORINFO,
+        )
+    };
+    if !ok.as_bool() {
+        return None;
+    }
+    let name: String = String::from_utf16_lossy(&info.szDevice)
+        .trim_end_matches('\0')
+        .to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 /// モニタの矩形 `(x, y, 幅, 高さ)`。
@@ -1088,6 +1177,19 @@ fn read_bitmap_pixels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **実機のモニタ構成で、小窓に出る補足を確かめる診断。**
+    ///
+    /// 出すのはモニタの枚数と表示用の一言だけ (画面の中身には触れない)。
+    /// 1 枚の環境では `None` = 「補足を出さない」が正しい。
+    ///
+    /// 実行: `cargo test --lib -- --ignored --nocapture live_monitor_hint`
+    #[test]
+    #[ignore = "実機のモニタ構成に依存する"]
+    fn live_monitor_hint() {
+        println!("モニタ枚数 : {}", super::monitor_count());
+        println!("小窓の補足 : {:?}", super::monitor_hint(0));
+    }
 
     /// **実機でローカル OCR が使えるかを確かめる診断。**
     ///

@@ -25,6 +25,7 @@
 //! `session.rs` (`RecordingSession` — M2 の STT への受け渡し)、
 //! `tray.rs` (トレイ常駐と状態表示)。
 
+mod app_icon;
 mod audio;
 mod config;
 mod context;
@@ -73,7 +74,7 @@ use inject::{ClipboardState, InjectOutcome, InjectTarget};
 use pipeline::FormatOutcome;
 use session::{
     PendingRecording, RecordingSession, SessionSummary, Status, StatusOrigin, StatusPayload,
-    TargetWindow,
+    TargetView, TargetWindow,
 };
 use stt::GroqStt;
 
@@ -89,6 +90,13 @@ const EVENT_ERROR: &str = "nox://error";
 const EVENT_HISTORY: &str = "nox://history";
 /// 入力レベル (0.0..=1.0)。オーバーレイのメーター用に間引いて送る。
 const EVENT_LEVEL: &str = "nox://level";
+/// 相手アプリの表示名とアイコンが揃ったことを小窓へ知らせるイベント。
+///
+/// **状態イベントとは別に送る。** アイコンと版情報の取得は相手の
+/// インストール状態次第で数百 ms かかりうるので、録音開始の経路では
+/// 待たない ([`app_icon`] のモジュール注記)。小窓は先に名前だけで出て、
+/// 揃ったところで差し替わる。
+const EVENT_TARGET_ICON: &str = "nox://target-icon";
 /// 設定 UI へキー捕獲の結果を返すイベント。
 const EVENT_HOTKEY_CAPTURED: &str = "nox://hotkey-captured";
 /// 履歴を開くよう UI へ促すイベント (トレイ・通知からの導線)。
@@ -800,6 +808,10 @@ fn overlay_ready(app: AppHandle, listeners: usize) {
             // 起動直後の同期であり、Idle 以外で拾われることはまず無い
             // (拾えたとしても、どの用途だったかを覚えていない再接続時の同期)。
             screen_ask: false,
+            // 同じ理由で相手ウィンドウも送らない。**過去の録音の相手を
+            // 出すくらいなら何も出さない** — 小窓の「相手」は「今この
+            // 録音が貼る先」以外の意味を持ってはいけない。
+            target: None,
         },
     ) {
         log::warn!("オーバーレイへの初期状態送出に失敗: {e}");
@@ -1571,17 +1583,35 @@ fn start_recording(app: &AppHandle, mode: HotkeyMode) -> Result<(), String> {
         None
     };
 
+    // 小窓に出す「相手ウィンドウ」。**ここでファイルもシェルも触らない**
+    // ([`target_view`] の doc)。アイコンと版情報は下の短命スレッドが追う。
+    let target_view = target_view(&target, mode);
+    // 後追い (下) に渡す分だけ控える。`target` はこの直後に PendingRecording へ渡す。
+    let icon_source = (target.process_path.clone(), target.window_title.clone());
+
     if let Ok(mut pending) = state.pending.lock() {
         *pending = Some(PendingRecording {
             target,
             started_at,
             mode,
             context: screen_context,
+            target_view: target_view.clone(),
             screen,
         });
     }
 
-    set_status(app, Status::Recording, None, mode == HotkeyMode::ScreenAsk);
+    set_status_with_target(
+        app,
+        Status::Recording,
+        mode == HotkeyMode::ScreenAsk,
+        target_view.clone(),
+    );
+    // 後追いは**状態イベントを送った後**に起こす。先に起こすと、キャッシュが
+    // 当たった回は後追いが状態より先に小窓へ届き、「表示中の相手が無い」
+    // として捨てられる (小窓は hwnd の一致でしか受け取らない)。
+    if let Some(view) = target_view.as_ref().filter(|v| v.known) {
+        resolve_target_icon(app, view.hwnd, icon_source.0, icon_source.1);
+    }
     // ここから録音中。キャンセルキーを武装する (停止系の全経路で解除する)。
     hotkey::set_recording_active(true);
 
@@ -1595,6 +1625,116 @@ fn start_recording(app: &AppHandle, mode: HotkeyMode) -> Result<(), String> {
     // 表示の区間 (overlay 側の FocusGuard) で捕まらない移動がここに出る。
     focus_probe::log_point("録音開始 直後");
     Ok(())
+}
+
+/// 小窓に出す「相手ウィンドウ」を組み立てる ([`TargetView`] に意図)。
+///
+/// **録音開始の経路から同期に呼ばれる。** したがってここでは
+/// 版情報もアイコンも引かない (どちらもファイル/シェルを叩き、相手次第で
+/// 数百 ms かかる)。表示名は**キャッシュが当たればそれ、外れたら exe の
+/// ベース名**で即座に確定させ、改善は [`resolve_target_icon`] に任せる。
+fn target_view(target: &TargetWindow, mode: HotkeyMode) -> Option<TargetView> {
+    // クリップボードのみモードは貼らない。相手を出すと「そこに貼られる」と
+    // 読めてしまうので、**出さないことが正しい情報になる**。
+    if mode == HotkeyMode::ClipboardOnly {
+        return None;
+    }
+
+    // 画面質問モードだけは、前景ではなく**読むモニタ**が対象。
+    // モニタが 1 枚なら補足しない (間違えようがない情報は出さない)。
+    let monitor = (mode == HotkeyMode::ScreenAsk)
+        .then(|| screen::monitor_hint(target.hwnd))
+        .flatten();
+
+    if !target.is_known() {
+        // 前景が取れなかった。通常モードなら「貼れないかもしれない」と
+        // 言う価値があるが、画面質問モードで言うことは何も無い
+        // (前景はモニタ選択にしか効かず、それは monitor 側で言っている)。
+        if mode == HotkeyMode::ScreenAsk && monitor.is_none() {
+            return None;
+        }
+        return Some(TargetView {
+            hwnd: 0,
+            known: false,
+            app_name: String::new(),
+            title: String::new(),
+            icon: None,
+            monitor,
+        });
+    }
+
+    let path = target.process_path.as_deref();
+    let app_name = path
+        .and_then(app_icon::cached_name)
+        .unwrap_or_else(|| app_icon::fallback_name(&target.process_name));
+    // アイコンもキャッシュが当たった分は**ここで同期に載せる**。後追いに
+    // 任せると到着順の競合で捨てられうる (`resolve_target_icon` の注記)。
+    let icon = path.and_then(app_icon::cached_icon).flatten();
+    Some(TargetView {
+        hwnd: target.hwnd,
+        known: true,
+        title: session::trim_app_suffix(&target.window_title, &app_name),
+        app_name,
+        icon,
+        monitor,
+    })
+}
+
+/// 相手アプリの表示名とアイコンを**録音開始の後ろで**解決して小窓へ送る。
+///
+/// 短命スレッド 1 本。ここが遅れても録音には何の影響もないし、失敗しても
+/// 小窓は当座の名前のまま出続ける (アイコンの枠は窓のグリフで埋まる)。
+///
+/// `hwnd` を一緒に送るのは、**古い録音の遅れて届いたアイコンを小窓側で
+/// 弾く**ため。連続して別のアプリへ喋ったとき、前の録音の結果が後から
+/// 届いて今の表示を書き換えるのを防ぐ。
+///
+/// タイトルも一緒に送り直す。開始時の切り落とし
+/// ([`session::trim_app_suffix`]) は当座の名前 (`chrome`) で行うので、
+/// 版情報から本当の名前 (`Google Chrome`) が出た後は**もう一度落とせる** —
+/// これをしないと、そのアプリへの初回の録音だけ
+/// 「Google Chrome · 設計メモ - Google Chrome」と名前が 2 度並ぶ。
+fn resolve_target_icon(
+    app: &AppHandle,
+    hwnd: isize,
+    path: Option<std::path::PathBuf>,
+    raw_title: String,
+) {
+    let Some(path) = path else {
+        return;
+    };
+    // 名前もアイコンも引き終えているなら、状態イベントに全部載っている。
+    // 後追いを飛ばすと小窓の再描画が 1 回減る (中身は同じなので無害だが、
+    // 無駄な IPC を毎回の録音に足す理由も無い)。
+    if app_icon::cached_name(&path).is_some() && app_icon::cached_icon(&path).is_some() {
+        return;
+    }
+    let app = app.clone();
+    let spawned = thread::Builder::new()
+        .name("nox-target-icon".to_string())
+        .spawn(move || {
+            let app_name = app_icon::display_name(&path);
+            let icon = app_icon::icon_data_uri(&path);
+            let title = session::trim_app_suffix(&raw_title, &app_name);
+            // **中身はログに出さない。** タイトルは design.md の方針どおり
+            // ログにも console にも流さないし、アプリ名も同じ行に並べて出す
+            // 値なので扱いを揃える。
+            if let Err(e) = app.emit(
+                EVENT_TARGET_ICON,
+                serde_json::json!({
+                    "hwnd": hwnd,
+                    "app_name": app_name,
+                    "title": title,
+                    "icon": icon,
+                }),
+            ) {
+                log::debug!("相手アプリの表示名/アイコンを送れません: {e}");
+            }
+        });
+    if let Err(e) = spawned {
+        // 出せなくても録音は続く。小窓は当座の名前のままになる。
+        log::debug!("相手アプリの表示名/アイコンを解決できません: {e}");
+    }
 }
 
 /// 入力レベルを間引いてフロントへ送るスレッドを起動する。
@@ -1686,15 +1826,19 @@ fn request_finalize(app: &AppHandle) -> Result<(), String> {
             // (クリップボードのみへ倒すと、貼られるはずの結果が黙って消える)。
             mode: HotkeyMode::Inject,
             context: context::ScreenContext::default(),
+            // 開始情報ごと取り落としているので、小窓に出す相手も無い。
+            target_view: None,
             screen: None,
         });
 
     stop_level_emitter(app);
-    set_status(
+    // 処理中も**開始時に組み立てた同じ相手**を出し続ける。ここで組み直すと
+    // 「どのモニタを読むか」が録音終了時の前景で決まってしまう。
+    set_status_with_target(
         app,
         Status::Processing,
-        None,
         pending.mode == HotkeyMode::ScreenAsk,
+        pending.target_view.clone(),
     );
 
     state
@@ -1737,6 +1881,7 @@ fn cancel_recording(app: &AppHandle) {
         Some("録音をキャンセルしました".into()),
         StatusOrigin::Recording,
         false,
+        None,
     );
     // 小窓は idle への遷移では自分で畳まない (overlay.ts 参照)。
     // 結果イベントも飛ばないので、エラー表示と同じ対で畳みを予約する。
@@ -1821,7 +1966,14 @@ fn finalize_worker(app: AppHandle, rx: Receiver<WorkerJob>) {
                 // 出どころを Background にして、オーバーレイには映さない
                 // (映すと完了イベントが来ず「認識中…」で固まる)。
                 if !app.state::<AppState>().is_recording() {
-                    set_status_from(&app, Status::Processing, None, StatusOrigin::Background, false);
+                    set_status_from(
+                        &app,
+                        Status::Processing,
+                        None,
+                        StatusOrigin::Background,
+                        false,
+                        None,
+                    );
                 }
                 if guard_panic("再転写", || retranscribe(&app, id)).is_none() {
                     emit_background_error(&app, "再転写中に内部エラーが発生しました");
@@ -3338,6 +3490,8 @@ fn finalize_on_exit(app: &AppHandle) {
             // (クリップボードのみへ倒すと、貼られるはずの結果が黙って消える)。
             mode: HotkeyMode::Inject,
             context: context::ScreenContext::default(),
+            // 開始情報ごと取り落としているので、小窓に出す相手も無い。
+            target_view: None,
             screen: None,
         });
 
@@ -3376,7 +3530,28 @@ fn finalize_on_exit(app: &AppHandle) {
 /// `screen_ask` は小窓の色分け用 ([`StatusPayload::screen_ask`] の doc)。
 /// 用途を問わない遷移 (Idle 化など) では `false` を渡してよい。
 fn set_status(app: &AppHandle, status: Status, message: Option<String>, screen_ask: bool) {
-    set_status_from(app, status, message, StatusOrigin::Recording, screen_ask);
+    set_status_from(app, status, message, StatusOrigin::Recording, screen_ask, None);
+}
+
+/// 相手ウィンドウ付きで状態を更新する (録音中・処理中の小窓表示用)。
+///
+/// 別の関数にしてあるのは、`set_status` の呼び出し元が十数か所あり、
+/// そのほとんど (Idle 化・エラー) は相手ウィンドウを持たないため。
+/// 全部に `None` を書かせると、**本当に渡すべき 2 か所が埋もれる**。
+fn set_status_with_target(
+    app: &AppHandle,
+    status: Status,
+    screen_ask: bool,
+    target: Option<TargetView>,
+) {
+    set_status_from(
+        app,
+        status,
+        None,
+        StatusOrigin::Recording,
+        screen_ask,
+        target,
+    );
 }
 
 /// 出どころを明示して状態を更新する。
@@ -3386,6 +3561,7 @@ fn set_status_from(
     message: Option<String>,
     origin: StatusOrigin,
     screen_ask: bool,
+    target: Option<TargetView>,
 ) {
     let state = app.state::<AppState>();
     if let Ok(mut slot) = state.status.lock() {
@@ -3403,6 +3579,7 @@ fn set_status_from(
             message,
             origin,
             screen_ask,
+            target,
         },
     ) {
         log::warn!("状態イベントの送出に失敗: {e}");
@@ -3463,6 +3640,7 @@ mod tests {
                 process_id: 42,
                 process_name: "notepad.exe".to_string(),
                 window_title: "無題 - メモ帳".to_string(),
+                process_path: None,
             },
             started_at: SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
             duration: Duration::from_millis(2_500),

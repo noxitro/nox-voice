@@ -100,6 +100,51 @@
           <span class="elapsed" id="elapsed"></span>
         </div>
 
+        <!-- 相手ウィンドウ (録音中・処理中のみ)。通常モードは貼付先、
+             画面質問モードは「前景アプリ + 読むモニタ」。クリップボード
+             のみモードでは Rust 側が送ってこないので出ない。 -->
+        <div class="target" id="target" hidden>
+          <span class="target-icon">
+            <!-- アイコンが届くまでの枠。同じ 14px を占めるので、
+                 到着してもレイアウトが跳ねない。 -->
+            <svg viewBox="0 0 16 16" class="target-glyph" aria-hidden="true">
+              <rect
+                x="1.75"
+                y="2.75"
+                width="12.5"
+                height="10.5"
+                rx="1.8"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+              />
+              <path
+                d="M1.75 6.1h12.5"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+              />
+            </svg>
+            <!-- アイコンが届くまでは 1x1 の透明画像。src 無しの <img> を
+                 置くと、環境によっては壊れた画像の枠が出る。中身は
+                 nox://target-icon で差し替わり、見え方は data-icon が
+                 決める (opacity のみ)。 -->
+            <img
+              class="target-img"
+              id="target-img"
+              alt=""
+              src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+            />
+          </span>
+          <span class="target-name">
+            <span class="target-app" id="target-app"></span
+            ><span class="target-title" id="target-title"></span>
+          </span>
+        </div>
+
+        <!-- 画面質問モードで、モニタが 2 枚以上あるときだけ出る補足。 -->
+        <div class="hint" id="hint" hidden></div>
+
         <div class="meter" id="meter" hidden>
           <div class="meter-fill" id="meter-fill"></div>
         </div>

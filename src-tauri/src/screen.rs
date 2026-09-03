@@ -720,6 +720,47 @@ pub fn encode_png(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String
     Ok(out)
 }
 
+/// RGBA8 を PNG にする。
+///
+/// [`encode_png`] (RGB) とは別に持つ。あちらはスクリーンショット用で、
+/// **透過を持たない**ことが前提の経路。こちらの用途はアプリアイコン
+/// ([`crate::app_icon`]) で、角の透過が落ちると小窓の暗い地の上に
+/// 白い四角が乗る。既存の呼び出し元を触らずに済むよう、関数を分けてある。
+pub fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    if rgba.len() != (width as usize) * (height as usize) * 4 {
+        return Err("画素数とバッファ長が合いません".to_string());
+    }
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| format!("PNG ヘッダを書けません: {e}"))?;
+        writer
+            .write_image_data(rgba)
+            .map_err(|e| format!("PNG を書けません: {e}"))?;
+    }
+    Ok(out)
+}
+
+/// `\\.\DISPLAY2` のようなデバイス名から「ディスプレイ 2」を作る。
+///
+/// 小窓に出す「どのモニタを読むか」の言い方 ([`monitor_hint`])。
+/// [`MonitorPick::label`] の「前景ウィンドウのモニタ」は**選び方**の説明で、
+/// ユーザーが目で確かめたい「どっちの画面か」には答えていない。番号なら
+/// Windows の表示設定に出ている番号と同じなので照合できる。
+///
+/// 形が想定と違えば `None`。呼び出し側が `MonitorPick::label()` へ落とす。
+pub fn display_label(device_name: &str) -> Option<String> {
+    let number = device_name.trim().strip_prefix(r"\\.\DISPLAY")?;
+    // 数字だけであることを確かめる (`\\.\DISPLAY1\Monitor0` のような
+    // 下位デバイス名を「ディスプレイ 1\Monitor0」と読ませない)。
+    (!number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
+        .then(|| format!("ディスプレイ {number}"))
+}
+
 /// 資料テキスト全体が上限を超えないよう、後ろのウィンドウから削る。
 ///
 /// 手前 (Z オーダーが上) のウィンドウを優先して残す。奥の窓は
@@ -1559,6 +1600,41 @@ mod tests {
         assert!(encode_png(&[0u8; 10], 4, 3).is_err());
     }
 
+    #[test]
+    fn rgba_png_encoding_round_trips_the_size() {
+        // アプリアイコン用 (透過を持つ)。
+        let rgba = vec![9u8; 4 * 3 * 4];
+        let png = encode_png_rgba(&rgba, 4, 3).expect("PNG にできる");
+        assert!(png.starts_with(&[0x89, b'P', b'N', b'G']), "PNG 署名が無い");
+        // IHDR の色型は 6 (RGBA)。ここが 2 (RGB) だと透過が落ちる。
+        assert_eq!(png[25], 6, "RGBA として書けていない");
+        assert!(png.len() > 8);
+    }
+
+    #[test]
+    fn rgba_png_encoding_rejects_a_mismatched_buffer() {
+        // RGB 用の長さ (画素 * 3) を渡しても通ってはいけない。
+        assert!(encode_png_rgba(&[0u8; 4 * 3 * 3], 4, 3).is_err());
+    }
+
+    // --- モニタの言い方 ---
+
+    #[test]
+    fn a_device_name_becomes_a_display_number() {
+        assert_eq!(display_label(r"\\.\DISPLAY2").as_deref(), Some("ディスプレイ 2"));
+        assert_eq!(display_label(r"\\.\DISPLAY1").as_deref(), Some("ディスプレイ 1"));
+    }
+
+    #[test]
+    fn an_unexpected_device_name_has_no_label() {
+        // 下位デバイス名や空はここでは名乗らせない (呼び出し側が
+        // MonitorPick::label() へ落とす)。
+        assert_eq!(display_label(r"\\.\DISPLAY1\Monitor0"), None);
+        assert_eq!(display_label(r"\\.\DISPLAY"), None);
+        assert_eq!(display_label(""), None);
+        assert_eq!(display_label("DISPLAY2"), None);
+    }
+
     // --- 資料量の頭打ち ---
 
     #[test]
@@ -1789,4 +1865,4 @@ mod tests {
 // ---------------------------------------------------------------------------
 mod win32;
 
-pub use win32::start_scan;
+pub use win32::{monitor_hint, start_scan};

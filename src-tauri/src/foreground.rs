@@ -28,17 +28,23 @@ pub fn capture_foreground() -> TargetWindow {
     // SAFETY: hwnd は非 NULL、出力ポインタはスタック上の有効な u32。
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
 
-    let process_name = if process_id != 0 {
-        process_image_name(process_id).unwrap_or_else(|| "<unknown>".to_string())
-    } else {
-        "<unknown>".to_string()
-    };
+    // フルパスとベース名は**同じ 1 回の問い合わせ**から取る。ベース名だけを
+    // 取り直すと `OpenProcess` が 2 回走り、録音開始の経路がその分遅れる。
+    let process_path = (process_id != 0)
+        .then(|| process_image_path(process_id))
+        .flatten();
+    let process_name = process_path
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<unknown>".to_string());
 
     TargetWindow {
         hwnd: hwnd.0 as isize,
         process_id,
         process_name,
         window_title: window_title(hwnd),
+        process_path,
     }
 }
 
@@ -63,6 +69,15 @@ pub(crate) fn window_title(hwnd: HWND) -> String {
 ///
 /// [`crate::screen`] のウィンドウ列挙からも使う。
 pub(crate) fn process_image_name(process_id: u32) -> Option<String> {
+    process_image_path(process_id).map(|path| base_name(&path.to_string_lossy()))
+}
+
+/// PID から実行ファイルの**フルパス**を得る。
+///
+/// ベース名しか要らない呼び出し元 ([`process_image_name`]) を壊さないよう、
+/// 別の関数として足してある。フルパスが要るのは小窓のアプリ表示名と
+/// アイコン ([`crate::app_icon`]) — 版情報もアイコンも実体のパスが要る。
+pub(crate) fn process_image_path(process_id: u32) -> Option<std::path::PathBuf> {
     // SAFETY: PID は数値、継承なし。失敗時は Err が返る。
     let handle: HANDLE =
         unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
@@ -93,7 +108,7 @@ pub(crate) fn process_image_name(process_id: u32) -> Option<String> {
 
     let size = (size as usize).min(buf.len());
     let full = String::from_utf16_lossy(&buf[..size]);
-    Some(base_name(&full))
+    (!full.is_empty()).then(|| std::path::PathBuf::from(full))
 }
 
 /// フルパスから実行ファイル名だけを取り出す。

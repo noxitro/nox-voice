@@ -6,6 +6,9 @@ import { listen } from "@tauri-apps/api/event";
  *
  * ここはイベントを受けて見た目を変えるだけ。**入力は一切受け取らない**
  * (ウィンドウ側でクリックスルーとフォーカス無効を設定済み)。
+ *
+ * **ウィンドウタイトルを console へ出さない。** Rust 側でタイトルを
+ * ログに残さない方針 (design.md) は、小窓の webview でも同じ。
  */
 
 type Status = "idle" | "recording" | "processing";
@@ -13,12 +16,35 @@ type Status = "idle" | "recording" | "processing";
 /** 状態の出どころ。オーバーレイは録音由来だけを映す。 */
 type StatusOrigin = "recording" | "background";
 
+/** 録音開始時に掴んだ相手ウィンドウ (Rust: `session::TargetView`)。 */
+interface TargetPayload {
+  hwnd: number;
+  /** false = 前景を掴めなかった。 */
+  known: boolean;
+  app_name: string;
+  title: string;
+  /** アイコン (data URI)。キャッシュが当たったときだけ入る。 */
+  icon: string | null;
+  /** 画面質問モードで複数モニタのときだけ入る。 */
+  monitor: string | null;
+}
+
+/** アプリの表示名とアイコンが揃ったときの後追い (Rust: `nox://target-icon`)。 */
+interface TargetIconPayload {
+  hwnd: number;
+  app_name: string;
+  title: string;
+  icon: string | null;
+}
+
 interface StatusPayload {
   status: Status;
   message: string | null;
   origin: StatusOrigin;
   /** 画面質問モードでの録音か。小窓の色分けに使う (overlay.css)。 */
   screen_ask: boolean;
+  /** 録音中・処理中に出す相手ウィンドウ。出さない場面では null。 */
+  target: TargetPayload | null;
 }
 
 interface ErrorPayload {
@@ -38,6 +64,16 @@ interface ResultPayload {
   clipboard_state: string;
 }
 
+/** 小窓の見た目 1 状態分。引数が増えたので位置引数ではなく名前で渡す。 */
+interface View {
+  state: "recording" | "processing" | "done" | "error";
+  label: string;
+  detail?: string;
+  screenAsk?: boolean;
+  pendingClipboard?: boolean;
+  target?: TargetPayload | null;
+}
+
 const el = <T extends HTMLElement>(id: string) =>
   document.getElementById(id) as T | null;
 
@@ -45,13 +81,25 @@ const el = <T extends HTMLElement>(id: string) =>
 let recordingStartedAt: number | null = null;
 let elapsedTimer: number | undefined;
 
-function setState(
-  state: "recording" | "processing" | "done" | "error",
-  label: string,
-  detail?: string,
-  screenAsk = false,
-  pendingClipboard = false,
-) {
+/**
+ * いま相手として出している HWND。
+ *
+ * 遅れて届くアイコン (`nox://target-icon`) を突き合わせるのに使う。
+ * **一致しない到着は捨てる** — 連続して別のアプリへ喋ったとき、前の録音の
+ * アイコンが後から届いて今の表示を書き換えるのを防ぐ。
+ */
+let shownTargetHwnd: number | null = null;
+
+function setState(view: View) {
+  const {
+    state,
+    label,
+    detail,
+    screenAsk = false,
+    pendingClipboard = false,
+    target = null,
+  } = view;
+
   const pill = el("pill");
   if (pill) {
     pill.dataset.state = state;
@@ -80,6 +128,8 @@ function setState(
     detailEl.hidden = !detail;
   }
 
+  renderTarget(state, target);
+
   const meter = el("meter");
   if (meter) meter.hidden = state !== "recording";
   const elapsed = el("elapsed");
@@ -90,6 +140,67 @@ function setState(
   void invoke("overlay_rendered", { state }).catch(() => {
     /* 疎通確認なので失敗しても表示は続ける */
   });
+}
+
+/**
+ * 相手ウィンドウの行を描く。
+ *
+ * 完了・エラーでは出さない (done の見た目は変えない / 終わった後に
+ * 「どこに貼るか」を言う意味が無い)。
+ *
+ * **同じ相手なら組み直さない。** 録音中に届いたアイコンと改善後の表示名は、
+ * 処理中への遷移で送られてくる状態イベント (開始時の値を持っている) に
+ * 上書きされてはいけない。
+ */
+function renderTarget(view: View["state"], target: TargetPayload | null) {
+  const row = el("target");
+  const hint = el("hint");
+  const image = el<HTMLImageElement>("target-img");
+  const app = el("target-app");
+  const title = el("target-title");
+  if (!row || !hint || !image || !app || !title) return;
+
+  const show = target !== null && (view === "recording" || view === "processing");
+  if (!show || !target) {
+    shownTargetHwnd = null;
+    row.hidden = true;
+    hint.hidden = true;
+    return;
+  }
+
+  hint.textContent = target.monitor ?? "";
+  hint.hidden = !target.monitor;
+
+  if (shownTargetHwnd === target.hwnd && !row.hidden) {
+    return; // 同じ相手。アイコンと改善後の名前をそのまま残す。
+  }
+  shownTargetHwnd = target.hwnd;
+
+  // アイコンは相手ごとに取り直す。前の相手の絵を一瞬でも残さない
+  // (src はそのままでよい。data-icon を外した時点で透明になり、
+  // 次の到着では src を書いてから立て直す)。
+  row.dataset.icon = "";
+  // キャッシュが当たった分は状態イベントに同梱されている。ここで即座に
+  // 出せば、後追い (nox://target-icon) との到着順に依存しない。
+  if (target.known && target.icon) {
+    image.src = target.icon;
+    row.dataset.icon = "true";
+  }
+
+  if (target.known) {
+    row.dataset.unknown = "";
+    app.textContent = target.app_name;
+    title.textContent = target.title;
+  } else {
+    // 前景を掴めなかった。**黙って何も言わない**より、貼れないかもしれない
+    // と先に言う (PRODUCT.md「失敗は騒がしく」)。
+    row.dataset.unknown = "true";
+    app.textContent = "挿入先を特定できません";
+    title.textContent = "";
+  }
+  // 画面質問モードで前景が取れないときは、行そのものは出さず補足だけ残す
+  // (読むのはモニタであって、貼付先の話ではない)。
+  row.hidden = !target.known && target.monitor !== null;
 }
 
 function startElapsed() {
@@ -123,22 +234,22 @@ window.addEventListener("DOMContentLoaded", async () => {
 
     switch (event.payload.status) {
       case "recording":
-        setState(
-          "recording",
-          event.payload.screen_ask ? "画面に質問" : "録音中",
-          undefined,
-          event.payload.screen_ask,
-        );
+        setState({
+          state: "recording",
+          label: event.payload.screen_ask ? "画面に質問" : "録音中",
+          screenAsk: event.payload.screen_ask,
+          target: event.payload.target,
+        });
         startElapsed();
         break;
       case "processing":
         stopElapsed();
-        setState(
-          "processing",
-          event.payload.screen_ask ? "画面を確認中…" : "認識中…",
-          undefined,
-          event.payload.screen_ask,
-        );
+        setState({
+          state: "processing",
+          label: event.payload.screen_ask ? "画面を確認中…" : "認識中…",
+          screenAsk: event.payload.screen_ask,
+          target: event.payload.target,
+        });
         break;
       case "idle":
         stopElapsed();
@@ -146,6 +257,28 @@ window.addEventListener("DOMContentLoaded", async () => {
         // 畳むのは Rust 側 (overlay::hide_after)。
         void invoke("overlay_rendered", { state: "idle(結果待ち)" }).catch(() => {});
         break;
+    }
+  });
+
+  // 相手アプリの表示名とアイコンの後追い。録音開始を待たせないために
+  // 状態イベントとは別便で来る (Rust 側 `resolve_target_icon`)。
+  await listen<TargetIconPayload>("nox://target-icon", (event) => {
+    // 今出している相手のものだけ反映する。古い録音の遅延到着は捨てる。
+    if (shownTargetHwnd === null || event.payload.hwnd !== shownTargetHwnd) return;
+    const row = el("target");
+    const app = el("target-app");
+    const title = el("target-title");
+    const image = el<HTMLImageElement>("target-img");
+    if (!row || !app || !title || !image || row.dataset.unknown === "true") return;
+
+    if (event.payload.app_name) app.textContent = event.payload.app_name;
+    title.textContent = event.payload.title;
+    if (event.payload.icon) {
+      image.src = event.payload.icon;
+      // 属性を書いた直後に効かせると遷移が始まらない。次のフレームで立てる。
+      requestAnimationFrame(() => {
+        row.dataset.icon = "true";
+      });
     }
   });
 
@@ -164,17 +297,25 @@ window.addEventListener("DOMContentLoaded", async () => {
     // いる**ので、静かに消えると「クリップボードに答えが用意された」こと
     // 自体に気付けない。ここだけは一言添える。
     const pending = !event.payload.injected;
-    setState("done", pending ? "コピーしました" : "", undefined, false, pending);
+    setState({
+      state: "done",
+      label: pending ? "コピーしました" : "",
+      pendingClipboard: pending,
+    });
   });
 
   await listen<ErrorPayload>("nox://error", (event) => {
     // 裏方 (再転写など) のエラーは映さない。録音中の表示を奪ってしまう。
     if (event.payload.origin !== "recording") return;
     const first = event.payload.message.split("\n")[0] ?? "エラー";
-    setState("error", first.slice(0, 30), "詳細は履歴から確認できます");
+    setState({
+      state: "error",
+      label: first.slice(0, 30),
+      detail: "詳細は履歴から確認できます",
+    });
   });
 
   // 待受が張れたことを Rust 側へ知らせる。ここが届いていれば
   // capability が正しく、イベントも invoke も通っている。
-  await invoke("overlay_ready", { listeners: 4 });
+  await invoke("overlay_ready", { listeners: 5 });
 });
