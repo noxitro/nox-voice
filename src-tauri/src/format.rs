@@ -1844,4 +1844,249 @@ fn main() {}
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // 整形品質の切り分け (2026-09-05)
+    // -----------------------------------------------------------------------
+
+    /// 文体プロファイルに足す補強。**句読点だけは必ず打たせる**。
+    ///
+    /// AI 宛の既定プロファイルは「文の構造は話したままにする」と言う。
+    /// 実測ではこれが強すぎて、句読点の無い長文がそのまま素通りしていた
+    /// (履歴 190 件中、整形結果が生転写と完全一致が 63 件)。構造を変えない
+    /// ことと句読点を打たないことは別だ、と明示するのがこの一文。
+    const STYLE_PATCH: &str =
+        "\nただし句読点と改行は必ず入れる。語順や言い回しを変えないことと、\
+句読点を打たないことは別である。";
+
+    /// **整形品質が低い原因を切り分ける A/B**。実際の履歴を流し直す。
+    ///
+    /// 切り分けたいのは 2 つの仮説で、直し方が正反対になる:
+    ///
+    /// 1. **モデルが弱い** (`gemini-flash-lite-latest`) → モデルを上げる
+    /// 2. **プロファイルが「整えるな」と言い過ぎ** → 指示文を直す
+    ///
+    /// そこで 2x2 で回す。プロンプトの組み立ては本番と同じ [`system_prompt`]
+    /// を通し、文体プロファイルも辞書もユーザーの実設定から引く — ここを
+    /// 再実装すると「試したものが本番と違う」という一番たちの悪い結果になる。
+    ///
+    /// **履歴の本文を Gemini へ再送する** (design.md R1 の範囲内だが、
+    /// 過去の発話をもう一度送ることになる)。ユーザーの明示的な依頼が
+    /// あるときだけ実行すること。
+    ///
+    /// 履歴にウィンドウタイトルは残っていないので、タイトル条件つきの
+    /// プロファイル (ブラウザ内の Claude 等) は当たらない。`chrome.exe` の
+    /// 結果はその分だけ本番と違う。
+    ///
+    /// 実行:
+    /// `cargo test -- --ignored --nocapture live_format_ab_over_history`
+    #[test]
+    #[ignore = "実 API を呼ぶ。ユーザーの実設定と履歴を読む"]
+    fn live_format_ab_over_history() {
+        let dir = std::env::var("NOX_AB_DIR").unwrap_or_else(|_| {
+            // 識別子は instance に 1 つだけ置いてある。ここへ写すと、
+            // 将来あちらを変えたときにこのテストだけ古い場所を見に行く。
+            format!(
+                "{}\\{}",
+                std::env::var("APPDATA").unwrap_or_default(),
+                crate::instance::APP_IDENTIFIER
+            )
+        });
+        let config_path = std::path::Path::new(&dir).join("config.json");
+        let db_path = std::path::Path::new(&dir).join("nox-voice.db");
+        let Ok(text) = std::fs::read_to_string(&config_path) else {
+            println!("設定が読めないのでスキップ: {}", config_path.display());
+            return;
+        };
+        let cfg: crate::config::Config = serde_json::from_str(&text).expect("設定を読める");
+        // キーは本番と同じ解決 (環境変数優先) を通す。実際この環境では
+        // 設定ファイル側は空で、キーは環境変数から来ている。
+        let Some(key) = cfg.gemini_key().secret else {
+            println!("Gemini のキーが解決できないのでスキップします");
+            return;
+        };
+
+        let mut samples = ab_samples(&db_path);
+        if let Some(n) = std::env::var("NOX_AB_SAMPLES").ok().and_then(|v| v.parse::<usize>().ok()) {
+            samples.truncate(n);
+        }
+        if samples.is_empty() {
+            println!("履歴に対象がありません");
+            return;
+        }
+
+        let client = crate::stt::build_http_client().expect("クライアント");
+        let dictionary = cfg.dictionary.clone();
+        // 対象モデルは環境変数で絞れる (既定は 2 モデルの比較)。
+        // **上位モデルが 503 で落ちている日に丸ごと欠測にしない**ため —
+        // プロンプトだけを変える比較 (同一モデルの素 vs 補強) は
+        // モデルの可用性と独立に測れる。
+        let models: Vec<String> = std::env::var("NOX_AB_MODELS")
+            .unwrap_or_else(|_| "gemini-flash-lite-latest,gemini-flash-latest".to_string())
+            .split(',')
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .collect();
+        // (ラベル, モデル, プロファイルを補強するか)
+        let conditions: Vec<(String, String, bool)> = models
+            .iter()
+            .flat_map(|m| {
+                let short = m.replace("gemini-", "").replace("-latest", "");
+                [
+                    (format!("{short} / 素"), m.clone(), false),
+                    (format!("{short} / 指示追加"), m.clone(), true),
+                ]
+            })
+            .collect();
+
+        // 条件ごとの集計 (無変化だった件数 / 句読点を足した件数 / 合計 ms)。
+        let mut unchanged = vec![0usize; conditions.len()];
+        let mut punctuated = vec![0usize; conditions.len()];
+        let mut total_ms = vec![0u128; conditions.len()];
+        let mut failed = vec![0usize; conditions.len()];
+
+        for (n, (raw, process)) in samples.iter().enumerate() {
+            let profile = crate::style::match_profile(&cfg.style_profiles, process, "");
+            let base = profile.map(|p| p.instruction.clone());
+            println!("\n──────── 標本 {} / {} ────────", n + 1, samples.len());
+            println!("貼付先 : {process}  (プロファイル: {})",
+                profile.map(|p| p.id.as_str()).unwrap_or("(無し)"));
+            println!("生転写 : {}", raw.replace('\n', " ⏎ "));
+            println!("        [{} 字 / 句読点 {}]", raw.chars().count(), punct_count(raw));
+
+            for (i, (label, model, patch)) in conditions.iter().map(|(l, m, p)| (l.clone(), m.clone(), *p)).enumerate() {
+                let style = base.as_ref().map(|b| {
+                    if patch {
+                        format!("{b}{STYLE_PATCH}")
+                    } else {
+                        b.clone()
+                    }
+                });
+                let url = crate::config::Config {
+                    format_model: model.clone(),
+                    ..cfg.clone()
+                }
+                .gemini_url();
+                // 本番の 20 秒 (FORMAT_TIMEOUT) では、混雑時に丸ごと欠測になって
+                // 「品質」を測れない。実時間そのものを知りたいので延ばす。
+                let formatter = GeminiFormatter::new(client.clone(), url, key.clone())
+                    .with_timeout(Duration::from_secs(
+                        std::env::var("NOX_AB_TIMEOUT_S")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(90),
+                    ));
+                // 503 (高負荷) は測りたいものと関係の無い欠測なので粘る。
+                // **ここで諦めると「失敗」と「無変化」が混ざる** — 集計の
+                // 意味が壊れるので、再試行の回数を上限つきで持つ。
+                let request = FormatRequest {
+                    raw,
+                    dictionary: &dictionary,
+                    style: style.as_deref(),
+                    app: Some(process),
+                    context: None,
+                };
+                let started = Instant::now();
+                let mut result = formatter.format(&request);
+                for attempt in 1..=2 {
+                    match &result {
+                        Err(FormatError::Server { status: 503, .. })
+                        | Err(FormatError::RateLimited(_)) => {
+                            std::thread::sleep(Duration::from_secs(4 * attempt));
+                            result = formatter.format(&request);
+                        }
+                        _ => break,
+                    }
+                }
+                let ms = started.elapsed().as_millis();
+                total_ms[i] += ms;
+                match result {
+                    Ok(out) => {
+                        let same = out.trim() == raw.trim();
+                        if same {
+                            unchanged[i] += 1;
+                        }
+                        if punct_count(&out) > punct_count(raw) {
+                            punctuated[i] += 1;
+                        }
+                        println!(
+                            "  {label:20} {ms:>5}ms {} 句読点{:>2}  {}",
+                            if same { "無変化" } else { "変化  " },
+                            punct_count(&out),
+                            out.replace('\n', " ⏎ ")
+                        );
+                    }
+                    Err(e) => {
+                        failed[i] += 1;
+                        println!("  {label:20} {ms:>5}ms 失敗   {}", e.to_string().lines().next().unwrap_or(""));
+                    }
+                }
+                // 無料枠のレート制限に当てない程度に間隔を空ける。
+                std::thread::sleep(Duration::from_millis(1_200));
+            }
+        }
+
+        println!("\n════════ 集計 ({} 標本) ════════", samples.len());
+        println!("{:22} {:>8} {:>10} {:>8} {:>9}", "条件", "無変化", "句読点追加", "欠測", "平均ms");
+        for (i, (label, _, _)) in conditions.iter().enumerate() {
+            println!(
+                "{label:22} {:>6}/{} {:>8}/{} {:>6}/{} {:>9}",
+                unchanged[i],
+                samples.len(),
+                punctuated[i],
+                samples.len(),
+                failed[i],
+                samples.len(),
+                total_ms[i] / samples.len() as u128
+            );
+        }
+    }
+
+    /// 句読点の数。整形が「文を切ったか」の最小の指標。
+    fn punct_count(text: &str) -> usize {
+        text.chars().filter(|c| matches!(c, '、' | '。' | '\n')).count()
+    }
+
+    /// A/B に使う標本を履歴から採る。
+    ///
+    /// **無変化だった長文を優先する** — そこが今いちばん困っている場面で、
+    /// 改善したかどうかが一番はっきり出る。比較のために、整形が効いていた
+    /// 行も少し混ぜる (直しがそちらを壊さないことも見たい)。
+    fn ab_samples(db: &std::path::Path) -> Vec<(String, String)> {
+        let Ok(conn) = rusqlite::Connection::open_with_flags(
+            db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) else {
+            println!("履歴 DB が開けません: {}", db.display());
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (sql, take) in [
+            (
+                "SELECT raw_text, target_process FROM sessions
+                 WHERE raw_text IS NOT NULL AND formatted_text = raw_text
+                 ORDER BY LENGTH(raw_text) DESC LIMIT ?1",
+                3,
+            ),
+            (
+                "SELECT raw_text, target_process FROM sessions
+                 WHERE raw_text IS NOT NULL AND formatted_text <> raw_text
+                   AND LENGTH(raw_text) >= 60
+                 ORDER BY LENGTH(raw_text) DESC LIMIT ?1",
+                1,
+            ),
+        ] {
+            let Ok(mut stmt) = conn.prepare(sql) else {
+                continue;
+            };
+            let rows = stmt
+                .query_map([take], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .and_then(|it| it.collect::<Result<Vec<_>, _>>());
+            if let Ok(rows) = rows {
+                out.extend(rows);
+            }
+        }
+        out
+    }
+
 }
