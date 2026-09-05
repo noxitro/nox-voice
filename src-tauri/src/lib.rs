@@ -127,8 +127,32 @@ const OVERLAY_RESULT_LINGER: std::time::Duration = std::time::Duration::from_mil
 /// コメント「画面に出さないと『何も起きなかった』ように見える」がまさに
 /// この状況を指している)。読んで Ctrl+V する時間を見込んで長めに残す。
 const OVERLAY_CLIPBOARD_LINGER: std::time::Duration = std::time::Duration::from_millis(2_400);
+/// 整形が落ちて生転写のまま届いたときに小窓を残す時間。
+///
+/// 貼付済み (650ms) より圧倒的に長い。**この表示は読まれなければ意味が無い**
+/// — 「整形なし」と理由の 2 行を読み切る時間が要る。エラーの 5 秒までは
+/// 取らないのは、発話は失われておらず届いているから (録音が無駄になった
+/// ときほど強くは止めない)。
+const OVERLAY_DEGRADED_LINGER: std::time::Duration = std::time::Duration::from_millis(3_500);
 /// エラー表示を残す時間 (読む時間が要る)。
 const OVERLAY_ERROR_LINGER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 完了表示を残す時間を選ぶ (純関数)。
+///
+/// 呼び出し元が 2 か所あるので、3 分岐をここへ寄せる。片方だけ直して
+/// 「画面質問モードでは劣化が一瞬で消える」といった食い違いを作らない。
+///
+/// **劣化を最優先で見る。** 貼り付いたかどうかより、整形が落ちたことの
+/// ほうが読ませたい情報だから。
+fn result_linger(injected: bool, degraded: bool) -> std::time::Duration {
+    if degraded {
+        OVERLAY_DEGRADED_LINGER
+    } else if injected {
+        OVERLAY_RESULT_LINGER
+    } else {
+        OVERLAY_CLIPBOARD_LINGER
+    }
+}
 
 /// 画面質問モードの Gemini 呼び出しを見切る時間。
 ///
@@ -2268,14 +2292,7 @@ fn transcribe_and_format(
             }
             // 結果を少し見せてから畳む。次の録音で表示が更新されれば、
             // このタイマーは世代違いで何もしない。
-            overlay::hide_after(
-                app,
-                if payload.injected {
-                    OVERLAY_RESULT_LINGER
-                } else {
-                    OVERLAY_CLIPBOARD_LINGER
-                },
-            );
+            overlay::hide_after(app, result_linger(payload.injected, payload.degraded));
             emit_history_changed(app);
             // 常駐したままでも保持期限が守られるよう、録音のたびに執行する。
             enforce_retention(app, cfg.history_retention_days);
@@ -2544,14 +2561,7 @@ fn answer_screen_question(
     // 貼り付けない。`payload.injected` を見て決めているのは他の呼び出し元と
     // 判定を 1 か所 (このモジュールの慣習) に揃えるため — 将来ここが
     // 貼り付けにも対応しても、この分岐は書き換えずに済む。
-    overlay::hide_after(
-        app,
-        if payload.injected {
-            OVERLAY_RESULT_LINGER
-        } else {
-            OVERLAY_CLIPBOARD_LINGER
-        },
-    );
+    overlay::hide_after(app, result_linger(payload.injected, payload.degraded));
 }
 
 /// 採用テキストを前景アプリへ注入し、結果を `payload` に反映する。
@@ -3620,6 +3630,24 @@ fn emit_error_from(app: &AppHandle, message: &str, origin: StatusOrigin) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// 劣化は貼付済みより長く残す。**ここが逆転すると表示は出ているのに
+    /// 読めない**という、一番たちの悪い直り方をする。
+    #[test]
+    fn a_degraded_result_stays_up_long_enough_to_read() {
+        // 劣化は貼り付いたかどうかに関わらず最優先。
+        assert_eq!(result_linger(true, true), OVERLAY_DEGRADED_LINGER);
+        assert_eq!(result_linger(false, true), OVERLAY_DEGRADED_LINGER);
+        // 劣化していなければ従来どおり (貼付済みは短く、クリップボードは長め)。
+        assert_eq!(result_linger(true, false), OVERLAY_RESULT_LINGER);
+        assert_eq!(result_linger(false, false), OVERLAY_CLIPBOARD_LINGER);
+        // 読む時間の順序。貼付済みの静かな完了より必ず長い。
+        assert!(OVERLAY_DEGRADED_LINGER > OVERLAY_CLIPBOARD_LINGER);
+        assert!(OVERLAY_CLIPBOARD_LINGER > OVERLAY_RESULT_LINGER);
+        // CSS のフェード開始 (3150ms) + 260ms が収まること。
+        // ここを割ると、消え始めてから畳むことになり読み切れない。
+        assert!(OVERLAY_DEGRADED_LINGER >= Duration::from_millis(3_410));
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

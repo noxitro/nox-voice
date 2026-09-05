@@ -109,6 +109,18 @@ body {
     fade 260ms ease-in 2050ms forwards;
 }
 
+/* 整形が落ちて生転写のまま届いたとき (design.md R2 の劣化モード)。
+   **クリップボードの規則より後に置く**: どちらも詳細度が同じなので、
+   両方立つ場面 (クリップボードのみモードで整形も落ちた) では後勝ちになる。
+   読む時間が要るぶんフェードの開始も遅らせる — 開始 3150ms + 260ms が
+   Rust 側 OVERLAY_DEGRADED_LINGER (3.5s) に収まる。 */
+.pill[data-state="done"][data-degraded="true"] {
+  padding: 9px 14px;
+  animation:
+    rise var(--duration-base) var(--ease-out),
+    fade 260ms ease-in 3150ms forwards;
+}
+
 @keyframes fade {
   to {
     opacity: 0;
@@ -185,6 +197,27 @@ body {
   display: block;
 }
 
+/* 劣化は琥珀。赤 (エラー) にしないのは、**発話は失われておらず届いている**
+   から — 整形という一段だけが落ちた状態で、録音が無駄になったわけではない。
+   録音中に貼付先を掴めなかったときと同じ「予告・注意」の色に揃える。 */
+.pill[data-state="done"][data-degraded="true"] .icon {
+  color: var(--pill-processing);
+}
+
+/* 貼り付け済みの劣化はチェックを引っ込め、注意の絵にする。緑のチェックは
+   「整形まで済んだ」と読めてしまい、この状態では嘘になる。
+   クリップボードどまりのときはクリップボードの絵のまま — Ctrl+V が
+   まだ要ることのほうが、ユーザーにとって次の一手だから。 */
+.pill[data-state="done"][data-degraded="true"]:not([data-pending="clipboard"])
+  .glyph-check {
+  display: none;
+  animation: none;
+}
+.pill[data-state="done"][data-degraded="true"]:not([data-pending="clipboard"])
+  .glyph-alert {
+  display: block;
+}
+
 .pill[data-state="error"] .icon {
   color: var(--pill-danger);
 }
@@ -223,7 +256,8 @@ body {
    ただしクリップボードどまり (data-pending="clipboard") は例外 — まだ
    Ctrl+V が要ることに気付けないと「何も起きなかった」ように見えるので、
    ここだけ一言だけ残す (overlay.ts の "コピーしました")。 */
-.pill[data-state="done"]:not([data-pending="clipboard"]) .body {
+.pill[data-state="done"]:not([data-pending="clipboard"]):not([data-degraded="true"])
+  .body {
   display: none;
 }
 
@@ -410,5 +444,10 @@ body {
   }
   .pill[data-state="done"][data-pending="clipboard"] {
     animation: fade 260ms ease-in 2050ms forwards;
+  }
+  /* 劣化のフェードもここで言い直す。書かないと上の done 用 (320ms) が
+     効いて、3.5 秒残すつもりの表示が 0.6 秒で消える。 */
+  .pill[data-state="done"][data-degraded="true"] {
+    animation: fade 260ms ease-in 3150ms forwards;
   }
 }

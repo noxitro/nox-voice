@@ -52,11 +52,19 @@ interface ErrorPayload {
   origin: StatusOrigin;
 }
 
+/** 整形の結末 (Rust: `pipeline::FormatOutcome`)。 */
+interface FormatOutcome {
+  kind: "formatted" | "raw_fallback" | "disabled";
+  /** `raw_fallback` のときだけ入る失敗理由。 */
+  reason?: string;
+}
+
 interface ResultPayload {
   text: string;
   stt_ms: number;
   format_ms: number;
   total_ms: number;
+  outcome: FormatOutcome;
   degraded: boolean;
   injected: boolean;
   inject_outcome: string;
@@ -71,6 +79,8 @@ interface View {
   detail?: string;
   screenAsk?: boolean;
   pendingClipboard?: boolean;
+  /** 整形が落ちて生転写のまま届いたか (R2 の劣化モード)。 */
+  degraded?: boolean;
   target?: TargetPayload | null;
 }
 
@@ -97,6 +107,7 @@ function setState(view: View) {
     detail,
     screenAsk = false,
     pendingClipboard = false,
+    degraded = false,
     target = null,
   } = view;
 
@@ -114,6 +125,11 @@ function setState(view: View) {
     // (実際にこの順で報告があった)。貼付済みと見分けが付く絵にして、
     // 消えるまでの時間も Rust 側 (OVERLAY_CLIPBOARD_LINGER) で長くしてある。
     pill.dataset.pending = state === "done" && pendingClipboard ? "clipboard" : "";
+    // 整形が落ちて生転写のまま届いたことを言う (PRODUCT.md「無言の
+    // フォールバックをしない」)。**ここを出さないと、API が落ちている間
+    // ずっと「成功」の顔で生転写が貼られ続ける** — 実際 2026-09-05 に
+    // Gemini が 503 を返し続けた日、7 回連続でそうなっていた。
+    pill.dataset.degraded = state === "done" && degraded ? "true" : "";
     pill.hidden = false;
   }
   const labelEl = el("label");
@@ -201,6 +217,30 @@ function renderTarget(view: View["state"], target: TargetPayload | null) {
   // 画面質問モードで前景が取れないときは、行そのものは出さず補足だけ残す
   // (読むのはモニタであって、貼付先の話ではない)。
   row.hidden = !target.known && target.monitor !== null;
+}
+
+/**
+ * 完了時の見出し。
+ *
+ * 貼付済みの成功は無言のまま (PRODUCT.md「成功は静かに」)。**劣化だけは
+ * 貼付済みでも喋る** — 生転写が入ったことは、黙っていると気づけない。
+ */
+function degradedLabel(degraded: boolean, pending: boolean): string {
+  if (degraded) {
+    return pending ? "整形なし · コピーしました" : "整形なし · 生のまま貼りました";
+  }
+  return pending ? "コピーしました" : "";
+}
+
+/**
+ * 失敗理由を 1 行に詰める。
+ *
+ * 理由は `Gemini のサーバエラー (503): {"error": ...}` のように API の
+ * 応答本文が続く。小窓に JSON を出しても読めないので、最初の `:` で切る。
+ */
+function shortReason(reason: string | undefined): string | undefined {
+  const head = (reason ?? "").split(":")[0]?.trim();
+  return head ? head : undefined;
 }
 
 function startElapsed() {
@@ -297,10 +337,15 @@ window.addEventListener("DOMContentLoaded", async () => {
     // いる**ので、静かに消えると「クリップボードに答えが用意された」こと
     // 自体に気付けない。ここだけは一言添える。
     const pending = !event.payload.injected;
+    const degraded = event.payload.degraded;
     setState({
       state: "done",
-      label: pending ? "コピーしました" : "",
+      label: degradedLabel(degraded, pending),
+      // 理由を出す。「整形されなかった」だけだと、直せるもの (キーが無い)
+      // なのか待てば直るもの (混雑) なのか判断できない。
+      detail: degraded ? shortReason(event.payload.outcome.reason) : undefined,
       pendingClipboard: pending,
+      degraded,
     });
   });
 
