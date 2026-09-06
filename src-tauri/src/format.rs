@@ -31,7 +31,28 @@ pub(crate) const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 /// エラー本文をログ/UI へ載せる際の最大長。
 const MAX_ERROR_BODY: usize = 400;
 /// 整形は体感速度に直結するので STT より短く見切る。
+///
+/// **控えが無いときの値**。落ちたら生転写しか無いので、粘る価値がある。
 pub const FORMAT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 控え ([`crate::format_groq`]) が使えるときの、主の見切り。
+///
+/// # なぜ 20 秒から縮めたか (実測 2026-09-06)
+///
+/// 20 秒は「早く見切ると整形が丸ごと失われる」前提で決めた値だった。
+/// 控えができた今、早く見切って失われるのは整形ではなく**担当が移るだけ**で、
+/// 損得が逆転している。
+///
+/// 実測はこの値を強く支持する:
+///
+/// - 履歴 307 件 (整形成功) — p50 0.93s / p90 1.39s / p99 5.94s / 最大 21.5s
+/// - 同一文 10 回 — 平均 801ms / 最大 919ms
+/// - 失敗 9 件のうち 8 件は **5.4 秒以内**に明示的なエラーが返っている。
+///   20 秒を使い切ったのは「サーバが黙り込んだ」1 件だけ
+///
+/// つまり 6 秒は履歴の p99 (5.94s) の直上にあり、**正常系をほぼ切らずに**
+/// ぶら下がりだけを切る。切られた分は控えが 0.5 秒で整形する。
+pub const FORMAT_TIMEOUT_WITH_FALLBACK: Duration = Duration::from_secs(6);
 
 /// 整形の失敗理由。すべて R2 のフォールバック対象。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +141,8 @@ pub struct GeminiFormatter {
     /// ここで上書きする。**クライアント側の設定より優先される**ので、
     /// テストで短くしたい場合も [`GeminiFormatter::with_timeout`] を使うこと。
     timeout: Duration,
+    /// 失敗したときに 1 回だけ試し直すか ([`GeminiFormatter::with_retry`])。
+    retry: bool,
 }
 
 impl GeminiFormatter {
@@ -133,7 +156,19 @@ impl GeminiFormatter {
             url: url.into(),
             api_key,
             timeout: FORMAT_TIMEOUT,
+            retry: true,
         }
+    }
+
+    /// 失敗時に試し直すかを決める。
+    ///
+    /// **控えがあるなら偽にする。** 主をもう一度試すのはもう一度
+    /// タイムアウト分待つということで、0.5 秒で返る控えがすぐ隣にある以上、
+    /// 待つ側に賭ける理由が無い。控えが無いときは真のまま — あちらは
+    /// 失敗すれば生転写しか残らないので、1 回粘る価値がある。
+    pub fn with_retry(mut self, retry: bool) -> Self {
+        self.retry = retry;
+        self
     }
 
     /// タイムアウトを差し替える (テストと、将来の設定項目用)。
@@ -217,7 +252,7 @@ impl TextFormatter for GeminiFormatter {
                     );
                     return Ok(text);
                 }
-                Err(e) if attempt == 1 && is_retryable(&e) => {
+                Err(e) if self.retry && attempt == 1 && is_retryable(&e) => {
                     log::warn!("整形を再試行します ({e})");
                     std::thread::sleep(RETRY_BACKOFF);
                 }
@@ -2156,6 +2191,183 @@ fn main() {}
             }
         }
         out
+    }
+
+
+    /// 控えがあるときの見切りは、履歴の p99 (5.94 秒) の直上に置く。
+    ///
+    /// **ここが p99 を下回ると、正常に返っていた整形が控えへ流れ始める。**
+    /// 控えの忠実性は主より低い (実測 7/9 対 5/5) ので、担当が移る回数は
+    /// 少ないほどよい。逆に 20 秒のままだと、ぶら下がった 1 件のために
+    /// 20 秒待ってから控えを呼ぶことになる。
+    #[test]
+    fn the_primary_deadline_sits_just_above_the_observed_p99() {
+        // 履歴 307 件の p99 は 5.94 秒 (docs/design.md)。
+        const OBSERVED_P99: Duration = Duration::from_millis(5_940);
+        assert!(
+            FORMAT_TIMEOUT_WITH_FALLBACK > OBSERVED_P99,
+            "p99 を下回ると正常系が控えへ流れる"
+        );
+        // かといって粘りすぎない。控えが 0.5 秒で返る以上、待つ側に賭けない。
+        assert!(FORMAT_TIMEOUT_WITH_FALLBACK <= Duration::from_secs(8));
+        // 控えが無いときは従来どおり粘る (落ちたら生転写しか残らない)。
+        assert!(FORMAT_TIMEOUT > FORMAT_TIMEOUT_WITH_FALLBACK);
+    }
+
+    /// 最悪待ち時間が、段を増やす前 (主 20s × 2 回 = 40.5 秒) より短いこと。
+    ///
+    /// **段を増やして体感が悪化したら本末転倒**なので、上限を数値で縛る。
+    #[test]
+    fn adding_a_second_rung_did_not_make_the_tail_worse() {
+        let backoff = RETRY_BACKOFF;
+        // 主: 再試行しない (with_retry(false))。控え: 1 回だけ試し直す。
+        let worst = FORMAT_TIMEOUT_WITH_FALLBACK
+            + crate::format_groq::GROQ_FORMAT_TIMEOUT
+            + backoff
+            + crate::format_groq::GROQ_FORMAT_TIMEOUT;
+        // 段を増やす前の上限: 20s + 0.5s + 20s。
+        let before = FORMAT_TIMEOUT + backoff + FORMAT_TIMEOUT;
+        assert!(
+            worst < before,
+            "最悪待ち時間が悪化している: {worst:?} >= {before:?}"
+        );
+        assert!(worst <= Duration::from_millis(22_500), "{worst:?}");
+    }
+
+    /// **タイムアウトと再試行の値を決めるための実測** (2026-09-06)。
+    ///
+    /// 履歴から主 (Gemini) の分布は取れる (307 件: p50 0.93s / p90 1.39s /
+    /// p99 5.94s) が、**控え (Groq) には履歴が無い**。控えのタイムアウトを
+    /// 履歴のない側で決めるわけにいかないので、同じ文を同じ回数だけ両方へ
+    /// 投げて測る。
+    ///
+    /// ついでに**出力のゆらぎ**も数える。既定モデルを選んだ根拠は 1 回の
+    /// 測定しかなく、2 回目に言い換えが出たことを観測している
+    /// (design.md「M5実測」)。同じ入力で何通りの出力が返るかは、
+    /// 回数を重ねないと分からない。
+    ///
+    /// タイムアウトは測定用に長く取る — **本番の値で測ると、本番の値より
+    /// 遅い応答が測定から消える**(打ち切りが分布を作ってしまう)。
+    ///
+    /// 実行: `cargo test --lib -- --ignored --nocapture live_latency_survey`
+    /// 回数は `NOX_REPS` (既定 10)。
+    #[test]
+    #[ignore = "実 API を呼ぶ。実設定のキーを使う"]
+    fn live_latency_survey() {
+        let dir = std::env::var("NOX_AB_DIR").unwrap_or_else(|_| {
+            format!(
+                "{}\\{}",
+                std::env::var("APPDATA").unwrap_or_default(),
+                crate::instance::APP_IDENTIFIER
+            )
+        });
+        let config_path = std::path::Path::new(&dir).join("config.json");
+        let Ok(text) = std::fs::read_to_string(&config_path) else {
+            println!("設定が読めないのでスキップ: {}", config_path.display());
+            return;
+        };
+        let cfg: crate::config::Config = serde_json::from_str(&text).expect("設定を読める");
+        let reps: usize = std::env::var("NOX_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let client = crate::stt::build_http_client().expect("クライアント");
+        // 測定専用の長いタイムアウト (打ち切りで分布を作らない)。
+        let probe_timeout = Duration::from_secs(60);
+
+        // 本番のAI宛プロファイルと同じ指示を掛ける/掛けないの2通りで測る。
+        // **素で測ると本番より忠実性が低く出る** — 実際の整形はこの指示の
+        // 下で走るので、指示なしの数字で既定モデルを決めてはいけない。
+        const AI_STYLE: &str = "AI への指示文。整えすぎない。意図・指示語 (これ / さっきの / 上の)・固有名詞・ファイルパス・コード片・英数字は原形のまま保ち、言い換えや要約をしない。「えー」「あの」のような言いよどみと言い直しだけを取り除き、文の構造は話したままにする";
+        let styles: [(&str, Option<&str>); 2] = [("素", None), ("AI宛プロファイル", Some(AI_STYLE))];
+
+        let mut formatters: Vec<(String, Box<dyn TextFormatter>)> = Vec::new();
+        if let Some(key) = cfg.gemini_key().secret {
+            formatters.push((
+                format!("Gemini {}", cfg.format_model),
+                Box::new(
+                    GeminiFormatter::new(client.clone(), cfg.gemini_url(), key)
+                        .with_timeout(probe_timeout),
+                ),
+            ));
+        }
+        if let Some(key) = cfg.groq_key().secret {
+            // 既定 (20b) と上位 (120b) を並べる。既定を選んだ根拠が n=1 なので、
+            // 忠実性で本当に 20b が勝つのかをここで確かめる。
+            for model in ["openai/gpt-oss-20b", "openai/gpt-oss-120b"] {
+                formatters.push((
+                    format!("Groq {model}"),
+                    Box::new(
+                        crate::format_groq::GroqFormatter::new(
+                            client.clone(),
+                            &cfg.groq_chat_endpoint,
+                            model,
+                            key.clone(),
+                        )
+                        .with_timeout(probe_timeout),
+                    ),
+                ));
+            }
+        }
+        if formatters.is_empty() {
+            println!("キーが解決できないのでスキップします");
+            return;
+        }
+
+        println!("入力: {LIVE_SAMPLE}");
+        println!("回数: {reps} / タイムアウト: 60s (測定用)\n");
+
+        for (style_label, style) in styles {
+        let request = FormatRequest {
+            raw: LIVE_SAMPLE,
+            style,
+            ..FormatRequest::default()
+        };
+        println!("════ 文体: {style_label} ════");
+        for (label, formatter) in &formatters {
+            let mut times: Vec<u128> = Vec::new();
+            let mut failures: Vec<String> = Vec::new();
+            let mut outputs: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+
+            for _ in 0..reps {
+                let started = Instant::now();
+                match formatter.format(&request) {
+                    Ok(text) => {
+                        times.push(started.elapsed().as_millis());
+                        *outputs.entry(text.trim().to_string()).or_insert(0) += 1;
+                    }
+                    Err(e) => failures.push(e.to_string().lines().next().unwrap_or("").to_string()),
+                }
+                // 無料枠に配慮して間隔を空ける。
+                std::thread::sleep(Duration::from_millis(600));
+            }
+
+            println!("──── {label} ────");
+            if times.is_empty() {
+                println!("  全て失敗: {failures:?}");
+                continue;
+            }
+            times.sort_unstable();
+            let n = times.len();
+            let pct = |p: usize| times[(n * p / 100).min(n - 1)];
+            let mean = times.iter().sum::<u128>() / n as u128;
+            println!(
+                "  成功 {n}/{reps}  平均 {mean}ms  p50 {}ms  p90 {}ms  最大 {}ms",
+                pct(50),
+                pct(90),
+                times[n - 1]
+            );
+            if !failures.is_empty() {
+                println!("  失敗 {}: {:?}", failures.len(), failures);
+            }
+            println!("  出力の種類: {} 通り", outputs.len());
+            for (text, count) in &outputs {
+                println!("    ×{count}  {text}");
+            }
+            println!();
+        }
+        }
     }
 
 }

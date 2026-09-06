@@ -36,10 +36,15 @@ use crate::format::{self, FormatError, FormatRequest, TextFormatter};
 
 /// 控えのタイムアウト。
 ///
-/// 主の 20 秒 ([`crate::format::FORMAT_TIMEOUT`]) を待った後にさらに
-/// 20 秒待たせない。Groq は実測 1 秒未満で返るので、10 秒で見切っても
-/// 正常系を切り落とさない。
-pub const GROQ_FORMAT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 実測 (2026-09-06、同一文 10 回 × 2 条件): 平均 480〜640ms / 最大 1142ms。
+/// 8 秒は最大の 7 倍あり、正常系を切り落とす余地は無い。それでいて
+/// 主 (6 秒) と合わせた最悪待ち時間を 22.5 秒に収める。
+///
+/// **再試行は残す。** Groq の無料枠は毎分 8,000 トークンで、連続実行では
+/// 実際に 429 が返る。ただし応答が「907ms 後に再試行を」と待ち時間まで
+/// 教えてくるとおり、これは待てば直る類の失敗である。ここは最後の LLM
+/// なので、諦めると生転写まで落ちる。
+pub const GROQ_FORMAT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Groq (OpenAI 互換 chat/completions) の整形実装。
 pub struct GroqFormatter {

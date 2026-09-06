@@ -2186,6 +2186,12 @@ fn transcribe_and_format(
     // 整形が有効なら、キーが無くても Formatter を作る。
     // そうすることで「キー未設定」が Disabled ではなく
     // RawFallback(理由つき) として UI に出る。
+    // 控えを先に決める。主の見切り方が**控えの有無で変わる**ため。
+    let fallback = cfg
+        .formatting_enabled
+        .then(|| build_fallback_formatter(&cfg, &http))
+        .flatten();
+    let has_fallback = fallback.is_some();
     let formatter = cfg.formatting_enabled.then(|| {
         GeminiFormatter::new(
             http.clone(),
@@ -2194,14 +2200,17 @@ fn transcribe_and_format(
         )
         // 共用クライアントの 60 秒より短く見切る。整形は待たせた分だけ
         // 体感を損ねる上、落ちても R2 で生転写に落ちるだけなので。
-        .with_timeout(format::FORMAT_TIMEOUT)
+        //
+        // **控えがあるなら短く見切り、試し直しもしない** (実測の根拠は
+        // `FORMAT_TIMEOUT_WITH_FALLBACK` の doc)。切られた分は控えが
+        // 0.5 秒で整形するので、失われるのは整形ではなく担当だけ。
+        .with_timeout(if has_fallback {
+            format::FORMAT_TIMEOUT_WITH_FALLBACK
+        } else {
+            format::FORMAT_TIMEOUT
+        })
+        .with_retry(!has_fallback)
     });
-    // 主が落ちた日に整形が丸ごと消えるのを防ぐ控え (R2 の 2 段目)。
-    // 整形自体が無効なら控えも要らない。
-    let fallback = cfg
-        .formatting_enabled
-        .then(|| build_fallback_formatter(&cfg, &http))
-        .flatten();
 
     // 挿入先に合う文体を選ぶ。
     let profile = style::match_profile(
