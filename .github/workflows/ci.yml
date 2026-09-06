@@ -3,8 +3,22 @@ name: CI
 on:
   push:
     branches: [main]
+    # 文書だけの変更で windows ランナー (無料枠 2 倍消費) を起こさない
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+      - 'LICENSE'
   pull_request:
     branches: [main]
+    # GitHub Actions は YAML のアンカー/エイリアスを解釈しないので直書きする
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+      - 'LICENSE'
+  # 枠が尽きたとき / 手元で確認したあとに任意で回すため
+  workflow_dispatch:
 
 # 同じブランチへの連続 push は古い方を止める (Windows ランナーは高くつく)。
 concurrency:
@@ -16,6 +30,9 @@ jobs:
     # このアプリは Win32 API (WH_KEYBOARD_LL / UIA / DWM) に直接依存するため、
     # ubuntu では cargo check すら通らない。windows-latest 一択。
     runs-on: windows-latest
+    # 付けていないと事故ったとき 6 時間回り続けて枠を溶かす。
+    # 実測は 1 回 10 分 (= 請求 20 分)。
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v4
