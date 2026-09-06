@@ -30,6 +30,28 @@ pub const DEFAULT_GROQ_ENDPOINT: &str = "https://api.groq.com/openai/v1/audio/tr
 pub const DEFAULT_GEMINI_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 pub const DEFAULT_STT_MODEL: &str = "whisper-large-v3";
 
+/// 整形の控え (Groq) の既定エンドポイント。**完全な URL**。
+///
+/// [`DEFAULT_GROQ_ENDPOINT`] から導出しないこと — あちらは
+/// transcriptions の完全な URL であってベース URL ではない。
+pub const DEFAULT_GROQ_CHAT_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
+
+/// 整形の控えの既定モデル。
+///
+/// # 実測 (2026-09-06、同一文の整形 / 数回ずつ)
+///
+/// | モデル | フィラー除去+言い直し解決 | 句読点なし119字 | 所要 |
+/// |---|---|---|---|
+/// | `openai/gpt-oss-120b` | 成功 | 句読点7・改行あり | 0.6〜1.3s |
+/// | **`openai/gpt-oss-20b`** | **成功 (最も原文に忠実)** | 句読点6 | 0.4〜0.6s |
+/// | `qwen/qwen3.8-27b` | 成功 | 句読点7 | 0.2〜0.3s |
+///
+/// 控えに求めるのは「主と同じ文体で、待たせずに返る」ことなので、
+/// 最速の qwen ではなく**最も原文に忠実**だった 20b を既定にする。
+/// いずれも推論モデルで、`max_tokens` に思考分を見込む必要がある
+/// ([`crate::format_groq`] のモジュール doc)。設定で差し替え可能。
+pub const DEFAULT_GROQ_FORMAT_MODEL: &str = "openai/gpt-oss-20b";
+
 /// 整形モデルの既定。
 ///
 /// # なぜ design.md の `gemini-2.5-flash` ではないか (実測 2026-08-17)
@@ -309,6 +331,26 @@ pub struct Config {
     pub gemini_endpoint: String,
     pub stt_model: String,
     pub format_model: String,
+    /// 主 (Gemini) が落ちたとき、控え (Groq) で整形をやり直すか。
+    ///
+    /// **既定は有効。** 2026-09-05 に Gemini の 503 が続き、その日の録音
+    /// 7 件すべてが整形されず生転写のままになった (design.md R2)。
+    /// 無効にすると従来どおり 1 段のまま、失敗は生転写へ落ちる。
+    ///
+    /// ⚠️ 有効な間は、整形プロンプト一式 (生転写・辞書・文体指示、および
+    /// deep context が ON なら**画面のテキスト**) が Groq へも行く。
+    /// 音声は既に Groq が受け取っているが、画面テキストは新規の送信先になる。
+    ///
+    /// フィールド単位の `#[serde(default = "...")]` が要る: 旧い設定ファイルに
+    /// この項目が無く、コンテナ側の default では拾えないため。
+    #[serde(default = "default_true")]
+    pub format_fallback_enabled: bool,
+    /// 控えの整形モデル ([`DEFAULT_GROQ_FORMAT_MODEL`])。
+    #[serde(default = "default_groq_format_model")]
+    pub groq_format_model: String,
+    /// 控えの chat/completions エンドポイント (**完全な URL**)。
+    #[serde(default = "default_groq_chat_endpoint")]
+    pub groq_chat_endpoint: String,
 }
 
 impl Default for Config {
@@ -361,6 +403,9 @@ impl Default for Config {
             gemini_endpoint: DEFAULT_GEMINI_ENDPOINT.to_string(),
             stt_model: DEFAULT_STT_MODEL.to_string(),
             format_model: DEFAULT_FORMAT_MODEL.to_string(),
+            format_fallback_enabled: true,
+            groq_format_model: DEFAULT_GROQ_FORMAT_MODEL.to_string(),
+            groq_chat_endpoint: DEFAULT_GROQ_CHAT_ENDPOINT.to_string(),
         }
     }
 }
@@ -514,6 +559,14 @@ fn default_sound_volume() -> u8 {
     crate::sound::DEFAULT_VOLUME
 }
 
+fn default_groq_format_model() -> String {
+    DEFAULT_GROQ_FORMAT_MODEL.to_string()
+}
+
+fn default_groq_chat_endpoint() -> String {
+    DEFAULT_GROQ_CHAT_ENDPOINT.to_string()
+}
+
 /// キャンセル音の既定。開始音と**別の音**にする (聞き分けが要る)。
 fn default_cancel_sound() -> SoundPreset {
     SoundPreset::Fall
@@ -618,6 +671,9 @@ pub struct ConfigView {
     pub typing_speed_chars_per_min: u32,
     pub stt_model: String,
     pub format_model: String,
+    /// 主が落ちたときに控え (Groq) で整形し直すか。
+    pub format_fallback_enabled: bool,
+    pub groq_format_model: String,
 }
 
 impl ConfigView {
@@ -690,6 +746,8 @@ impl ConfigView {
             typing_speed_chars_per_min: c.typing_speed_chars_per_min,
             stt_model: c.stt_model.clone(),
             format_model: c.format_model.clone(),
+            format_fallback_enabled: c.format_fallback_enabled,
+            groq_format_model: c.groq_format_model.clone(),
         }
     }
 }
@@ -746,6 +804,9 @@ pub struct ConfigPatch {
     pub format_model: Option<String>,
     pub groq_endpoint: Option<String>,
     pub gemini_endpoint: Option<String>,
+    pub format_fallback_enabled: Option<bool>,
+    pub groq_format_model: Option<String>,
+    pub groq_chat_endpoint: Option<String>,
 }
 
 impl fmt::Debug for ConfigPatch {
@@ -813,6 +874,9 @@ impl fmt::Debug for ConfigPatch {
             .field("format_model", &self.format_model)
             .field("groq_endpoint", &self.groq_endpoint)
             .field("gemini_endpoint", &self.gemini_endpoint)
+            .field("format_fallback_enabled", &self.format_fallback_enabled)
+            .field("groq_format_model", &self.groq_format_model)
+            .field("groq_chat_endpoint", &self.groq_chat_endpoint)
             .finish()
     }
 }
@@ -1237,6 +1301,15 @@ impl Config {
         }
         if let Some(v) = patch.gemini_endpoint {
             self.gemini_endpoint = non_empty_or(v, DEFAULT_GEMINI_ENDPOINT);
+        }
+        if let Some(v) = patch.format_fallback_enabled {
+            self.format_fallback_enabled = v;
+        }
+        if let Some(v) = patch.groq_format_model {
+            self.groq_format_model = non_empty_or(v, DEFAULT_GROQ_FORMAT_MODEL);
+        }
+        if let Some(v) = patch.groq_chat_endpoint {
+            self.groq_chat_endpoint = non_empty_or(v, DEFAULT_GROQ_CHAT_ENDPOINT);
         }
         if let Some(v) = patch.typing_speed_chars_per_min {
             self.typing_speed_chars_per_min = v;
@@ -2029,6 +2102,44 @@ mod tests {
         // 永久に機能が届かない。
         let cfg: Config = serde_json::from_str(r#"{"language":"ja"}"#).expect("読める");
         assert!(cfg.auto_learn_dictionary);
+    }
+
+    #[test]
+    fn the_format_fallback_is_on_by_default_with_the_measured_model() {
+        let cfg = Config::default();
+        assert!(cfg.format_fallback_enabled, "控えが既定で無効になっている");
+        assert_eq!(cfg.groq_format_model, "openai/gpt-oss-20b");
+        assert_eq!(
+            cfg.groq_chat_endpoint,
+            "https://api.groq.com/openai/v1/chat/completions"
+        );
+        // 転写のエンドポイントから導出していないこと (あちらは完全な URL)。
+        assert_ne!(cfg.groq_chat_endpoint, cfg.groq_endpoint);
+    }
+
+    #[test]
+    fn an_older_config_file_gets_the_format_fallback() {
+        // 項目が無い設定ファイル (この機能より前に書かれたもの) でも
+        // 既定が届くこと。ここが false / 空に化けると、既存ユーザーだけ
+        // 2026-09-05 と同じ全件生転写に戻る。
+        let cfg: Config = serde_json::from_str(r#"{"language":"ja"}"#).expect("読める");
+        assert!(cfg.format_fallback_enabled);
+        assert_eq!(cfg.groq_format_model, DEFAULT_GROQ_FORMAT_MODEL);
+        assert_eq!(cfg.groq_chat_endpoint, DEFAULT_GROQ_CHAT_ENDPOINT);
+    }
+
+    #[test]
+    fn the_fallback_model_and_endpoint_fall_back_to_defaults_when_blanked() {
+        let mut cfg = Config::default();
+        cfg.apply(ConfigPatch {
+            format_fallback_enabled: Some(false),
+            groq_format_model: Some("  ".to_string()),
+            groq_chat_endpoint: Some(String::new()),
+            ..ConfigPatch::default()
+        });
+        assert!(!cfg.format_fallback_enabled);
+        assert_eq!(cfg.groq_format_model, DEFAULT_GROQ_FORMAT_MODEL);
+        assert_eq!(cfg.groq_chat_endpoint, DEFAULT_GROQ_CHAT_ENDPOINT);
     }
 
     #[test]

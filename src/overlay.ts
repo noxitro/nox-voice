@@ -54,8 +54,14 @@ interface ErrorPayload {
 
 /** 整形の結末 (Rust: `pipeline::FormatOutcome`)。 */
 interface FormatOutcome {
-  kind: "formatted" | "raw_fallback" | "disabled";
-  /** `raw_fallback` のときだけ入る失敗理由。 */
+  /**
+   * `fallback_formatted` = 主 (Gemini) が落ちて控え (Groq) が整形した。
+   *
+   * **小窓は何も出さない。** 出力は良好で利用者に打つ手が無いため
+   * (`degraded` が false のまま来る)。履歴にはバッジと理由が残る。
+   */
+  kind: "formatted" | "fallback_formatted" | "raw_fallback" | "disabled";
+  /** `raw_fallback` なら失敗理由、`fallback_formatted` なら**主の**失敗理由。 */
   reason?: string;
 }
 

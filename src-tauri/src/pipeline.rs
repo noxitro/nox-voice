@@ -2,8 +2,9 @@
 //!
 //! # R2: 整形フォールバック (design.md)
 //!
-//! Gemini の失敗・タイムアウト・レート制限時は、生転写をそのまま採用して
-//! 続行する。整形が落ちても音声入力そのものは成立させる、という設計判断。
+//! 整形は 2 段になっている: 主 (Gemini) が落ちたら**副 (Groq) で整形を
+//! やり直し**、それも落ちたら生転写をそのまま採用して続行する。
+//! 整形が落ちても音声入力そのものは成立させる、という設計判断。
 //! どちらが採用されたかは [`FormatOutcome`] に残り、UI と (M4 の) 履歴で
 //! 参照できる — R5 (生転写の可視性) が成り立つのはこの記録があるため。
 //!
@@ -17,7 +18,11 @@ use std::time::Instant;
 use serde::Serialize;
 
 use crate::dictionary::{self, DictionaryEntry};
-use crate::format::{FormatError, FormatRequest, TextFormatter};
+use crate::format::{FormatRequest, TextFormatter};
+// 対応表を format 側へ移したので、本体で FormatError を名指しするのは
+// テストだけになった (整形の失敗はそのまま provider_reason へ渡す)。
+#[cfg(test)]
+use crate::format::FormatError;
 use crate::stt::{SpeechToText, SttError, TranscribeRequest};
 
 /// 整形の結末。どのテキストがなぜ採用されたかを保持する。
@@ -26,6 +31,17 @@ use crate::stt::{SpeechToText, SttError, TranscribeRequest};
 pub enum FormatOutcome {
     /// 整形に成功し、その結果を採用した。
     Formatted,
+    /// 主 (Gemini) が失敗し、**副 (Groq) が整形した**。
+    ///
+    /// `reason` は主の失敗理由。整形自体は成功しているので
+    /// [`Self::is_degraded`] は **false** — 出力の質は落ちていない。
+    ///
+    /// 判別子を明示するのは、履歴の `outcome` 列
+    /// ([`crate::history::OUTCOME_FALLBACK_FORMATTED`]) と UI のバッジ種別が
+    /// この文字列に揃っているため。variant 名から機械的に導くと、
+    /// **バッジが黙って未知の値になって前の録音の表示が残る**。
+    #[serde(rename = "fallback_formatted")]
+    FormattedByFallback { reason: String },
     /// 整形に失敗したので生転写を採用した (R2 劣化モード)。
     RawFallback { reason: String },
     /// 設定で整形が無効なので生転写を採用した。
@@ -34,6 +50,10 @@ pub enum FormatOutcome {
 
 impl FormatOutcome {
     /// 劣化モードで動いたか (UI の注意表示に使う)。
+    ///
+    /// **副で整形できた場合は真にしない。** 出力は主のときと同じ品質で、
+    /// ユーザーに打つ手も無い。「失敗は騒がしく」は**利用者が行動すべき
+    /// 失敗**についての原則であって、ここには当たらない (design.md)。
     pub fn is_degraded(&self) -> bool {
         matches!(self, FormatOutcome::RawFallback { .. })
     }
@@ -78,12 +98,15 @@ impl<'a> PipelineInput<'a> {
 /// WAV を転写し、必要なら整形する。
 ///
 /// `formatter` が `None` (整形無効・キー未設定) なら生転写を採用する。
+/// `fallback` は主が落ちたときだけ使う控えの整形器
+/// ([`format_with_fallback`])。`None` なら段は 1 つのまま。
 /// 整形が失敗しても [`Err`] にはせず、[`FormatOutcome::RawFallback`] で返す。
 /// [`Err`] になるのは STT が失敗したときだけ。
 pub fn run(
     input: &PipelineInput<'_>,
     stt: &dyn SpeechToText,
     formatter: Option<&dyn TextFormatter>,
+    fallback: Option<&dyn TextFormatter>,
 ) -> Result<PipelineResult, SttError> {
     // 辞書と画面コンテキストを STT のバイアスにも使う。
     // 誤変換を後から直すより、そもそも起こさせない方が確実。
@@ -114,19 +137,7 @@ pub fn run(
         app: input.app,
         context: input.context,
     };
-    let (text, outcome) = match formatter.format(&request) {
-        Ok(formatted) => (formatted, FormatOutcome::Formatted),
-        Err(e) => {
-            // R2: ここで失敗を握り潰さず、理由つきで生転写へ落とす。
-            log::warn!("整形に失敗したため生転写を採用します (劣化モード): {e}");
-            (
-                raw_text.clone(),
-                FormatOutcome::RawFallback {
-                    reason: degradation_reason(&e),
-                },
-            )
-        }
-    };
+    let (text, outcome) = format_with_fallback(formatter, fallback, &request, &raw_text);
     let format_ms = format_started.elapsed().as_millis() as u64;
 
     Ok(PipelineResult {
@@ -138,26 +149,78 @@ pub fn run(
     })
 }
 
-/// 劣化理由をユーザー向けの短い文にする。
+/// 主 → 副 → 生転写、の連鎖 (純関数)。
 ///
-/// 「何が起きたか」より「どうすればよいか」が伝わる粒度にする。
-fn degradation_reason(error: &FormatError) -> String {
-    match error {
-        FormatError::MissingApiKey => "Gemini の API キーが未設定です".to_string(),
-        FormatError::Unauthorized(_) => "Gemini の認証に失敗しました".to_string(),
-        FormatError::RateLimited(_) => "Gemini のレート制限に達しました".to_string(),
-        FormatError::Timeout => "Gemini の応答がタイムアウトしました".to_string(),
-        FormatError::Network(_) => "Gemini へ接続できませんでした".to_string(),
-        FormatError::Server { status, .. } => format!("Gemini のサーバエラー ({status})"),
-        FormatError::Http { status, .. } => format!("Gemini がエラーを返しました ({status})"),
-        FormatError::Blocked(reason) => format!("Gemini が応答を生成しませんでした ({reason})"),
-        FormatError::Decode(_) => "Gemini の応答を解釈できませんでした".to_string(),
-        FormatError::Empty => "Gemini の応答が空でした".to_string(),
-        FormatError::Incomplete { reason } => {
-            format!("Gemini の生成が途中で終わりました ({reason})")
+/// 段が増えたぶんだけ「なぜこうなったか」が複雑になるので、
+/// 分岐を [`run`] の中に散らさず 1 か所に閉じ込める。
+///
+/// - 主が成功 → [`FormatOutcome::Formatted`]。**副は呼ばない**
+/// - 主が失敗 + 副が成功 → [`FormatOutcome::FormattedByFallback`] (劣化ではない)
+/// - 両方失敗 → [`FormatOutcome::RawFallback`]。理由は**両方**書く。
+///   片方しか書かないと、次に同じことが起きたときどちらが原因か追えない
+/// - 副が無い (無効・キー未設定) → 従来どおり主の理由だけの `RawFallback`
+pub fn format_with_fallback(
+    primary: &dyn TextFormatter,
+    fallback: Option<&dyn TextFormatter>,
+    request: &FormatRequest<'_>,
+    raw_text: &str,
+) -> (String, FormatOutcome) {
+    let primary_error = match primary.format(request) {
+        Ok(formatted) => return (formatted, FormatOutcome::Formatted),
+        Err(e) => e,
+    };
+    let primary_reason = degradation_reason(&primary_error, PRIMARY);
+
+    let Some(fallback) = fallback else {
+        // R2: ここで失敗を握り潰さず、理由つきで生転写へ落とす。
+        log::warn!("整形に失敗したため生転写を採用します (劣化モード): {primary_error}");
+        return (
+            raw_text.to_string(),
+            FormatOutcome::RawFallback {
+                reason: primary_reason,
+            },
+        );
+    };
+
+    match fallback.format(request) {
+        Ok(formatted) => {
+            // 出力は良好なので小窓は静かなままだが、**ログには残す**。
+            // 主が落ち続けていることに誰も気づかない状態を作らない。
+            log::warn!("主の整形が落ちたため控えで整形しました: {primary_reason}");
+            (
+                formatted,
+                FormatOutcome::FormattedByFallback {
+                    reason: primary_reason,
+                },
+            )
+        }
+        Err(fallback_error) => {
+            // `FormatError::Display` は文面に「Gemini」を焼き込んでいるので、
+            // 控えの失敗をそのまま `{fallback_error}` で出すと嘘になる。
+            // ログにも provider 名を付け替えた文を使う。
+            let fallback_reason = degradation_reason(&fallback_error, FALLBACK);
+            log::warn!(
+                "主も控えも整形に失敗したため生転写を採用します (劣化モード): \
+                 主={primary_reason} / 控え={fallback_reason}"
+            );
+            // 主の理由を**先頭**に置き、その後ろにだけ「:」を出す。
+            // 小窓は最初の「:」で切って 1 行に収める (design.md 2026-09-05)
+            // ので、順序を変えると表示が「主」だけになる。
+            (
+                raw_text.to_string(),
+                FormatOutcome::RawFallback {
+                    reason: format!("{primary_reason}。控えの{FALLBACK}も失敗: {fallback_reason}"),
+                },
+            )
         }
     }
 }
+
+/// 理由文に出す提供元の名前。**対応表は [`crate::format::provider_reason`]
+/// に置いてある** — 控え ([`crate::format_groq`]) のログも同じ文言を使うので、
+/// エラーから文への対応は `FormatError` の隣に 1 つだけ持つ。
+use crate::format::{provider_reason as degradation_reason, PROVIDER_GEMINI as PRIMARY,
+    PROVIDER_GROQ as FALLBACK};
 
 #[cfg(test)]
 mod tests {
@@ -246,7 +309,7 @@ mod tests {
     fn happy_path_uses_the_formatted_text() {
         let stt = FixedStt(Ok("えーと こんにちは"));
         let formatter = FixedFormatter::ok("こんにちは。");
-        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter)).expect("成功する");
+        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), None).expect("成功する");
 
         assert_eq!(result.raw_text, "えーと こんにちは");
         assert_eq!(result.text, "こんにちは。");
@@ -258,7 +321,7 @@ mod tests {
     fn raw_transcript_is_always_kept_for_r5() {
         let stt = FixedStt(Ok("生の転写"));
         let formatter = FixedFormatter::ok("整形後のテキスト");
-        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter)).expect("成功する");
+        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), None).expect("成功する");
         // 整形後を採用しても、生転写は照合用に残る (R5)。
         assert_eq!(result.raw_text, "生の転写");
         assert_ne!(result.raw_text, result.text);
@@ -269,7 +332,7 @@ mod tests {
         let stt = FixedStt(Ok("のっくすぼいす"));
         let formatter = FixedFormatter::ok("nox-voice");
         let dictionary = crate::dictionary::parse_entries(&["nox-voice".to_string()]);
-        run(&PipelineInput { wav: b"wav", language: "ja", dictionary: &dictionary, ..Default::default() }, &stt, Some(&formatter)).expect("成功する");
+        run(&PipelineInput { wav: b"wav", language: "ja", dictionary: &dictionary, ..Default::default() }, &stt, Some(&formatter), None).expect("成功する");
         assert_eq!(
             *formatter.last_dictionary.lock().expect("ロック"),
             dictionary
@@ -282,7 +345,7 @@ mod tests {
     fn format_failure_falls_back_to_the_raw_transcript() {
         let stt = FixedStt(Ok("生転写のテキスト"));
         let formatter = FixedFormatter::err(FormatError::RateLimited("quota".to_string()));
-        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter)).expect("STT は成功している");
+        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), None).expect("STT は成功している");
 
         assert_eq!(result.text, "生転写のテキスト", "生転写へ落ちていない");
         assert_eq!(result.raw_text, "生転写のテキスト");
@@ -313,7 +376,7 @@ mod tests {
         for error in errors {
             let stt = FixedStt(Ok("生転写"));
             let formatter = FixedFormatter::err(error.clone());
-            let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter))
+            let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), None)
                 .unwrap_or_else(|e| panic!("{error:?} で Err になった: {e}"));
             assert_eq!(result.text, "生転写", "{error:?} で生転写に落ちていない");
             assert!(result.outcome.is_degraded(), "{error:?}");
@@ -332,7 +395,7 @@ mod tests {
         let formatter = FixedFormatter::err(FormatError::Incomplete {
             reason: "MAX_TOKENS".to_string(),
         });
-        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter)).expect("STT は成功");
+        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), None).expect("STT は成功");
 
         assert_eq!(
             result.text, "長い発話の生転写がここに入る",
@@ -351,7 +414,7 @@ mod tests {
     #[test]
     fn formatting_disabled_skips_the_formatter_entirely() {
         let stt = FixedStt(Ok("生転写のみ"));
-        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, None).expect("成功する");
+        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, None, None).expect("成功する");
         assert_eq!(result.text, "生転写のみ");
         assert_eq!(result.outcome, FormatOutcome::Disabled);
         assert!(!result.outcome.is_degraded(), "無効化は劣化ではない");
@@ -362,7 +425,7 @@ mod tests {
     fn missing_gemini_key_degrades_with_an_actionable_reason() {
         let stt = FixedStt(Ok("生転写"));
         let formatter = FixedFormatter::err(FormatError::MissingApiKey);
-        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter)).expect("STT は成功");
+        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), None).expect("STT は成功");
         match result.outcome {
             FormatOutcome::RawFallback { reason } => {
                 assert!(reason.contains("API キー"), "{reason}");
@@ -371,13 +434,137 @@ mod tests {
         }
     }
 
+    // --- 控え (副) の整形器 ---
+
+    /// 呼ばれたら落ちる二重体。「呼ばれていない」を確かめるために使う。
+    ///
+    /// 呼び出し回数の照合でも書けるが、panic なら**どのテストで**
+    /// 余計に呼んだかがそのまま出る。
+    struct NeverCalledFormatter;
+
+    impl TextFormatter for NeverCalledFormatter {
+        fn format(&self, _request: &FormatRequest<'_>) -> Result<String, FormatError> {
+            panic!("主が成功したのに控えが呼ばれた");
+        }
+    }
+
+    #[test]
+    fn the_fallback_is_not_called_when_the_primary_succeeds() {
+        let stt = FixedStt(Ok("えーと こんにちは"));
+        let primary = FixedFormatter::ok("こんにちは。");
+        let result = run(
+            &PipelineInput::new(b"wav", "ja"),
+            &stt,
+            Some(&primary),
+            Some(&NeverCalledFormatter),
+        )
+        .expect("成功する");
+        assert_eq!(result.text, "こんにちは。");
+        assert_eq!(result.outcome, FormatOutcome::Formatted);
+    }
+
+    #[test]
+    fn the_fallback_formats_when_the_primary_fails() {
+        let stt = FixedStt(Ok("えーと こんにちは"));
+        let primary = FixedFormatter::err(FormatError::Server {
+            status: 503,
+            body: "overloaded".into(),
+        });
+        let fallback = FixedFormatter::ok("こんにちは。");
+        let result = run(
+            &PipelineInput::new(b"wav", "ja"),
+            &stt,
+            Some(&primary),
+            Some(&fallback),
+        )
+        .expect("成功する");
+
+        assert_eq!(result.text, "こんにちは。", "控えの出力が採用されていない");
+        assert_eq!(fallback.calls(), 1);
+        match result.outcome {
+            FormatOutcome::FormattedByFallback { reason } => {
+                assert!(reason.contains("Gemini"), "主の失敗理由が残っていない: {reason}");
+                assert!(reason.contains("503"), "{reason}");
+            }
+            other => panic!("控えでの整形になっていない: {other:?}"),
+        }
+    }
+
+    /// 控えで整形できたのは**劣化ではない**。出力の質は落ちていないので、
+    /// 小窓の注意表示 (`is_degraded`) を出さない。
+    #[test]
+    fn formatting_by_the_fallback_is_not_a_degradation() {
+        let outcome = FormatOutcome::FormattedByFallback {
+            reason: "Gemini のサーバエラー (503)".to_string(),
+        };
+        assert!(!outcome.is_degraded());
+    }
+
+    #[test]
+    fn both_failing_reports_both_reasons() {
+        let stt = FixedStt(Ok("生転写のテキスト"));
+        let primary = FixedFormatter::err(FormatError::Server {
+            status: 503,
+            body: "overloaded".into(),
+        });
+        let fallback = FixedFormatter::err(FormatError::Unauthorized("bad key".into()));
+        let result = run(
+            &PipelineInput::new(b"wav", "ja"),
+            &stt,
+            Some(&primary),
+            Some(&fallback),
+        )
+        .expect("STT は成功している");
+
+        assert_eq!(result.text, "生転写のテキスト", "生転写へ落ちていない");
+        assert!(result.outcome.is_degraded());
+        match result.outcome {
+            FormatOutcome::RawFallback { reason } => {
+                // 片方しか書かないと、どちらが原因か後から追えない。
+                assert!(reason.contains("Gemini"), "主の理由が無い: {reason}");
+                assert!(reason.contains("503"), "{reason}");
+                assert!(reason.contains("Groq"), "控えの理由が無い: {reason}");
+                assert!(reason.contains("認証"), "{reason}");
+                // 小窓は最初の「:」で切るので、そこまでに主の理由が収まること。
+                let first_line = reason.split(':').next().unwrap_or_default();
+                assert!(first_line.contains("Gemini"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn without_a_fallback_the_behaviour_is_unchanged() {
+        let stt = FixedStt(Ok("生転写のテキスト"));
+        let primary = FixedFormatter::err(FormatError::RateLimited("quota".into()));
+        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&primary), None)
+            .expect("STT は成功している");
+        assert_eq!(result.text, "生転写のテキスト");
+        match result.outcome {
+            FormatOutcome::RawFallback { reason } => {
+                assert_eq!(reason, "Gemini のレート制限に達しました");
+                assert!(!reason.contains("Groq"), "控えが無いのに言及している: {reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 副の失敗理由に「Gemini の…」と書かない (それは嘘になる)。
+    #[test]
+    fn the_reason_names_the_provider_that_actually_failed() {
+        assert_eq!(
+            degradation_reason(&FormatError::Timeout, FALLBACK),
+            "Groq の応答がタイムアウトしました"
+        );
+    }
+
     // --- STT の失敗は劣化できない ---
 
     #[test]
     fn stt_failure_propagates_and_skips_formatting() {
         let stt = FixedStt(Err(SttError::MissingApiKey));
         let formatter = FixedFormatter::ok("呼ばれないはず");
-        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter));
+        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), None);
         assert_eq!(result, Err(SttError::MissingApiKey));
         assert_eq!(formatter.calls(), 0, "STT 失敗後に整形を呼んでいる");
     }
@@ -385,7 +572,7 @@ mod tests {
     #[test]
     fn stt_timeout_propagates() {
         let stt = FixedStt(Err(SttError::Timeout));
-        assert_eq!(run(&PipelineInput::new(b"wav", "ja"), &stt, None), Err(SttError::Timeout));
+        assert_eq!(run(&PipelineInput::new(b"wav", "ja"), &stt, None, None), Err(SttError::Timeout));
     }
 
     #[test]
@@ -393,7 +580,7 @@ mod tests {
         let stt = FixedStt(Err(SttError::Empty));
         let formatter = FixedFormatter::ok("呼ばれないはず");
         assert_eq!(
-            run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter)),
+            run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), None),
             Err(SttError::Empty)
         );
         assert_eq!(formatter.calls(), 0);
@@ -445,7 +632,7 @@ mod tests {
         };
         let wav = crate::stt::japanese_sample_wav();
 
-        let result = run(&PipelineInput::new(&wav, "ja"), &stt, Some(&formatter))
+        let result = run(&PipelineInput::new(&wav, "ja"), &stt, Some(&formatter), None)
             .expect("通しで成功する");
         println!("生転写: {:?}", result.raw_text);
         println!("整形後: {:?}", result.text);
@@ -496,6 +683,7 @@ mod tests {
             },
             &stt,
             Some(&formatter),
+            None,
         )
         .expect("通しで成功する");
 
@@ -547,6 +735,7 @@ mod tests {
             },
             &stt,
             Some(&formatter),
+            None,
         )
         .expect("通しで成功する");
 
@@ -599,6 +788,7 @@ mod tests {
             },
             &stt,
             Some(&formatter),
+            None,
         )
         .expect("通しで成功する");
 
@@ -634,7 +824,7 @@ mod tests {
         };
         let wav = crate::stt::japanese_sample_wav();
 
-        let result = run(&PipelineInput::new(&wav, "ja"), &stt, Some(&formatter))
+        let result = run(&PipelineInput::new(&wav, "ja"), &stt, Some(&formatter), None)
             .expect("STT は成功する");
         println!("生転写: {:?}", result.raw_text);
         println!("採用  : {:?}", result.text);
@@ -675,6 +865,7 @@ mod tests {
             },
             &spy,
             None,
+            None,
         )
         .expect("成功する");
 
@@ -690,7 +881,7 @@ mod tests {
         let spy = PromptSpy {
             prompt: std::sync::Mutex::new(None),
         };
-        run(&PipelineInput::new(b"wav", "ja"), &spy, None).expect("成功する");
+        run(&PipelineInput::new(b"wav", "ja"), &spy, None, None).expect("成功する");
         assert_eq!(*spy.prompt.lock().expect("ロック"), None);
     }
 
@@ -709,6 +900,7 @@ mod tests {
             },
             &stt,
             Some(&formatter),
+            None,
         )
         .expect("成功する");
 
@@ -731,5 +923,13 @@ mod tests {
         })
         .expect("シリアライズ");
         assert_eq!(json, r#"{"kind":"raw_fallback","reason":"理由"}"#);
+        // 履歴の outcome 列 (history::OUTCOME_FALLBACK_FORMATTED) と
+        // UI のバッジ種別がこの文字列に揃っている。ここがずれると、
+        // バッジが未知の値になって前の録音の表示が残る。
+        let json = serde_json::to_string(&FormatOutcome::FormattedByFallback {
+            reason: "理由".to_string(),
+        })
+        .expect("シリアライズ");
+        assert_eq!(json, r#"{"kind":"fallback_formatted","reason":"理由"}"#);
     }
 }

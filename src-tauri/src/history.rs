@@ -84,6 +84,13 @@ impl std::error::Error for HistoryError {}
 /// Rust の enum 定義に引きずられないよう、変換をここに閉じ込める。
 pub const OUTCOME_FORMATTED: &str = "formatted";
 pub const OUTCOME_RAW_FALLBACK: &str = "raw_fallback";
+/// 主 (Gemini) が落ち、**控え (Groq) が整形した**行。
+///
+/// `formatted` とも `raw_fallback` とも別の値にする — 整形はできているので
+/// 劣化ではないが、主が落ちた日を後から数えられないと 2026-09-05 の
+/// 「7 件すべて生転写」のような障害に気づけない。
+/// 値は [`crate::pipeline::FormatOutcome`] の serde 判別子と揃えてある。
+pub const OUTCOME_FALLBACK_FORMATTED: &str = "fallback_formatted";
 pub const OUTCOME_DISABLED: &str = "disabled";
 /// STT がまだ通っていない行 (失敗 WAV の取り込み)。
 pub const OUTCOME_UNTRANSCRIBED: &str = "untranscribed";

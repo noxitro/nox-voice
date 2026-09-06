@@ -27,6 +27,8 @@ interface SessionSummary {
 /** Rust 側 `pipeline::FormatOutcome` と対応 (serde の内部タグ表現)。 */
 type FormatOutcome =
   | { kind: "formatted" }
+  /** 主 (Gemini) が落ちて控え (Groq) が整形した。`reason` は**主の**失敗理由。 */
+  | { kind: "fallback_formatted"; reason: string }
   | { kind: "raw_fallback"; reason: string }
   | { kind: "disabled" };
 
@@ -207,6 +209,9 @@ interface ConfigView {
   typing_speed_chars_per_min: number;
   stt_model: string;
   format_model: string;
+  /** 主が落ちたとき控え (Groq) で整形し直すか。 */
+  format_fallback_enabled: boolean;
+  groq_format_model: string;
 }
 
 /**
@@ -442,6 +447,11 @@ function renderResult(r: ResultPayload) {
         badge.textContent = "整形済み";
         badge.dataset.kind = "formatted";
         break;
+      case "fallback_formatted":
+        // 整形はできている (劣化ではない) ので、注意の琥珀とは別の色にする。
+        badge.textContent = "控えで整形";
+        badge.dataset.kind = "fallback";
+        break;
       case "raw_fallback":
         badge.textContent = "劣化モード";
         badge.dataset.kind = "degraded";
@@ -455,6 +465,11 @@ function renderResult(r: ResultPayload) {
   if (note) {
     if (r.outcome.kind === "raw_fallback") {
       note.textContent = `整形できなかったため生転写を採用しました: ${r.outcome.reason}`;
+      note.hidden = false;
+    } else if (r.outcome.kind === "fallback_formatted") {
+      // 出力は良好なので小窓は黙っているが、ここでは主が落ちたことを言う。
+      // 主の障害が続いていることに気づける場所を 1 つは残す。
+      note.textContent = `主の整形が使えなかったため控えで整形しました: ${r.outcome.reason}`;
       note.hidden = false;
     } else {
       note.hidden = true;
@@ -653,6 +668,10 @@ function renderConfig(view: ConfigView) {
   if (language) language.value = view.language;
   const formatting = el<HTMLInputElement>("formatting-enabled");
   if (formatting) formatting.checked = view.formatting_enabled;
+  const formatFallback = el<HTMLInputElement>("format-fallback-enabled");
+  if (formatFallback) formatFallback.checked = view.format_fallback_enabled;
+  const groqFormatModel = el<HTMLInputElement>("groq-format-model");
+  if (groqFormatModel) groqFormatModel.value = view.groq_format_model;
   const injection = el<HTMLInputElement>("injection-enabled");
   if (injection) injection.checked = view.injection_enabled;
   const restoreDelay = el<HTMLInputElement>("restore-delay");
@@ -1189,6 +1208,8 @@ async function saveSettings(event: Event) {
   const retention = el<HTMLInputElement>("history-retention");
   const deepContext = el<HTMLInputElement>("deep-context");
   const autoLearn = el<HTMLInputElement>("auto-learn");
+  const formatFallback = el<HTMLInputElement>("format-fallback-enabled");
+  const groqFormatModel = el<HTMLInputElement>("groq-format-model");
   const screenAsk = el<HTMLInputElement>("screen-ask-enabled");
   const overlayEnabled = el<HTMLInputElement>("overlay-enabled");
   const startHidden = el<HTMLInputElement>("start-hidden");
@@ -1213,6 +1234,12 @@ async function saveSettings(event: Event) {
   const patch: Record<string, unknown> = {
     language: language?.value ?? "",
     formatting_enabled: formatting?.checked ?? true,
+    // 既定は有効。要素が見つからないときに false を送ると、UI の事故で
+    // 控えが黙って切れ、Gemini が落ちた日に整形が丸ごと消える。
+    format_fallback_enabled: formatFallback?.checked ?? true,
+    // 空文字は Rust 側 (`non_empty_or`) が既定へ倒す。入力欄が無いときだけ
+    // 未指定にして、現在値を据え置く。
+    ...(groqFormatModel ? { groq_format_model: groqFormatModel.value } : {}),
     injection_enabled: injection?.checked ?? true,
     history_enabled: historyEnabled?.checked ?? true,
     deep_context: deepContext?.checked ?? false,
@@ -1305,6 +1332,7 @@ async function saveSettings(event: Event) {
 /** 履歴の結末バッジ。 */
 const OUTCOME_BADGE: Record<string, string> = {
   formatted: "整形済",
+  fallback_formatted: "控えで整形",
   raw_fallback: "劣化",
   disabled: "整形オフ",
   untranscribed: "未転写",
@@ -1352,12 +1380,16 @@ function buildHistoryItem(row: SessionRow): HTMLLIElement {
 
   const badge = document.createElement("span");
   badge.className = "badge";
+  // 控えで整形できた行は `formatted` でも `degraded` でもない第 3 の見た目。
+  // 出力は良好なので注意の琥珀は嘘になり、かといって主が落ちた事実は残る。
   badge.dataset.kind =
     row.outcome === "formatted"
       ? "formatted"
-      : row.outcome === "untranscribed"
-        ? "untranscribed"
-        : "degraded";
+      : row.outcome === "fallback_formatted"
+        ? "fallback"
+        : row.outcome === "untranscribed"
+          ? "untranscribed"
+          : "degraded";
   badge.textContent = OUTCOME_BADGE[row.outcome] ?? row.outcome;
 
   const preview = document.createElement("span");

@@ -389,6 +389,24 @@
                   <input type="checkbox" id="formatting-enabled" />
                   <span>LLM で整形する(オフなら生転写をそのまま使う)</span>
                 </label>
+                <label class="checkbox">
+                  <input type="checkbox" id="format-fallback-enabled" />
+                  <span>Gemini が使えないときは Groq で整形する(控え)</span>
+                </label>
+                <p class="hint">
+                  <strong>控えへ送るのは整形の指示一式</strong>です。生転写・辞書・文体指示に
+                  加え、画面コンテキストがオンなら<strong>画面のテキストも Groq へ送られます</strong>。
+                  音声は既に Groq(音声認識)へ送っていますが、画面のテキストは新しい送信先に
+                  なります。オフにすると、Gemini が落ちたときは生転写がそのまま使われます。
+                </p>
+                <label class="field">
+                  <span>控えの整形モデル</span>
+                  <input type="text" id="groq-format-model" placeholder="openai/gpt-oss-20b" />
+                  <small class="field-note"
+                    >空にすると既定(<code>openai/gpt-oss-20b</code>)に戻ります。推論モデルなので、
+                    変更したら所要時間を必ず実測してください。</small
+                  >
+                </label>
               </div>
             </div>
 

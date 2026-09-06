@@ -29,7 +29,7 @@ Aqua Voice / Typeless の再現を個人利用向けに無料枠APIのみで実�
 ## Capabilities and Constraints
 
 - STT: Groq無料枠(日本語)。ローカルフォールバック: kotoba-whisper GGML(feature local-stt、モデルは設定からDL)。「ローカルのみ」モード時は音声を外部送信しない
-- 整形: Gemini無料枠 `gemini-flash-lite-latest`。失敗時は生転写挿入の劣化モード常設
+- 整形: Gemini無料枠 `gemini-flash-lite-latest`。落ちたときは控えのGroq(`openai/gpt-oss-20b`、既定ON・設定で変更可)で整形し直し、それも落ちれば生転写挿入の劣化モード常設
 - プライバシー制約: Gemini無料枠の規約リスクはユーザー受容済み(docs/design.md R1)。deep contextは既定OFF・履歴非保存。履歴DB(SQLite)はローカルのみ、保持期限設定あり
 - UIスタック: Tauri v2 + vanilla-ts(フレームワーク無し)。ウィンドウ: main(設定+履歴)/ overlay(状態ピル)
 - 技術的正典: docs/design.md(設計要件R1〜R7と実測知見)。UI変更はR7(フォーカス非奪取)等の不変条件を壊さないこと

@@ -148,6 +148,10 @@
           typing_speed_chars_per_min: 300,
           stt_model: "whisper-large-v3-turbo",
           format_model: "gemini-2.5-flash",
+          // 控え (Groq) の整形。既定 ON なので、ここを false にすると
+          // 「既定 ON」の検査ができなくなる (自動学習と同じ理由)。
+          format_fallback_enabled: true,
+          groq_format_model: "openai/gpt-oss-20b",
         };
 
         /** SoundPreset::id() / label() と同じ並び (src-tauri/src/sound.rs)。 */

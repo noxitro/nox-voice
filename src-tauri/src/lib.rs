@@ -33,6 +33,7 @@ mod dictionary;
 mod focus_probe;
 mod foreground;
 mod format;
+mod format_groq;
 mod history;
 mod hotkey;
 mod inject;
@@ -68,6 +69,7 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, Wry};
 use audio::Recorder;
 use config::{ConfigPatch, ConfigStore, ConfigView};
 use format::{GeminiFormatter, ScreenAnswerer};
+use format_groq::GroqFormatter;
 use history::{DashboardStats, HistoryStore, SessionDraft, SessionRow};
 use hotkey::{HookHandle, HotkeyAction, HotkeyMode, PttInterpreter, HOTKEY_SLOTS, TAP_THRESHOLD};
 use inject::{ClipboardState, InjectOutcome, InjectTarget};
@@ -2128,6 +2130,37 @@ fn finalize_one(job: FinalizeJob) -> Result<FinalizedRecording, String> {
     })
 }
 
+/// 整形の**控え** (Groq) を組み立てる。無効・キー未設定なら `None`。
+///
+/// 主と副の対を 2 か所で書かないためのヘルパ。新規録音と再転写で
+/// 組み立てがずれると、**片方だけ控えが効かない**という追いにくい差になる
+/// (STT の経路で実際にやった過ちと同じ形。design.md 2026-08-31)。
+///
+/// キーは [`config::Config::groq_key`] — 環境変数優先で、STT と同じ経路。
+fn build_fallback_formatter(
+    cfg: &config::Config,
+    client: &reqwest::blocking::Client,
+) -> Option<GroqFormatter> {
+    if !cfg.format_fallback_enabled {
+        return None;
+    }
+    // 主と違い、キーが無いなら**作らない**。主は「キー未設定」を
+    // RawFallback の理由として見せたいが、控えの不在は理由ではない
+    // (主が成功していれば控えは呼ばれもしない)。
+    let key = cfg.groq_key().secret?;
+    Some(
+        GroqFormatter::new(
+            client.clone(),
+            &cfg.groq_chat_endpoint,
+            &cfg.groq_format_model,
+            key,
+        )
+        // 主の 20 秒を待った後にさらに 20 秒待たせない。主の側と同じく、
+        // 見切りの長さは呼び出し側に見えるところへ書く。
+        .with_timeout(format_groq::GROQ_FORMAT_TIMEOUT),
+    )
+}
+
 /// WAV を転写し、必要なら整形して結果を通知する。
 ///
 /// - 整形の失敗は [`pipeline::run`] が生転写へ落とす (R2 劣化モード)。
@@ -2155,7 +2188,7 @@ fn transcribe_and_format(
     // RawFallback(理由つき) として UI に出る。
     let formatter = cfg.formatting_enabled.then(|| {
         GeminiFormatter::new(
-            http,
+            http.clone(),
             cfg.gemini_url(),
             cfg.gemini_key().secret.unwrap_or_default(),
         )
@@ -2163,6 +2196,12 @@ fn transcribe_and_format(
         // 体感を損ねる上、落ちても R2 で生転写に落ちるだけなので。
         .with_timeout(format::FORMAT_TIMEOUT)
     });
+    // 主が落ちた日に整形が丸ごと消えるのを防ぐ控え (R2 の 2 段目)。
+    // 整形自体が無効なら控えも要らない。
+    let fallback = cfg
+        .formatting_enabled
+        .then(|| build_fallback_formatter(&cfg, &http))
+        .flatten();
 
     // 挿入先に合う文体を選ぶ。
     let profile = style::match_profile(
@@ -2201,8 +2240,9 @@ fn transcribe_and_format(
         context: screen_context.as_prompt_text(),
     };
     let formatter_ref = formatter.as_ref().map(|f| f as &dyn format::TextFormatter);
+    let fallback_ref = fallback.as_ref().map(|f| f as &dyn format::TextFormatter);
 
-    let outcome = run_stt_pipeline(app, &cfg, &input, formatter_ref);
+    let outcome = run_stt_pipeline(app, &cfg, &input, formatter_ref, fallback_ref);
 
     match outcome {
         Ok(result) => {
@@ -2398,7 +2438,9 @@ fn answer_screen_question(
         app: None,
         context: None,
     };
-    let transcript = match run_stt_pipeline(app, &cfg, &input, None) {
+    // 整形器を渡さないので控えも要らない (画面質問モードでは、発話は
+    // 整形せず「質問」として asker へ渡す)。
+    let transcript = match run_stt_pipeline(app, &cfg, &input, None, None) {
         Ok(result) => result,
         Err(e) => {
             let msg = format!("質問を聞き取れませんでした: {e}");
@@ -2684,13 +2726,14 @@ fn run_stt_pipeline(
     cfg: &config::Config,
     input: &pipeline::PipelineInput<'_>,
     formatter: Option<&dyn format::TextFormatter>,
+    fallback: Option<&dyn format::TextFormatter>,
 ) -> Result<pipeline::PipelineResult, stt::SttError> {
     let plan = local_stt::EnginePlan::from_mode(cfg.local_stt_mode);
 
     if !plan.use_cloud {
         // ローカルのみ: クラウドのクライアントを**作りもしない**。
         log::info!("ローカルのみモードのため、音声はクラウドへ送りません");
-        return run_with_local_stt(app, input, formatter, None);
+        return run_with_local_stt(app, input, formatter, fallback, None);
     }
 
     let Some(http) = app.state::<AppState>().http.clone() else {
@@ -2706,7 +2749,7 @@ fn run_stt_pipeline(
         cfg.groq_key().secret.unwrap_or_default(),
     );
 
-    match pipeline::run(input, &stt_client, formatter) {
+    match pipeline::run(input, &stt_client, formatter, fallback) {
         Err(e) if plan.use_local && local_stt::should_fall_back(&e) => {
             log::warn!("Groq が使えないためローカル認識へ切り替えます: {e}");
             notify(
@@ -2714,7 +2757,7 @@ fn run_stt_pipeline(
                 Notice::Informational,
                 "クラウド認識が使えないため、ローカルで認識します (時間がかかります)",
             );
-            run_with_local_stt(app, input, formatter, Some(&e))
+            run_with_local_stt(app, input, formatter, fallback, Some(&e))
         }
         other => other,
     }
@@ -2730,6 +2773,7 @@ fn run_with_local_stt(
     app: &AppHandle,
     input: &pipeline::PipelineInput<'_>,
     formatter: Option<&dyn format::TextFormatter>,
+    fallback: Option<&dyn format::TextFormatter>,
     cloud_error: Option<&stt::SttError>,
 ) -> Result<pipeline::PipelineResult, stt::SttError> {
     let models_dir = app.state::<AppState>().models_dir.clone();
@@ -2746,7 +2790,7 @@ fn run_with_local_stt(
     }
 
     let local = LocalStt { models_dir };
-    pipeline::run(input, &local, formatter)
+    pipeline::run(input, &local, formatter, fallback)
 }
 
 /// [`local_stt`] を [`stt::SpeechToText`] として使うためのラッパ。
@@ -2782,6 +2826,11 @@ fn record_history(
 
     let (outcome, reason) = match &payload.outcome {
         FormatOutcome::Formatted => (history::OUTCOME_FORMATTED, None),
+        // 主の失敗理由を残す。整形はできているので UI は静かだが、
+        // 「どの日に主が落ちていたか」を後から数えられるようにする。
+        FormatOutcome::FormattedByFallback { reason } => {
+            (history::OUTCOME_FALLBACK_FORMATTED, Some(reason.clone()))
+        }
         FormatOutcome::RawFallback { reason } => {
             (history::OUTCOME_RAW_FALLBACK, Some(reason.clone()))
         }
@@ -3297,16 +3346,21 @@ fn retranscribe(app: &AppHandle, id: i64) {
     let cfg = state.config.snapshot();
     // 整形はクラウドのみ。ローカルのみモードでも整形は使う
     // (テキストの送信は R1 で受容済み。**音声**を出さないことが要点)。
-    let formatter = match (cfg.formatting_enabled, state.http.clone()) {
-        (true, Some(http)) => Some(
-            GeminiFormatter::new(
-                http,
-                cfg.gemini_url(),
-                cfg.gemini_key().secret.unwrap_or_default(),
-            )
-            .with_timeout(format::FORMAT_TIMEOUT),
+    let (formatter, fallback) = match (cfg.formatting_enabled, state.http.clone()) {
+        (true, Some(http)) => (
+            Some(
+                GeminiFormatter::new(
+                    http.clone(),
+                    cfg.gemini_url(),
+                    cfg.gemini_key().secret.unwrap_or_default(),
+                )
+                .with_timeout(format::FORMAT_TIMEOUT),
+            ),
+            // 新規録音と同じヘルパで組む。ここを別に書くと、
+            // 再転写でだけ控えが効かない差が黙って生まれる。
+            build_fallback_formatter(&cfg, &http),
         ),
-        _ => None,
+        _ => (None, None),
     };
 
     // 再転写では画面コンテキストを使わない。録音時の画面はもう無く、
@@ -3320,10 +3374,14 @@ fn retranscribe(app: &AppHandle, id: i64) {
         &cfg,
         &input,
         formatter.as_ref().map(|f| f as &dyn format::TextFormatter),
+        fallback.as_ref().map(|f| f as &dyn format::TextFormatter),
     ) {
         Ok(result) => {
             let (outcome, reason) = match &result.outcome {
                 FormatOutcome::Formatted => (history::OUTCOME_FORMATTED, None),
+                FormatOutcome::FormattedByFallback { reason } => {
+                    (history::OUTCOME_FALLBACK_FORMATTED, Some(reason.clone()))
+                }
                 FormatOutcome::RawFallback { reason } => {
                     (history::OUTCOME_RAW_FALLBACK, Some(reason.clone()))
                 }

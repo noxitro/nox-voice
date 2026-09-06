@@ -23,7 +23,11 @@ use crate::config::Secret;
 use crate::dictionary::DictionaryEntry;
 
 /// 再試行前の待ち時間。
-const RETRY_BACKOFF: Duration = Duration::from_millis(500);
+///
+/// 副の整形器 ([`crate::format_groq`]) も同じ間合いを使う。「何秒待って
+/// 1 回だけ試し直す」は整形という工程の性質から来る判断であって、
+/// 提供元ごとに違う理由が無い。
+pub(crate) const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 /// エラー本文をログ/UI へ載せる際の最大長。
 const MAX_ERROR_BODY: usize = 400;
 /// 整形は体感速度に直結するので STT より短く見切る。
@@ -223,7 +227,50 @@ impl TextFormatter for GeminiFormatter {
     }
 }
 
-fn is_retryable(error: &FormatError) -> bool {
+/// 理由文に出す提供元の名前。
+///
+/// [`provider_reason`] に渡す。文字列を各所で直書きすると、
+/// 表記ゆれ (`Groq` / `groq`) が理由文に出る。
+pub(crate) const PROVIDER_GEMINI: &str = "Gemini";
+pub(crate) const PROVIDER_GROQ: &str = "Groq";
+
+/// 失敗を**利用者向けの短い文**にする。「何が起きたか」より
+/// 「どうすればよいか」が伝わる粒度にする。
+///
+/// # なぜ `Display` と別に持つか
+///
+/// [`FormatError`] の `Display` は文面に「Gemini」を焼き込んでいる。
+/// 整形器が主 (Gemini) と副 ([`crate::format_groq`]) の 2 つになった以上、
+/// **`Display` をそのままログや UI へ出すと、控えの失敗が「Gemini の…」と
+/// 表示されて端的に嘘になる**。提供元を引数に取るこちらを使うこと。
+///
+/// `Display` 側を書き換えないのは、あちらが API 応答の本文まで含む
+/// 開発者向けの詳細表示であり、用途が違うため。
+pub(crate) fn provider_reason(error: &FormatError, provider: &str) -> String {
+    match error {
+        FormatError::MissingApiKey => format!("{provider} の API キーが未設定です"),
+        FormatError::Unauthorized(_) => format!("{provider} の認証に失敗しました"),
+        FormatError::RateLimited(_) => format!("{provider} のレート制限に達しました"),
+        FormatError::Timeout => format!("{provider} の応答がタイムアウトしました"),
+        FormatError::Network(_) => format!("{provider} へ接続できませんでした"),
+        FormatError::Server { status, .. } => format!("{provider} のサーバエラー ({status})"),
+        FormatError::Http { status, .. } => format!("{provider} がエラーを返しました ({status})"),
+        FormatError::Blocked(reason) => {
+            format!("{provider} が応答を生成しませんでした ({reason})")
+        }
+        FormatError::Decode(_) => format!("{provider} の応答を解釈できませんでした"),
+        FormatError::Empty => format!("{provider} の応答が空でした"),
+        FormatError::Incomplete { reason } => {
+            format!("{provider} の生成が途中で終わりました ({reason})")
+        }
+    }
+}
+
+/// 再試行して意味のある失敗か。
+///
+/// 主 (Gemini) と副 (Groq) で共有する。「混雑・不達は待てば直るが、
+/// 認証エラーや壊れた応答は何度投げても同じ」という判断に提供元差は無い。
+pub(crate) fn is_retryable(error: &FormatError) -> bool {
     matches!(
         error,
         FormatError::RateLimited(_)
@@ -368,8 +415,7 @@ pub fn system_prompt(request: &FormatRequest<'_>) -> String {
 /// 全モデルで通る最小構成に倒し、思考の制御はモデル選択で行う
 /// (待たせたくないなら `-flash-lite` 系を選ぶ)。
 pub fn build_request(request: &FormatRequest<'_>) -> Value {
-    // 本文にも見出しを付けて、システム指示の言う「データ部」と対応させる。
-    let body = format!("{SECTION_BODY}\n{}", sanitize_data(request.raw));
+    let body = user_message(request);
     json!({
         "systemInstruction": { "parts": [{ "text": system_prompt(request) }] },
         "contents": [{ "role": "user", "parts": [{ "text": body }] }],
@@ -382,6 +428,17 @@ pub fn build_request(request: &FormatRequest<'_>) -> Value {
     })
 }
 
+/// ユーザーロールへ載せる本文 (純関数)。
+///
+/// 見出しを付けて無害化まで済ませた形が「整形対象のテキスト」の正しい姿。
+/// [`system_prompt`] の【データ部の読み方】はこの形を前提に書かれているので、
+/// **素の `raw` を送る経路を作ってはいけない** — 見出し偽装への耐性が
+/// その経路でだけ静かに落ちる。主 (Gemini) と副 ([`crate::format_groq`]) で
+/// 同じものを通すために切り出してある。
+pub(crate) fn user_message(request: &FormatRequest<'_>) -> String {
+    format!("{SECTION_BODY}\n{}", sanitize_data(request.raw))
+}
+
 /// 入力長から `maxOutputTokens` を決める。
 ///
 /// 整形後の長さは入力とほぼ同じだが、既定値のままだと長い発話で
@@ -392,7 +449,7 @@ pub fn build_request(request: &FormatRequest<'_>) -> Value {
 /// 倍率が大きいのは、**thinking 系モデルでは思考トークンもこの枠を食う**ため。
 /// 日本語は 1 文字あたりおよそ 1 トークン前後なので、文字数の 8 倍を目安に、
 /// 短文でも下限を確保しつつ上限で青天井を防ぐ。
-fn max_output_tokens(raw: &str) -> u64 {
+pub(crate) fn max_output_tokens(raw: &str) -> u64 {
     const PER_CHAR: u64 = 8;
     const MIN: u64 = 2_048;
     const MAX: u64 = 65_536;
@@ -736,7 +793,7 @@ fn parse_response(body: &str, unwrap: Unwrap) -> Result<String, FormatError> {
 ///
 /// プロンプトで禁じてはいるが、守られなかったときにバッククォートで
 /// 汚れたテキストがそのまま挿入されるのは避けたい。
-fn strip_wrapping(text: &str) -> String {
+pub(crate) fn strip_wrapping(text: &str) -> String {
     let mut s = text.trim();
 
     if s.starts_with("```") {
@@ -765,7 +822,12 @@ fn strip_wrapping(text: &str) -> String {
     s.to_string()
 }
 
-fn classify_status(status: u16, body: &str) -> FormatError {
+/// HTTP ステータスを [`FormatError`] へ落とす。
+///
+/// 主 (Gemini) と副 ([`crate::format_groq`]) で共有する。どちらも
+/// OpenAI/Google 系の慣習どおり 401/403 が認証、429 がレート制限、
+/// 5xx がサーバ側の不調なので、判断を 2 度書く理由が無い。
+pub(crate) fn classify_status(status: u16, body: &str) -> FormatError {
     let body = truncate_body(body);
     match status {
         401 | 403 => FormatError::Unauthorized(body),
@@ -775,7 +837,8 @@ fn classify_status(status: u16, body: &str) -> FormatError {
     }
 }
 
-fn classify_transport_error(error: reqwest::Error) -> FormatError {
+/// reqwest の送信失敗を [`FormatError`] へ落とす (主・副で共有)。
+pub(crate) fn classify_transport_error(error: reqwest::Error) -> FormatError {
     if error.is_timeout() {
         FormatError::Timeout
     } else {
@@ -783,7 +846,16 @@ fn classify_transport_error(error: reqwest::Error) -> FormatError {
     }
 }
 
-fn truncate_body(body: &str) -> String {
+/// 実 API テストで使う共通の生転写サンプル。
+///
+/// 主 (Gemini) と副 ([`crate::format_groq`]) を**同じ文**で測るために
+/// ここに置く。別々の文で測ると、出力の差がモデルの差なのか入力の差なのか
+/// 分からなくなる。フィラー 2 種と言い直しが 1 つずつ入っている。
+#[cfg(test)]
+pub(crate) const LIVE_SAMPLE: &str =
+    "えーとですね、あのー、明日、いや明後日の会議なんですけど、資料の準備をお願いします";
+
+pub(crate) fn truncate_body(body: &str) -> String {
     let trimmed = body.trim();
     if trimmed.chars().count() <= MAX_ERROR_BODY {
         return trimmed.to_string();
@@ -1647,9 +1719,6 @@ fn main() {}
         let rendered = format!("{err} / {err:?}");
         assert!(!rendered.contains(key), "キーが漏れている: {rendered}");
     }
-
-    const LIVE_SAMPLE: &str =
-        "えーとですね、あのー、明日、いや明後日の会議なんですけど、資料の準備をお願いします";
 
     /// 実 API 疎通。`GEMINI_API_KEY` があるときだけ意味がある。
     #[test]

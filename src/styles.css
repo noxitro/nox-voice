@@ -391,6 +391,14 @@ h3 {
   color: var(--status-ok);
 }
 
+/* 控え (Groq) で整形できた行。琥珀の degraded とは**別の色**にする —
+   整形は成っていて出力の質は落ちていないので、注意の色は嘘になる。
+   かといって formatted と同じ緑にすると、主が落ちた事実が消える。 */
+.badge[data-kind="fallback"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
 .badge[data-kind="degraded"] {
   background: var(--status-processing-soft);
   color: var(--status-processing);
