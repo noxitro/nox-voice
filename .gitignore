@@ -22,3 +22,13 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# --- エージェント / ツールの作業ファイル ---
+# 公開リポジトリでうっかり `git add .` したときに、ローカルパスや
+# 作業メモが混ざらないようにする。clippy_output.json は
+# `C:\Users\<名前>\...` を大量に含むので特に危ない。
+.claude/
+.opencode/
+clippy_output.json
+workflow.config.json
+LOOP.md
