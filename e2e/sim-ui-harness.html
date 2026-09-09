@@ -121,6 +121,9 @@
           ],
           local_stt_mode: "fallback",
           start_hidden: true,
+          // 設定ファイル上の「意思」。UI はこれを見ない (実際の登録は
+          // get_autostart が返す) が、ConfigView にはあるので型どおり置く。
+          autostart: false,
           hotkey_vk: 0x20,
           hotkey_mods: [0xa2],
           hotkey_label: "左 Ctrl + Space",
@@ -197,6 +200,11 @@
           invokes: [],
           /** 直近の set_config パッチ。 */
           lastPatch: null,
+          /**
+           * スタートアップへの登録状態 (レジストリの模擬)。**config とは別物**。
+           * 実機でも 2 つはずれうるので、モックでも分けて持つ。
+           */
+          autostartEnabled: false,
           /** 辞書の何語まで `prompt` に載るか (模擬)。テストから変えられる。 */
           dictPromptCap: 2,
           /** get_history が返す件数。50 でページング条件を満たす。 */
@@ -363,6 +371,13 @@
                 mock.config.dictionary_status = dictStatus(mock.config.dictionary);
               }
               return Promise.resolve(structuredClone(mock.config));
+            case "get_autostart":
+              return Promise.resolve(mock.autostartEnabled);
+            case "set_autostart":
+              // Rust 側も登録してから読み直した値を返す。ここも同じ形にして、
+              // 「押した値をそのまま信じる」実装を通してしまわないようにする。
+              mock.autostartEnabled = args.enabled;
+              return Promise.resolve(mock.autostartEnabled);
             case "get_history": {
               const start = args.beforeId == null ? 1000 : args.beforeId - 1;
               const rows = [];

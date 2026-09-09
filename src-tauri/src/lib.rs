@@ -65,6 +65,9 @@ use crossbeam_channel::{Receiver, Sender};
 use serde::Serialize;
 use tauri::menu::MenuItem;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, Wry};
+// `app.autolaunch()` を生やす拡張トレイト。自動起動の登録状態は
+// このプラグイン経由でしか触らない (直接レジストリを書かない)。
+use tauri_plugin_autostart::ManagerExt;
 
 use audio::Recorder;
 use config::{ConfigPatch, ConfigStore, ConfigView};
@@ -1101,6 +1104,87 @@ fn show_window(app: AppHandle) {
     tray::show_main_window(&app);
 }
 
+/// PC 起動時の自動起動が**実際に**登録されているかを返す。
+///
+/// 返すのはレジストリ (`HKCU\...\Run`) の状態であって、設定ファイルの
+/// `autostart` ではない。利用者はタスクマネージャーの「スタートアップ アプリ」
+/// から登録を無効にできるので、この 2 つはずれる。UI に出すのは常にこちら
+/// ([`config::Config::autostart`] の doc)。
+///
+/// 読めなかったときは `Err`。false を返して「無効です」と見せてはいけない
+/// (PRODUCT.md「0 件と欠測を混同しない」)。
+#[tauri::command]
+fn get_autostart(app: AppHandle) -> Result<bool, String> {
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+/// 自動起動を登録 / 解除して、**登録後の実際の状態**を返す。
+///
+/// 失敗を握り潰さない。黙って失敗すると「設定したのに起動しない」になり、
+/// 利用者は次に PC を起こすまで気づけない。
+///
+/// 設定ファイルへ意思を書くのは**レジストリ側が成功したときだけ**。
+/// 逆順にすると、書けたのに登録できていない状態が残る。
+///
+/// **設定ファイルの保存に失敗しても `Ok` を返す。** レジストリが正典だと
+/// 決めた以上、既に登録が変わっているのに `Err` を返すと、UI はトグルを
+/// 元へ戻して**実態と違う表示**になる (「有効にしたのに無効と出る」)。
+/// 保存できなかったのは意思の記録だけで、自動起動自体は効いている。
+/// ログには残し、次回起動時の突き合わせ ([`reconcile_autostart`]) で
+/// 設定ファイルは実際の状態へ寄る。
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    let manager = app.autolaunch();
+    if enabled {
+        manager.enable().map_err(|e| e.to_string())?;
+    } else {
+        manager.disable().map_err(|e| e.to_string())?;
+    }
+    // 登録できたと言い張らず、その場で読み直した値を正とする。
+    let actual = manager.is_enabled().map_err(|e| e.to_string())?;
+    if let Err(e) = app.state::<AppState>().config.update(ConfigPatch {
+        autostart: Some(actual),
+        ..ConfigPatch::default()
+    }) {
+        // 登録自体は変わっている。ここで Err にすると表示だけが嘘になる。
+        log::warn!("自動起動の意思を設定ファイルへ保存できません (登録は変更済み): {e}");
+    }
+    log::info!("自動起動を{}にしました", if actual { "有効" } else { "無効" });
+    Ok(actual)
+}
+
+/// 起動時、設定ファイルの意思と実際の登録状態を突き合わせる。
+///
+/// **正典はレジストリ**。食い違っていたら設定ファイルのほうを実際の状態へ
+/// 合わせる。逆向き (実際の登録をやり直す) は、利用者が OS 側で切ったものを
+/// アプリが勝手に戻す行為で、PRODUCT.md「ユーザーの環境を壊さない」に反する。
+///
+/// 読めなかったときは**何もしない**。欠測を false と読んで意思を書き換えると、
+/// 一度の読み取り失敗で利用者の設定が静かに消える。
+fn reconcile_autostart(app: &AppHandle) {
+    let actual = match app.autolaunch().is_enabled() {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("自動起動の登録状態を読めません ({e})。設定はそのままにします");
+            return;
+        }
+    };
+    let state = app.state::<AppState>();
+    if state.config.snapshot().autostart == actual {
+        return;
+    }
+    log::info!(
+        "自動起動の設定 (意思) と実際の登録が食い違っています。実際の状態 ({}) に合わせます",
+        if actual { "有効" } else { "無効" }
+    );
+    if let Err(e) = state.config.update(ConfigPatch {
+        autostart: Some(actual),
+        ..ConfigPatch::default()
+    }) {
+        log::warn!("自動起動の設定を実際の状態へ合わせられません: {e}");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // **1 行目でやること**。Tauri のビルダーに触る前に名前付きミューテックスを取る。
@@ -1143,6 +1227,23 @@ pub fn run() {
         // 常駐運用ではウィンドウが閉じているので、行動を要する通知は
         // WebView イベントではなく OS トーストで出す必要がある。
         .plugin(tauri_plugin_notification::init())
+        // PC 起動時の自動起動 (Windows は `HKCU\...\Run` への登録)。
+        //
+        // **起動時引数は渡さない** (第 2 引数が None)。窓を出すかどうかは
+        // `start_hidden` が決めることで、引数で二重に表現すると、設定を変えても
+        // 効かない経路ができる。自動起動は「いつ起動するか」、`start_hidden` は
+        // 「起動したとき窓を出すか」で直交している。
+        //
+        // 第 1 引数の `MacosLauncher` は本アプリ (Windows 専用) では無関係だが
+        // API 上必須なので既定を渡す。
+        //
+        // 登録するかどうかは利用者が設定画面で選ぶ。既定は false
+        // (`Config::autostart` の doc)。ここで入れているのは機構だけで、
+        // プラグインを足しただけでは何も登録されない。
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(
             tauri_plugin_log::Builder::new()
                 // 既定は Info。フォーカス診断 (focus_probe) は debug なので
@@ -1194,7 +1295,9 @@ pub fn run() {
             delete_untranscribed,
             get_local_stt_status,
             download_local_model,
-            show_window
+            show_window,
+            get_autostart,
+            set_autostart
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -1239,6 +1342,15 @@ pub fn run() {
             // ウィンドウは tauri.conf.json で非表示にして作られる。
             // 「出してから隠す」と一瞬フラッシュするので、出す側を明示する。
             let first_run = handle.state::<AppState>().config.is_first_run();
+            // 設定ファイルの意思と、実際の登録状態を突き合わせる。正典は
+            // レジストリ側 (この関数の doc)。
+            //
+            // **初回判定を読んだ後でなければならない。** 突き合わせは設定
+            // ファイルを書きうるので、先に走らせると `is_first_run()` が
+            // false へ倒れる。設定を消した PC に古いスタートアップ登録だけが
+            // 残っていた場合、初回の設定ウィンドウが出ず、API キーを入れる
+            // 画面へ辿り着けなくなる (`Config::start_hidden` の doc)。
+            reconcile_autostart(&handle);
             if first_run || !cfg.start_hidden {
                 if first_run {
                     log::info!("初回起動のため設定ウィンドウを表示します");

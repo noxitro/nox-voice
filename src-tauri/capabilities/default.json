@@ -1,11 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "メインウィンドウとオーバーレイ小窓の権限。オーバーレイを入れないと、そちらの listen/invoke がすべて拒否されて透明な空ウィンドウになる",
+  "description": "メインウィンドウとオーバーレイ小窓の権限。オーバーレイを入れないと、そちらの listen/invoke がすべて拒否されて透明な空ウィンドウになる。プラグインの権限も同じで、足し忘れるとフロントからの呼び出しが黙って拒否される (autostart はこれに該当)",
   "windows": ["main", "overlay"],
   "permissions": [
     "core:default",
     "opener:default",
-    "notification:default"
+    "notification:default",
+    "autostart:default"
   ]
 }

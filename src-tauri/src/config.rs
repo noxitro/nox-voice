@@ -203,6 +203,24 @@ pub struct Config {
     /// 常駐アプリなので既定は「出さない」。ただし**初回起動だけは出す** —
     /// API キーを設定しないと何もできず、窓が出ないと設定画面へ辿り着けない。
     pub start_hidden: bool,
+    /// PC 起動時に自動で立ち上げるか (Windows なら `HKCU\...\Run` への登録)。
+    ///
+    /// **既定は false。** 常駐アプリだからといって、入れた瞬間に勝手に
+    /// スタートアップへ入るのは利用者の環境を変える行為で、PRODUCT.md の
+    /// 「ユーザーの環境を壊さない」に反する。明示的に選ばれたときだけ登録する。
+    ///
+    /// **この値は「利用者の意思」であって実際の状態ではない。** 正典は
+    /// レジストリ側で、利用者はタスクマネージャーの「スタートアップ アプリ」から
+    /// いつでも無効にできるし、設定ファイルを別マシンへ持ち込むこともある。
+    /// 食い違いを見つけたら実際の状態へこちらを合わせる (`lib.rs` の setup)。
+    ///
+    /// [`Self::start_hidden`] とは直交する。こちらは「いつ起動するか」、
+    /// あちらは「起動したとき窓を出すか」を決める。
+    ///
+    /// フィールド単位の `#[serde(default)]` は旧い設定ファイル対策
+    /// ([`Self::hotkey_mods`] の doc に理由)。
+    #[serde(default)]
+    pub autostart: bool,
     /// PTT のトリガー仮想キーコード。既定は Space ([`crate::hotkey::DEFAULT_HOTKEY_VK`])。
     ///
     /// [`Self::hotkey_mods`] が空のときは単独キーとして扱う (旧形式の設定ファイル)。
@@ -365,6 +383,9 @@ impl Default for Config {
             local_stt_mode: LocalSttMode::Fallback,
             local_model_sha256: String::new(),
             start_hidden: true,
+            // 既定 false。入れただけで勝手にスタートアップへ入らない
+            // (フィールドの doc に理由)。
+            autostart: false,
             hotkey_vk: crate::hotkey::DEFAULT_HOTKEY_VK,
             hotkey_mods: crate::hotkey::DEFAULT_HOTKEY_MODS.to_vec(),
             cancel_vk: crate::hotkey::DEFAULT_CANCEL_VK,
@@ -633,6 +654,13 @@ pub struct ConfigView {
     pub style_profiles: Vec<StyleProfile>,
     pub local_stt_mode: LocalSttMode,
     pub start_hidden: bool,
+    /// 設定ファイルに記録された「自動起動の意思」。
+    ///
+    /// **UI のトグルはこれを見てはいけない。** 実際に登録されているかは
+    /// `get_autostart` (レジストリ) で問い合わせる。ここに出すのは、
+    /// 意思と実際の食い違いを診断したい場合のためだけ
+    /// ([`Config::autostart`] の doc)。
+    pub autostart: bool,
     pub hotkey_vk: u32,
     /// ホットキーの修飾キー (空なら単独キー)。
     pub hotkey_mods: Vec<u32>,
@@ -708,6 +736,7 @@ impl ConfigView {
             style_profiles: c.style_profiles.clone(),
             local_stt_mode: c.local_stt_mode,
             start_hidden: c.start_hidden,
+            autostart: c.autostart,
             hotkey_vk: c.hotkey_vk,
             hotkey_mods: c.hotkey_combo().mods_vec(),
             hotkey_label: c.hotkey_combo().label(),
@@ -780,6 +809,10 @@ pub struct ConfigPatch {
     pub local_stt_mode: Option<LocalSttMode>,
     pub local_model_sha256: Option<String>,
     pub start_hidden: Option<bool>,
+    /// 自動起動の意思。**フロントの設定フォームからは送らない** —
+    /// 登録はレジストリへの操作を伴うので `set_autostart` が唯一の入口で、
+    /// ここへ直接書けると「設定ファイルだけ true、実体は未登録」を作れてしまう。
+    pub autostart: Option<bool>,
     pub hotkey_vk: Option<u32>,
     pub hotkey_mods: Option<Vec<u32>>,
     pub cancel_vk: Option<u32>,
@@ -836,6 +869,7 @@ impl fmt::Debug for ConfigPatch {
             .field("auto_learn_dictionary", &self.auto_learn_dictionary)
             .field("local_stt_mode", &self.local_stt_mode)
             .field("start_hidden", &self.start_hidden)
+            .field("autostart", &self.autostart)
             .field("hotkey_vk", &self.hotkey_vk)
             .field("hotkey_mods", &self.hotkey_mods.as_ref().map(Vec::len))
             .field("cancel_vk", &self.cancel_vk)
@@ -1227,6 +1261,9 @@ impl Config {
         }
         if let Some(v) = patch.start_hidden {
             self.start_hidden = v;
+        }
+        if let Some(v) = patch.autostart {
+            self.autostart = v;
         }
         if let Some(v) = patch.hotkey_vk {
             self.hotkey_vk = v;
@@ -2225,6 +2262,21 @@ mod tests {
     fn the_app_starts_hidden_by_default() {
         // トレイ常駐が本来の姿。起動のたびに窓が出て前景を奪うのは邪魔。
         assert!(Config::default().start_hidden);
+    }
+
+    #[test]
+    fn autostart_is_off_until_the_user_asks_for_it() {
+        // 入れただけでスタートアップへ入るのは利用者の環境を変える行為。
+        // PRODUCT.md「ユーザーの環境を壊さない」。既定は必ず false。
+        assert!(!Config::default().autostart);
+    }
+
+    #[test]
+    fn an_old_config_file_without_autostart_still_loads() {
+        // 旧い設定ファイルにはこの項目が無い。フィールド単位の
+        // `#[serde(default)]` が効いていないと、ここで読み込みごと落ちる。
+        let cfg: Config = serde_json::from_str(r#"{"language":"ja"}"#).expect("旧形式でも読める");
+        assert!(!cfg.autostart);
     }
 
     #[test]

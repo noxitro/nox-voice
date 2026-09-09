@@ -950,6 +950,24 @@
                   <input type="checkbox" id="start-hidden" />
                   <span>起動時はウィンドウを出さない(トレイに常駐)</span>
                 </label>
+                <!--
+                  自動起動だけは「保存」を待たずにその場で効く。登録先は
+                  Windows のスタートアップ(レジストリ)で、設定ファイルの中で
+                  完結しないため。詳細は main.ts の setupAutostart。
+                -->
+                <label class="checkbox">
+                  <input type="checkbox" id="autostart" />
+                  <span>PC 起動時に自動で起動する</span>
+                </label>
+                <p class="hint">
+                  トレイに常駐した状態で始まります(メインウィンドウは開きません)。
+                </p>
+                <!--
+                  失敗の理由を出す欄。空のときは場所を取らない (hidden)。
+                  「失敗は騒がしく」(PRODUCT.md) — 登録できなかったことを
+                  黙って飲み込むと「設定したのに起動しない」になる。
+                -->
+                <p class="error" id="autostart-note" aria-live="polite" hidden></p>
                 <label class="checkbox">
                   <input type="checkbox" id="overlay-enabled" />
                   <span>録音中に小窓を表示する(クリックは下のアプリへ抜けます)</span>

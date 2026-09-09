@@ -1667,6 +1667,91 @@ async function main() {
     };
   });
 
+  // --- U16: 自動起動のトグルは「実際の登録状態」を映し、押した瞬間に効く
+  //
+  // 他の設定と違って保存ボタンを通さない (登録先がレジストリで、設定ファイルの
+  // 中で完結しないため)。ここで見るのは 2 つ:
+  //
+  // - 区画を開いた時点で `get_autostart` を呼び、**その戻り値**を映すこと
+  //   (設定ファイルの `autostart` を映すと、OS 側で切られたのに気づけない)
+  // - 押したら即 `set_autostart` が飛び、返ってきた実測値が入ること
+  await check("U16 自動起動のトグルは実際の登録状態を読み、押すと即 set_autostart が飛ぶ", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      // 設定ファイルの意思は false のまま、**実際には登録済み**という食い違い。
+      // 実機で起きうる状態 (別マシンから設定を持ち込んだ等) をそのまま作る。
+      window.__NOX_MOCK__.autostartEnabled = true;
+      window.__NOX_MOCK__.config.autostart = false;
+      document.querySelector('.nav-item[data-section="app"]').click();
+      await new Promise((r) => setTimeout(r, 200));
+      const box = document.getElementById("autostart");
+      const checkedOnOpen = box.checked;
+
+      // 切る。押した瞬間に飛ぶ (保存ボタンは押さない)。
+      box.checked = false;
+      box.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 200));
+      return {
+        checkedOnOpen,
+        checkedAfter: box.checked,
+        sent: window.__NOX_MOCK__.lastArgs("set_autostart"),
+        registry: window.__NOX_MOCK__.autostartEnabled,
+        savedPatch: window.__NOX_MOCK__.lastPatch,
+        noteHidden: document.getElementById("autostart-note").hidden,
+      };
+    `);
+    return {
+      ok:
+        r.checkedOnOpen === true &&
+        r.checkedAfter === false &&
+        r.sent?.enabled === false &&
+        r.registry === false &&
+        r.savedPatch === null &&
+        r.noteHidden,
+      detail:
+        r.checkedOnOpen === true && r.checkedAfter === false && r.savedPatch === null
+          ? `開いた時点で checked=${r.checkedOnOpen} (実際の登録状態) / 押すと set_autostart={enabled:${r.sent?.enabled}} / set_config は呼ばれていない`
+          : `開いた時点=${r.checkedOnOpen} / 押した後=${r.checkedAfter} / 送った値=${JSON.stringify(r.sent)} / set_config パッチ=${JSON.stringify(r.savedPatch)}`,
+    };
+  });
+
+  // --- U17: 登録に失敗したらトグルを元へ戻し、理由を出す
+  //
+  // ここが黙って成功に見えると、利用者は**次に PC を起こすまで**登録できて
+  // いないことに気づけない。「失敗は騒がしく」(PRODUCT.md)。
+  await check("U17 自動起動の登録に失敗したらトグルが戻り、理由が出る", async () => {
+    await load(cdp, "?fail=set_autostart");
+    const r = await cdp.run(`
+      document.querySelector('.nav-item[data-section="app"]').click();
+      await new Promise((r) => setTimeout(r, 200));
+      const box = document.getElementById("autostart");
+      const before = box.checked;
+      box.checked = true;
+      box.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 250));
+      const note = document.getElementById("autostart-note");
+      return {
+        before,
+        after: box.checked,
+        disabled: box.disabled,
+        noteHidden: note.hidden,
+        note: note.textContent,
+      };
+    `);
+    return {
+      ok:
+        r.before === false &&
+        r.after === false &&
+        r.disabled === false &&
+        !r.noteHidden &&
+        r.note.includes("有効"),
+      detail:
+        r.after === false && !r.noteHidden
+          ? `トグルは ${r.before} のまま戻り、理由を表示: "${r.note}" (再操作可: disabled=${r.disabled})`
+          : `押した後=${r.after} / 理由の表示=${r.noteHidden ? "無し" : r.note} — 失敗が成功に見えている`,
+    };
+  });
+
   const failed = results.filter((r) => r.verdict === "FAIL");
   console.log(`\n=== PASS ${results.length - failed.length} / FAIL ${failed.length} (全 ${results.length}) ===`);
   console.log("疑似テストなので、緑でも実機 E2E (e2e/hotkey.mjs) の代わりにはならない。");

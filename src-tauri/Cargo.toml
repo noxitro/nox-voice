@@ -94,6 +94,7 @@ sha2 = "0.11.0"
 # どちらも tauri の依存として既に lock に載っているので、ビルド時間は増えない。
 png = "0.17"
 base64 = "0.22"
+tauri-plugin-autostart = "2.5"
 
 [features]
 default = []

@@ -201,6 +201,14 @@ interface ConfigView {
   cancel_sound: string;
   cancel_sound_path: string;
   overlay_enabled: boolean;
+  /**
+   * 設定ファイルに記録された「自動起動の意思」。
+   *
+   * **トグルの表示に使ってはいけない。** 実際に登録されているかは
+   * `get_autostart` (レジストリ) が正典で、この 2 つはずれる
+   * (利用者がタスクマネージャーから登録を切れる)。
+   */
+  autostart: boolean;
   history_enabled: boolean;
   history_retention_days: number;
   restore_delay_ms: number;
@@ -323,6 +331,10 @@ function showSection(section: SectionId, focusHeading = false) {
 
   const savebar = el("savebar");
   if (savebar) savebar.hidden = !SECTIONS_WITH_FORM.has(section);
+
+  // 自動起動のトグルだけは、開くたびにレジストリへ問い合わせて実際の状態を
+  // 映し直す。設定ファイルの値を映すと、OS 側で切られたことに気づけない。
+  if (section === "app") void loadAutostart();
 
   // 切り替えたら内容の先頭から読ませる。前の区画のスクロール位置が
   // 残っていると、開いた瞬間に見出しの無い途中が出る。
@@ -758,6 +770,69 @@ function renderConfig(view: ConfigView) {
   if (groqState) groqState.textContent = keyStateLabel(view, "groq");
   const geminiState = el("gemini-state");
   if (geminiState) geminiState.textContent = keyStateLabel(view, "gemini");
+}
+
+/* --- 自動起動 (PC 起動時の立ち上げ) ----------------------------------------
+ *
+ * ここだけ他の設定と作りが違う。理由は 2 つある。
+ *
+ * - **保存ボタンを待たない。** 登録先は Windows のスタートアップ
+ *   (レジストリ) で、設定ファイルの中で完結しない。押した瞬間に OS を
+ *   触るので、その場で結果を確かめて見せる
+ * - **表示は設定ファイルではなく実際の登録状態から作る。** 利用者は
+ *   タスクマネージャーの「スタートアップ アプリ」から登録を切れるし、
+ *   設定ファイルを別マシンへ持ち込むこともある。正典はレジストリ側
+ *   (Rust の `get_autostart` / design.md)
+ *
+ * したがって `renderConfig` からは触らない。あそこは保存のたびに走るので、
+ * 意思の値で実際の状態を上書きしてしまう。 */
+
+/** 失敗の理由を出す (null で消す)。「失敗は騒がしく」(PRODUCT.md)。 */
+function showAutostartError(message: string | null) {
+  const note = el("autostart-note");
+  if (!note) return;
+  note.textContent = message ?? "";
+  note.hidden = message === null;
+}
+
+/** 実際の登録状態を読んでトグルへ反映する。設定画面を開くたびに呼ぶ。 */
+async function loadAutostart() {
+  const box = el<HTMLInputElement>("autostart");
+  if (!box) return;
+  try {
+    box.checked = await invoke<boolean>("get_autostart");
+    box.disabled = false;
+    showAutostartError(null);
+  } catch (e) {
+    // 読めなかったのは「無効」ではない (欠測と 0 件を混同しない)。
+    // 状態が分からないまま押させると、押した結果も信じられない。
+    box.disabled = true;
+    showAutostartError(`自動起動の状態を確認できません (${e})`);
+  }
+}
+
+/**
+ * トグル操作。**失敗したらトグルを元に戻す。** 成功したように見せると、
+ * 利用者は次に PC を起こすまで登録されていないことに気づけない。
+ */
+async function onAutostartToggle() {
+  const box = el<HTMLInputElement>("autostart");
+  if (!box) return;
+  const wanted = box.checked;
+  // 往復の間に二度押しさせない (OS への登録が競合する)。
+  box.disabled = true;
+  try {
+    // 返るのは登録後に読み直した実測値。押した値をそのまま信じない。
+    box.checked = await invoke<boolean>("set_autostart", { enabled: wanted });
+    showAutostartError(null);
+  } catch (e) {
+    box.checked = !wanted;
+    showAutostartError(
+      `自動起動を${wanted ? "有効" : "無効"}にできませんでした (${e})`,
+    );
+  } finally {
+    box.disabled = false;
+  }
 }
 
 /* --- 辞書: 行単位の編集と「枠に入っているか」の表示 -------------------------
@@ -2532,6 +2607,8 @@ window.addEventListener("DOMContentLoaded", async () => {
     () => void toggleHotkeyPicker("screen_ask"),
   );
   el("screen-ask-enabled")?.addEventListener("change", syncScreenAskEnabled);
+  // 自動起動は保存ボタンを通さない。押した時点で OS を触る (関数群の doc)。
+  el("autostart")?.addEventListener("change", () => void onAutostartToggle());
   el("sound-volume")?.addEventListener("input", syncSoundVolumeLabel);
   el("sound-enabled")?.addEventListener("change", syncSoundControlsEnabled);
   el("start-sound")?.addEventListener("change", syncSoundCustomVisible);
@@ -2705,4 +2782,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   } catch (e) {
     showError(`状態の取得に失敗しました: ${e}`);
   }
+  // 自動起動は上の連鎖に入れない。ここが失敗しても履歴や統計の読み込みまで
+  // 道連れにする理由が無い (失敗は自分の欄で言う)。
+  await loadAutostart();
 });
