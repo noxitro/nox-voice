@@ -299,8 +299,11 @@ window.addEventListener("DOMContentLoaded", async () => {
         break;
       case "idle":
         stopElapsed();
-        // 結果イベントが続くので、ここでは消さない。
-        // 畳むのは Rust 側 (overlay::hide_after)。
+        // 結果イベントが続くので、ここでは消さない。畳むのは Rust 側。
+        // **キャンセルだけは結果イベントが来ない。** そのため Rust 側の
+        // cancel_recording が hide_after ではなく hide で即座に畳む。
+        // ここを「何もしない」に保つ以上、あちらを遅らせると録音中の顔が
+        // 残り続けるので、片方だけ変えないこと。
         void invoke("overlay_rendered", { state: "idle(結果待ち)" }).catch(() => {});
         break;
     }

@@ -1,6 +1,6 @@
 [package]
 name = "nox-voice"
-version = "0.5.0"
+version = "0.5.1"
 description = "Windows 11 向け AI 音声入力常駐アプリ"
 authors = ["noxitro"]
 edition = "2021"
