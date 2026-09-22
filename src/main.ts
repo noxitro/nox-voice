@@ -1549,12 +1549,12 @@ function buildHistoryDetail(row: SessionRow): HTMLElement {
   const hasText = Boolean(row.formatted_text || row.raw_text);
   if (hasText) {
     // コピーも再貼付も同じ経路 (Rust 側の copy_history_entry) に通す。
-    // navigator.clipboard だと履歴除外フォーマットが付かず、発話が
-    // Win+V 履歴やクラウドクリップボードへ流れてしまう。
+    // navigator.clipboard だとクラウド同期の除外フォーマットが付かず、
+    // 発話が他デバイスへ流れてしまう。
     const copy = document.createElement("button");
     copy.type = "button";
     copy.textContent = "コピー";
-    copy.title = "クリップボードに入れます (Win+V 履歴には残しません)";
+    copy.title = "クリップボードに入れます (他デバイスへは同期しません)";
     copy.addEventListener("click", () => {
       void invoke("copy_history_entry", { id: row.id }).catch((e) => {
         showHistoryError(`コピーに失敗しました: ${e}`);

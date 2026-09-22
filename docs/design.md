@@ -41,13 +41,17 @@ Gemini API無料枠(Unpaid Services)では送信コンテンツがGoogleの製�
   - **退避 (backup) 自体は `Keep` でも続ける**。`EmptyClipboard` 成功後に `SetClipboardData` が失敗する経路では、退避内容の書き戻しが唯一の救済になるため
   - **通知は増やさない**。`Keep` の成功時は `ClipboardState::HoldsInjectedText` になるが、`outcome_message(Injected, _)` は `Lost` 以外で `None` を返すのでトーストは出ない(毎回鳴れば無意味になる — R6の通知と同じ教訓)。可視化はオーバーレイの完了表示に一言添えるだけにする
   - R6の通知条件 (`CF_UNICODETEXT` が無いときだけ) は変えない。`Keep` では復元を試みない分、非テキストの破棄が確定するので通知の意味はむしろ強まる
+- **R3 補記 — 残す経路は Win+V 履歴に載せる (2026-09-22 決定)**: 以前は全経路で履歴・クラウド同期を除外していたが、「クリップボードに残る」経路 (`Keep` / クリップボードのみ / 履歴UIのコピー) では**Win+V 履歴に載せる**ようにした。ユーザー要望 — 残したテキストを後から Win+V で拾い直せないのは不便。
+  - 判定は `ClipboardHistory::for_policy`(`Keep`→`Include`、`Restore`→`Exclude`)。`Restore` は一瞬置くだけの中継なので、ユーザーがコピーしていないものを履歴に並べないよう従来どおり除外する
+  - `Include` では `ExcludeClipboardContentFromMonitorProcessing` も外す(履歴を含むすべての監視から外す形式なので、`CanIncludeInClipboardHistory` だけ外しても履歴には載らない)。副作用として他社のクリップボード管理ツールにも見える
+  - **クラウド同期 (`CanUploadToCloudClipboard`=0) は常に止める**。他デバイスへの送信は要望の範囲外
 - **R5 生転写の可視性**: 履歴UIで生転写と整形結果を並置。LLM整形の欠落・Whisperハルシネーションを照合可能に
 - **R6 非テキスト破壊の可視化**: 画像(CF_DIB)・ファイル(CF_HDROP)等は退避不能→破棄されることをトースト通知
 - **R7 挿入時フォーカス検証**: 挿入直前に `GetForegroundWindow` をホットキー押下時保存HWNDと照合。不一致なら貼付中止→通知+クリップボード保持(SetForegroundWindow強制復帰はフォアグラウンドロックで失敗しうるため主手段にしない)
 
 ## 技術メモ(調査より)
 
-- 注入はクリップボード+Ctrl+V(SendInput)が業界標準(Aqua/Typeless/Wispr Flow/Handy全て)。`ExcludeClipboardContentFromMonitorProcessing` 等でWin+V履歴・クラウドクリップボード除外
+- 注入はクリップボード+Ctrl+V(SendInput)が業界標準(Aqua/Typeless/Wispr Flow/Handy全て)。`ExcludeClipboardContentFromMonitorProcessing` 等でWin+V履歴・クラウドクリップボード除外(残す経路は履歴にだけ載せる — R3 補記 2026-09-22)
 - SendInput Unicode直打ちはサロゲートペア・長文で不安定なため不採用
 - UIPI: 管理者昇格アプリへは注入不可(既知の制限、R4の履歴保全でデータ消失は防ぐ)
 - ホットキーは WH_KEYBOARD_LL(RegisterHotKeyはキーアップ不可でPTT不可、Fnキーは機種依存で不可)

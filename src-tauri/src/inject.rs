@@ -104,15 +104,44 @@ const CF_HDROP: u32 = 15;
 const CF_LOCALE: u32 = 16;
 const CF_DIBV5: u32 = 17;
 
-/// クリップボード履歴・クラウド同期から除外するための登録形式。
+/// 書き込む整形テキストを Win+V 履歴に載せるか。
 ///
-/// 発話テキストが Win+V の履歴や他デバイスへ流れるのを防ぐ。
-/// いずれも値 0 の DWORD を入れる。
-const EXCLUSION_FORMATS: [&str; 3] = [
-    "ExcludeClipboardContentFromMonitorProcessing",
-    "CanIncludeInClipboardHistory",
-    "CanUploadToCloudClipboard",
-];
+/// クラウド同期 (他デバイスへの送信) は、どちらでも常に止める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardHistory {
+    /// 履歴に載せる。テキストがクリップボードに**残る**経路で使う
+    /// (後から Win+V で拾い直せるように)。
+    Include,
+    /// 履歴にも載せない。貼付後すぐ元の内容へ戻す経路で使う。
+    /// 一瞬だけ置いた中継用のテキストが履歴に溜まるのは、ユーザーから見て
+    /// 「コピーしていないものが並ぶ」ことになる。
+    Exclude,
+}
+
+impl ClipboardHistory {
+    /// 貼付後の方針から決める。残すなら載せ、戻すなら載せない。
+    fn for_policy(policy: ClipboardPolicy) -> Self {
+        match policy {
+            ClipboardPolicy::Keep => Self::Include,
+            ClipboardPolicy::Restore { .. } => Self::Exclude,
+        }
+    }
+
+    /// 値 0 の DWORD として一緒に置く登録形式。
+    ///
+    /// `ExcludeClipboardContentFromMonitorProcessing` は履歴を含むすべての
+    /// 監視から外すので、履歴に載せるときは付けてはいけない。
+    fn marker_formats(self) -> &'static [&'static str] {
+        match self {
+            Self::Include => &["CanUploadToCloudClipboard"],
+            Self::Exclude => &[
+                "ExcludeClipboardContentFromMonitorProcessing",
+                "CanIncludeInClipboardHistory",
+                "CanUploadToCloudClipboard",
+            ],
+        }
+    }
+}
 
 /// 注入の結末。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -328,7 +357,7 @@ pub fn copy_only(text: &str) -> InjectReport {
     if text.trim().is_empty() {
         return InjectReport::untouched(InjectOutcome::EmptyText);
     }
-    match prepare_clipboard(text) {
+    match prepare_clipboard(text, ClipboardHistory::Include) {
         Ok(prepared) => {
             log::info!(
                 "クリップボードのみ: {} 文字を入れました (貼り付けはしません)",
@@ -365,7 +394,7 @@ pub fn inject(text: &str, target: InjectTarget, policy: ClipboardPolicy) -> Inje
     // 貼り先アプリへ通知を飛ばす)。区間を分けておかないと、フォーカスが
     // 動いたときにクリップボードのせいか Ctrl+V のせいかを切り分けられない。
     let clipboard_guard = crate::focus_probe::FocusGuard::begin("クリップボード設定");
-    let prepared = match prepare_clipboard(text) {
+    let prepared = match prepare_clipboard(text, ClipboardHistory::for_policy(policy)) {
         Ok(p) => p,
         Err(failure) => {
             clipboard_guard.end();
@@ -541,7 +570,10 @@ struct PrepareFailure {
 }
 
 /// クリップボードを開き、退避してから整形テキストを設定する。
-fn prepare_clipboard(text: &str) -> Result<PreparedClipboard, PrepareFailure> {
+fn prepare_clipboard(
+    text: &str,
+    history: ClipboardHistory,
+) -> Result<PreparedClipboard, PrepareFailure> {
     let guard = ClipboardGuard::open().map_err(|outcome| PrepareFailure {
         outcome,
         // 開けなかったので中身は無傷。
@@ -554,7 +586,7 @@ fn prepare_clipboard(text: &str) -> Result<PreparedClipboard, PrepareFailure> {
     // SAFETY: クリップボードは開いている (guard が生きている)。
     let backup = unsafe { read_unicode_text() };
 
-    if let Err(e) = write_payload(text) {
+    if let Err(e) = write_payload(text, history) {
         log::error!("クリップボードへの書き込みに失敗: {e}");
         // ここに来た時点で EmptyClipboard は成功しているかもしれない =
         // 元の内容を壊した可能性がある。退避したテキストを書き戻す。
@@ -671,11 +703,11 @@ fn restore_text(text: &str) -> Result<(), InjectOutcome> {
 
 /// テキストをクリップボードへ入れる (履歴からの再貼付用)。
 ///
-/// 注入はしないので、履歴除外フォーマットも付ける。発話内容が
-/// Win+V 履歴やクラウドへ流れるのは通常の貼付時と同じく避けたい。
+/// ユーザーが明示的にコピーしたものなので Win+V 履歴には載せる。
+/// クラウド同期は通常の貼付時と同じく止める。
 pub fn set_clipboard_text(text: &str) -> Result<(), InjectOutcome> {
     let _guard = ClipboardGuard::open()?;
-    write_payload(text).map_err(|e| {
+    write_payload(text, ClipboardHistory::Include).map_err(|e| {
         log::error!("クリップボードへの書き込みに失敗: {e}");
         InjectOutcome::ClipboardFailed
     })
@@ -824,15 +856,15 @@ unsafe fn read_unicode_text() -> Option<String> {
     Some(String::from_utf16_lossy(&text))
 }
 
-/// 整形テキストと履歴除外フォーマットを書き込む。
-fn write_payload(text: &str) -> windows::core::Result<()> {
+/// 整形テキストと、履歴・同期の扱いを示す形式を書き込む。
+fn write_payload(text: &str, history: ClipboardHistory) -> windows::core::Result<()> {
     // SAFETY: クリップボードは開いている。
     unsafe { EmptyClipboard() }?;
     set_unicode_text(text)?;
 
     // 履歴・クラウド同期からの除外。失敗しても致命ではない
     // (貼付自体は成立する) のでログに留める。
-    for name in EXCLUSION_FORMATS {
+    for &name in history.marker_formats() {
         match register_format(name) {
             Some(format) => {
                 if let Err(e) = set_dword(format, 0) {
@@ -1580,7 +1612,7 @@ mod tests {
         let sentinel = "nox-voice テスト用の元テキスト";
         restore_text(sentinel).expect("前準備: 元テキストを置く");
 
-        let prepared = prepare_clipboard("整形後のテキスト").expect("設定できる");
+        let prepared = prepare_clipboard("整形後のテキスト", ClipboardHistory::Exclude).expect("設定できる");
         assert_eq!(
             prepared.backup.as_deref(),
             Some(sentinel),
@@ -1635,7 +1667,7 @@ mod tests {
         let sentinel = "nox-voice テスト用の元テキスト";
         restore_text(sentinel).expect("前準備: 元テキストを置く");
 
-        let prepared = prepare_clipboard("残すべき整形テキスト").expect("設定できる");
+        let prepared = prepare_clipboard("残すべき整形テキスト", ClipboardHistory::Exclude).expect("設定できる");
         assert_eq!(
             prepared.backup.as_deref(),
             Some(sentinel),
@@ -1734,7 +1766,7 @@ mod tests {
         };
 
         // 自分が整形テキストを置き、その時点のシーケンス番号を得る。
-        let prepared = prepare_clipboard("整形テキスト").expect("設定できる");
+        let prepared = prepare_clipboard("整形テキスト", ClipboardHistory::Exclude).expect("設定できる");
 
         // ここでユーザーが別のものをコピーした、という状況を作る。
         restore_text("ユーザーが後からコピーした内容").expect("割り込みを再現");
@@ -1774,7 +1806,7 @@ mod tests {
             unsafe { read_unicode_text() }
         };
 
-        let prepared = prepare_clipboard("整形テキスト").expect("設定できる");
+        let prepared = prepare_clipboard("整形テキスト", ClipboardHistory::Exclude).expect("設定できる");
         let outcome = restore_if_unchanged("退避しておいた元テキスト", prepared.sequence);
         assert_eq!(outcome, RestoreOutcome::Restored);
 
@@ -1801,7 +1833,7 @@ mod tests {
         };
 
         let before = current_sequence();
-        let prepared = prepare_clipboard("シーケンス確認").expect("設定できる");
+        let prepared = prepare_clipboard("シーケンス確認", ClipboardHistory::Exclude).expect("設定できる");
         assert_ne!(
             before, prepared.sequence,
             "書き込んでもシーケンス番号が進んでいない (介入検知が働かない)"
@@ -1811,6 +1843,41 @@ mod tests {
         if let Some(text) = original {
             restore_text(&text).expect("復元できる");
         }
+    }
+
+    /// 残す経路は Win+V 履歴に載せ、戻す経路は載せない。
+    #[test]
+    fn history_follows_whether_the_text_stays() {
+        assert_eq!(
+            ClipboardHistory::for_policy(ClipboardPolicy::Keep),
+            ClipboardHistory::Include
+        );
+        assert_eq!(
+            ClipboardHistory::for_policy(ClipboardPolicy::Restore {
+                delay: Duration::from_millis(300)
+            }),
+            ClipboardHistory::Exclude
+        );
+    }
+
+    /// 履歴に載せるときは履歴を止める形式を付けず、クラウド同期だけは
+    /// どちらでも止める。
+    #[test]
+    fn marker_formats_block_cloud_sync_but_only_exclude_blocks_history() {
+        let include = ClipboardHistory::Include.marker_formats();
+        let exclude = ClipboardHistory::Exclude.marker_formats();
+        for blocks_history in [
+            "ExcludeClipboardContentFromMonitorProcessing",
+            "CanIncludeInClipboardHistory",
+        ] {
+            assert!(
+                !include.contains(&blocks_history),
+                "{blocks_history} が履歴を止める"
+            );
+            assert!(exclude.contains(&blocks_history));
+        }
+        assert!(include.contains(&"CanUploadToCloudClipboard"));
+        assert!(exclude.contains(&"CanUploadToCloudClipboard"));
     }
 
     /// 履歴除外フォーマットが実際に載ること。
@@ -1823,11 +1890,11 @@ mod tests {
             unsafe { read_unicode_text() }
         };
 
-        prepare_clipboard("履歴除外の確認").expect("設定できる");
+        prepare_clipboard("履歴除外の確認", ClipboardHistory::Exclude).expect("設定できる");
 
         let _guard = ClipboardGuard::open().expect("開ける");
         let formats = enumerate_formats();
-        for name in EXCLUSION_FORMATS {
+        for &name in ClipboardHistory::Exclude.marker_formats() {
             let id = register_format(name).expect("形式を登録できる");
             assert!(
                 formats.contains(&id),
