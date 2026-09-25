@@ -6,6 +6,8 @@
 //
 // 前提と副作用:
 // - `src-tauri/target/debug/nox-voice.exe` が要る (cargo build)。
+//   別の exe を測るときは `NOX_E2E_EXE` で渡す (CI はリリースビルドや
+//   インストーラが入れた exe を渡す)。
 // - **開始時に既存の nox-voice.exe を全部落とす**。利用者がアプリを使っている
 //   間は走らせないこと (ホットキー E2E と同じ流儀)。
 // - vite は不要。ここではウィンドウの中身を一切触らず、プロセス数とログだけを見る。
@@ -17,7 +19,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 const REPO = path.resolve(import.meta.dirname, "..");
-const EXE = path.join(REPO, "src-tauri", "target", "debug", "nox-voice.exe");
+const EXE = process.env.NOX_E2E_EXE || path.join(REPO, "src-tauri", "target", "debug", "nox-voice.exe");
 const LOG = path.join(process.env.LOCALAPPDATA, "com.noxitro.nox-voice", "logs", "nox-voice.log");
 
 /** 1 個目が起動しきる (= フック設置ログが出る) のを待つ上限。 */

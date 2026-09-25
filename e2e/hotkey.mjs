@@ -15,6 +15,12 @@
 // injectionReachesHook に依らない (SKIP にならない)。逆に「物理キーが
 // OS → WebView2 → DOM と届くか」はここでは測れない。docs/hotkey-e2e.md 参照。
 //
+// 環境変数:
+// - NOX_E2E_EXE      測る exe (既定は src-tauri/target/debug/nox-voice.exe)。
+//                    CI はリリースビルドを渡す
+// - NOX_E2E_NO_AUDIO 録音デバイスの無い環境 (GitHub Actions の Windows
+//                    ランナー等) で 1 にする。下の NO_AUDIO の doc を参照
+//
 // 使い方: node e2e/hotkey.mjs
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -29,8 +35,29 @@ const CONFIG = path.join(APP_DIR, "config.json");
 const CONFIG_BACKUP = path.join(APP_DIR, "config.json.e2e-backup");
 const LOG = path.join(process.env.LOCALAPPDATA, "com.noxitro.nox-voice", "logs", "nox-voice.log");
 const REPO = path.resolve(import.meta.dirname, "..");
-const EXE = path.join(REPO, "src-tauri", "target", "debug", "nox-voice.exe");
+const EXE = process.env.NOX_E2E_EXE || path.join(REPO, "src-tauri", "target", "debug", "nox-voice.exe");
 const SEND_KEYS = path.join(REPO, "e2e", "send-keys.ps1");
+
+/** 録音が本当に始まったときの行。`録音開始 [貼り付け] (挿入先: …)`。
+ *
+ * 単に「録音開始」で探してはいけない。フォーカス診断 (debug) が
+ * `audio::start` の**前**に `[focus] 録音開始 直前` を出すので、録音デバイスが
+ * 無くて開始に失敗した run でも「開始した」と読めてしまう。 */
+const STARTED = "録音開始 [";
+/** 録音デバイスが無いときに、同じ押下で出る行 (audio.rs の NoInputDevice)。 */
+const NO_DEVICE = "録音を開始できません: 録音デバイスが見つかりません";
+
+/** 録音デバイスの無い環境で走らせる (`NOX_E2E_NO_AUDIO=1`)。
+ *
+ * デバイスが無いと {@link STARTED} は永久に出ない。それでもホットキーが
+ * フックに届いたことは、同じ押下で出る {@link NO_DEVICE} で分かる。
+ * このモードではその行を「発火した」証拠として数え、録音の確定を要する
+ * 判定 (T1 の確定側 / T11 / T12) は**測らない**。測っていないことは
+ * 結果の行と最後の集計に必ず書く。
+ *
+ * 指定しないまま録音デバイスの無い環境で走らせると T1 が FAIL になり、
+ * 理由としてこの変数を案内する (フックの故障と取り違えないため)。 */
+const NO_AUDIO = process.env.NOX_E2E_NO_AUDIO === "1";
 
 const VK = {
   LCTRL: 0xa2,
@@ -47,6 +74,9 @@ const VK = {
 const results = [];
 /** 合成入力がフックまで届く環境か。届かない run は「失敗」ではなく「欠測」。 */
 let injectionReachesHook = true;
+/** 開始時に設定ファイルがあったか。無かったなら終了時に「無い」へ戻す。
+ * 確かめる前に落ちたときに本物の設定を消さないよう、既定は true。 */
+let hadConfig = true;
 let logOffset = 0;
 let app = null;
 let vite = null;
@@ -87,6 +117,41 @@ async function waitForLog(needle, timeoutMs = 5000) {
     if (hit) return hit;
     if (Date.now() > deadline) return null;
     await sleep(150);
+  }
+}
+/** ホットキーが発火した証拠を待つ。陽性・陰性の両方の判定に使う。
+ *
+ * 通常は録音が本当に始まった行だけを数える。録音デバイスの無いモード
+ * (NO_AUDIO) では、同じ押下で出る開始失敗の行も数える。 */
+async function waitForFired(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const hit = readNewLog()
+      .split(/\r?\n/)
+      .find((l) => l.includes(STARTED) || (NO_AUDIO && l.includes(NO_DEVICE)));
+    if (hit) return hit;
+    if (Date.now() > deadline) return null;
+    await sleep(150);
+  }
+}
+/** 発火のあと、録音が確定するまで待つ (次のテストへ録音を持ち越さないため)。
+ * 録音デバイスの無いモードでは確定するものが無いので、落ち着くのだけ待つ。 */
+async function settleRecording() {
+  if (NO_AUDIO) {
+    await sleep(800);
+    return null;
+  }
+  return waitForLog("録音確定", 8000);
+}
+
+function restoreConfig() {
+  if (fs.existsSync(CONFIG_BACKUP)) {
+    fs.copyFileSync(CONFIG_BACKUP, CONFIG);
+    fs.rmSync(CONFIG_BACKUP);
+    console.log("\n設定ファイルを元に戻しました");
+  } else if (!hadConfig) {
+    fs.rmSync(CONFIG, { force: true });
+    console.log("\n開始前は設定ファイルが無かったので、テストで作ったものを消しました");
   }
 }
 
@@ -338,8 +403,12 @@ async function main() {
 
   // 実設定を退避し、テスト用に差し替える。injection を切るのは、
   // 合成キーで始まった録音の結果がユーザーの作業中ウィンドウへ貼られないため。
-  fs.copyFileSync(CONFIG, CONFIG_BACKUP);
-  const base = readConfig();
+  // 新しいマシン (CI のランナーなど) では設定ファイルがまだ無い。アプリは
+  // 欠けた項目を既定値で補う (#[serde(default)]) ので、空から組み立てて良い。
+  hadConfig = fs.existsSync(CONFIG);
+  if (hadConfig) fs.copyFileSync(CONFIG, CONFIG_BACKUP);
+  const base = hadConfig ? readConfig() : {};
+  fs.mkdirSync(APP_DIR, { recursive: true });
   const testCfg = {
     ...base,
     injection_enabled: false,
@@ -363,34 +432,47 @@ async function main() {
     record("T0 設定画面へ CDP 接続", true, `捕獲系のキー経路: ${transport.label}`);
 
     // --- T1: 既定の組み合わせ (左Ctrl+Space) の長押しで録音が始まり、離すと確定する
+    //   (録音デバイスの無いモードでは「発火した」までを見る)
     markLog();
     sendKeys(`down:A2,down:20,sleep:800,up:20,up:A2`, pid);
-    const started = await waitForLog("録音開始", 5000);
-    const finalized = await waitForLog("録音確定", 8000);
+    const started = await waitForFired(5000);
+    const finalized = await settleRecording();
     // T1 は較正も兼ねる。ここが通らない環境では、以降のキー依存テストは
     // 「アプリの不具合」ではなく「合成入力がフックへ届いていない」ので判定不能。
     // 実機の物理キーでは動くのにここだけ落ちる run が実在する
     // (エージェントのサンドボックス下で起動した場合など)。
     injectionReachesHook = Boolean(started);
+    // 録音デバイスが無いだけなら、フックは生きている。取り違えないよう別に言う。
+    const noDevice = !started && readNewLog().includes(NO_DEVICE);
     record(
       "T1 既定 左Ctrl+Space の長押し PTT",
-      Boolean(started && finalized),
+      Boolean(started && (NO_AUDIO || finalized)),
       started
-        ? `開始=${started.trim()}`
-        : "「録音開始」がログに出ない — 合成入力がフックへ届いていない可能性が高い。" +
+        ? `開始=${started.trim()}${NO_AUDIO ? " (録音デバイス無しモード: 確定は測っていない)" : ""}`
+        : noDevice
+          ? "ホットキーは発火したが、録音デバイスが無くて録音できない。" +
+            "フック経路だけを測るなら NOX_E2E_NO_AUDIO=1 で走らせること"
+          : "「録音開始」がログに出ない — 合成入力がフックへ届いていない可能性が高い。" +
             "物理キーボードで同じ操作を試して切り分けること",
       false,
     );
     if (!injectionReachesHook) {
       console.log(
-        ["", "  ※ この環境では合成入力がフックに届きません。", "  以降のキー依存テストは SKIP 扱いにします。", ""].join("\n"),
+        [
+          "",
+          noDevice
+            ? "  ※ この環境には録音デバイスがありません (NOX_E2E_NO_AUDIO=1 で測れます)。"
+            : "  ※ この環境では合成入力がフックに届きません。",
+          "  以降のキー依存テストは SKIP 扱いにします。",
+          "",
+        ].join("\n"),
       );
     }
 
     // --- T2: 修飾キー無しで Space だけ押しても発火しない (陰性側)
     markLog();
     sendKeys(`down:20,sleep:600,up:20`, pid);
-    const spuriousSpace = await waitForLog("録音開始", 2500);
+    const spuriousSpace = await waitForFired(2500);
     record(
       "T2 Space 単独では発火しない",
       spuriousSpace === null,
@@ -425,8 +507,8 @@ async function main() {
     // --- T4: 設定した新しい組み合わせが実際に効く
     markLog();
     sendKeys(`down:A2,down:7D,sleep:800,up:7D,up:A2`, pid);
-    const newStarted = await waitForLog("録音開始", 5000);
-    await waitForLog("録音確定", 8000);
+    const newStarted = await waitForFired(5000);
+    await settleRecording();
     record(
       "T4 設定した 左Ctrl+F14 で録音が始まる",
       Boolean(newStarted),
@@ -436,7 +518,7 @@ async function main() {
     // --- T5: 古い組み合わせはもう効かない (陰性側)
     markLog();
     sendKeys(`down:A2,down:20,sleep:600,up:20,up:A2`, pid);
-    const oldStill = await waitForLog("録音開始", 2500);
+    const oldStill = await waitForFired(2500);
     record(
       "T5 旧 左Ctrl+Space はもう効かない",
       oldStill === null,
@@ -452,8 +534,8 @@ async function main() {
     const persisted = readConfig();
     markLog();
     sendKeys(`down:A2,down:7D,sleep:800,up:7D,up:A2`, app.pid);
-    const afterRestart = await waitForLog("録音開始", 6000);
-    await waitForLog("録音確定", 8000);
+    const afterRestart = await waitForFired(6000);
+    await settleRecording();
     record(
       "T6 再起動後も 左Ctrl+F14 が効く",
       Boolean(afterRestart) && persisted.hotkey_vk === VK.F14,
@@ -523,7 +605,7 @@ async function main() {
     markLog();
     await sleep(20000);
     sendKeys(`down:A2,down:7D,sleep:800,up:7D,up:A2`, app.pid);
-    const afterIdle = await waitForLog("録音開始", 6000);
+    const afterIdle = await waitForFired(6000);
     const reinstalled = readNewLog().includes("再設置");
     record(
       "T9 20 秒放置したあともホットキーが効く (フック生存確認)",
@@ -545,94 +627,98 @@ async function main() {
       `起動中の nox-voice.exe = ${alive} 個 (2 個目の exitCode=${second.exitCode})`,
     );
 
-    // --- T11 / T12: 単独 Alt のホットキーとフォーカス診断 (2026-08-29 の回帰)
-    //
-    // 何を検証しているか:
-    //   T11 = トリガーが Alt 単独 (既定の右 Alt) でも PTT が壊れないこと。
-    //         フックは**トリガーを離すたび**に VK_NONAME を 1 打撒く
-    //         (break_lone_alt)。押下の辺では撒かない — 低レベルフックは
-    //         前景アプリより先に走るので、押下時に撒くとダミーが Alt-down を
-    //         追い越し、アプリから見た押下〜離しの間が空のままになる
-    //         (2026-08-29 に一度そう書いて効かなかった。design.md の Q7)。
-    //         この打鍵が自分のホットキー解釈へ混ざると、押しても録音が
-    //         始まらなくなる — つまり修正そのものの陰性側の確認。
-    //         撒いたことは `[focus] 単独 Alt 対策の打鍵 累計 N 回` で見る
-    //         (フックからはログを出せないので、数字を後から読む形にしてある)。
-    //         この行は**録音の停止側** (request_finalize) で出る。撒く辺が
-    //         離しなので、開始時に読むと必ず「撒く前」の値になるため。
-    //         したがって計測は「録音確定を待ってから読む」順でなければならない。
-    //   T12 = 小窓の表示・非表示でキーボードフォーカスが動かないこと。
-    //         focus_probe が違反を見つけたら warn を出すので、その不在を見る。
-    //
-    // 何を検証**できていないか** (ここが本題なので必ず読むこと):
-    //   - **ブラウザの入力欄でキャレットが残るか**は測れていない。元の不具合は
-    //     「Chrome がツールバーへフォーカスを移し、ページの caret が消える」で、
-    //     これは Chrome の中の話なので Win32 の API (GetForegroundWindow /
-    //     GetGUIThreadInfo) からは見えない。DOM の blur を見るしかなく、
-    //     それには実ブラウザと実ページが要る。実機確認の手順は
-    //     docs/design.md の Q7 節を参照。
-    //   - 貼付 (Ctrl+V) 経路の診断も出ない。この E2E は API キーを与えないので
-    //     STT が失敗し、注入まで到達しない。
-    //   - 合成キーがフックへ届かない環境では T11 は SKIP になる (T1 と同じ較正)。
-    //     T12 は録音を伴わないので、フックに依らず判定できる。
-    killApp();
-    await sleep(1000);
-    const altCfg = {
-      ...readConfig(),
-      hotkey_vk: VK.RALT,
-      hotkey_mods: [],
-      // 小窓を出さないと表示・非表示の区間が測れない (T12 の前提)。
-      overlay_enabled: true,
-    };
-    fs.writeFileSync(CONFIG, JSON.stringify(altCfg, null, 2));
-    await startApp();
-    markLog();
-    const breaksBefore = lastLoneAltBreaks(readNewLog());
-    sendKeys(`down:A5,sleep:800,up:A5`, app.pid);
-    const altStarted = await waitForLog("録音開始", 6000);
-    const altFinalized = await waitForLog("録音確定", 8000);
-    const altLog = readNewLog();
-    const breaksAfter = lastLoneAltBreaks(altLog);
-    record(
-      "T11 単独 右Alt の PTT が効き、離しでダミーキーが 1 打撒かれる",
-      Boolean(altStarted && altFinalized) && breaksAfter > breaksBefore,
-      !altStarted
-        ? "右 Alt を押しても録音が始まらない (撒いたダミーキーが自分の解釈へ混ざっている可能性)"
-        : !altFinalized
-          ? "右 Alt を離しても録音が確定しない"
-          : breaksAfter > breaksBefore
-            ? `ダミーキー累計 ${breaksBefore} → ${breaksAfter}`
-            : `録音は通ったがダミーキーが撒かれていない (累計 ${breaksAfter} のまま。`
-              + "撒く辺が離しから外れたか、停止側のログが出ていない)",
-    );
+    // T11 / T12 は録音の確定 (停止側のログ) と小窓の表示区間を要する。
+    // 録音デバイスの無いモードでは測れないので実行しない。**測っていないことは
+    // 最後の集計に書く** (SKIP の行を積むと run 全体が落ちるが、ここは
+    // モードを指定した時点で測らないと決めてある)。
+    if (NO_AUDIO) {
+      console.log("--    T11 / T12 は録音デバイス無しモードでは実行しない");
+    } else {
+      // --- T11 / T12: 単独 Alt のホットキーとフォーカス診断 (2026-08-29 の回帰)
+      //
+      // 何を検証しているか:
+      //   T11 = トリガーが Alt 単独 (既定の右 Alt) でも PTT が壊れないこと。
+      //         フックは**トリガーを離すたび**に VK_NONAME を 1 打撒く
+      //         (break_lone_alt)。押下の辺では撒かない — 低レベルフックは
+      //         前景アプリより先に走るので、押下時に撒くとダミーが Alt-down を
+      //         追い越し、アプリから見た押下〜離しの間が空のままになる
+      //         (2026-08-29 に一度そう書いて効かなかった。design.md の Q7)。
+      //         この打鍵が自分のホットキー解釈へ混ざると、押しても録音が
+      //         始まらなくなる — つまり修正そのものの陰性側の確認。
+      //         撒いたことは `[focus] 単独 Alt 対策の打鍵 累計 N 回` で見る
+      //         (フックからはログを出せないので、数字を後から読む形にしてある)。
+      //         この行は**録音の停止側** (request_finalize) で出る。撒く辺が
+      //         離しなので、開始時に読むと必ず「撒く前」の値になるため。
+      //         したがって計測は「録音確定を待ってから読む」順でなければならない。
+      //   T12 = 小窓の表示・非表示でキーボードフォーカスが動かないこと。
+      //         focus_probe が違反を見つけたら warn を出すので、その不在を見る。
+      //
+      // 何を検証**できていないか** (ここが本題なので必ず読むこと):
+      //   - **ブラウザの入力欄でキャレットが残るか**は測れていない。元の不具合は
+      //     「Chrome がツールバーへフォーカスを移し、ページの caret が消える」で、
+      //     これは Chrome の中の話なので Win32 の API (GetForegroundWindow /
+      //     GetGUIThreadInfo) からは見えない。DOM の blur を見るしかなく、
+      //     それには実ブラウザと実ページが要る。実機確認の手順は
+      //     docs/design.md の Q7 節を参照。
+      //   - 貼付 (Ctrl+V) 経路の診断も出ない。この E2E は API キーを与えないので
+      //     STT が失敗し、注入まで到達しない。
+      //   - 合成キーがフックへ届かない環境では T11 は SKIP になる (T1 と同じ較正)。
+      //     T12 は録音を伴わないので、フックに依らず判定できる。
+      killApp();
+      await sleep(1000);
+      const altCfg = {
+        ...readConfig(),
+        hotkey_vk: VK.RALT,
+        hotkey_mods: [],
+        // 小窓を出さないと表示・非表示の区間が測れない (T12 の前提)。
+        overlay_enabled: true,
+      };
+      fs.writeFileSync(CONFIG, JSON.stringify(altCfg, null, 2));
+      await startApp();
+      markLog();
+      const breaksBefore = lastLoneAltBreaks(readNewLog());
+      sendKeys(`down:A5,sleep:800,up:A5`, app.pid);
+      const altStarted = await waitForLog(STARTED, 6000);
+      const altFinalized = await waitForLog("録音確定", 8000);
+      const altLog = readNewLog();
+      const breaksAfter = lastLoneAltBreaks(altLog);
+      record(
+        "T11 単独 右Alt の PTT が効き、離しでダミーキーが 1 打撒かれる",
+        Boolean(altStarted && altFinalized) && breaksAfter > breaksBefore,
+        !altStarted
+          ? "右 Alt を押しても録音が始まらない (撒いたダミーキーが自分の解釈へ混ざっている可能性)"
+          : !altFinalized
+            ? "右 Alt を離しても録音が確定しない"
+            : breaksAfter > breaksBefore
+              ? `ダミーキー累計 ${breaksBefore} → ${breaksAfter}`
+              : `録音は通ったがダミーキーが撒かれていない (累計 ${breaksAfter} のまま。`
+                + "撒く辺が離しから外れたか、停止側のログが出ていない)",
+      );
 
-    // 小窓の区間で違反 warn が出ていないこと。
-    // 出ている場合はその行をそのまま detail に載せる — 「動いた」だけでは
-    // どこで動いたのか分からないため。
-    const focusViolation = altLog
-      .split(/\r?\n/)
-      .find((l) => l.includes("[focus]") && l.includes("フォーカスが動きました"));
-    const sawOverlayProbe = altLog.includes("[focus] オーバーレイ表示");
-    record(
-      "T12 小窓の表示・非表示でキーボードフォーカスが動かない",
-      sawOverlayProbe && !focusViolation,
-      focusViolation
-        ? `違反: ${focusViolation.trim()}`
-        : sawOverlayProbe
-          ? "オーバーレイ表示の区間を計測し、違反なし"
-          : "診断行が 1 行も出ていない (NOX_VOICE_LOG=debug が効いていないか、小窓が無効)",
-      false,
-    );
+      // 小窓の区間で違反 warn が出ていないこと。
+      // 出ている場合はその行をそのまま detail に載せる — 「動いた」だけでは
+      // どこで動いたのか分からないため。
+      const focusViolation = altLog
+        .split(/\r?\n/)
+        .find((l) => l.includes("[focus]") && l.includes("フォーカスが動きました"));
+      const sawOverlayProbe = altLog.includes("[focus] オーバーレイ表示");
+      record(
+        "T12 小窓の表示・非表示でキーボードフォーカスが動かない",
+        sawOverlayProbe && !focusViolation,
+        focusViolation
+          ? `違反: ${focusViolation.trim()}`
+          : sawOverlayProbe
+            ? "オーバーレイ表示の区間を計測し、違反なし"
+            : "診断行が 1 行も出ていない (NOX_VOICE_LOG=debug が効いていないか、小窓が無効)",
+        false,
+      );
+    }
 
   } finally {
     killApp();
     vite?.kill();
     await sleep(300);
-    if (fs.existsSync(CONFIG_BACKUP)) {
-      fs.copyFileSync(CONFIG_BACKUP, CONFIG);
-      fs.rmSync(CONFIG_BACKUP);
-      console.log("\n設定ファイルを元に戻しました");
-    }
+    restoreConfig();
   }
 
   const failed = results.filter((r) => r.verdict === "FAIL");
@@ -641,6 +727,11 @@ async function main() {
   console.log(
     `\n=== PASS ${passed.length} / FAIL ${failed.length} / SKIP ${skipped.length} (全 ${results.length}) ===`,
   );
+  if (NO_AUDIO) {
+    console.log(
+      "録音デバイス無しモード: 録音の確定 (T1 の後半) と T11 / T12 は測っていない。実機で測り直すこと。",
+    );
+  }
   if (skipped.length) {
     console.log("SKIP は合格ではない。合成入力がフックへ届く環境で測り直すこと。");
   }
@@ -651,10 +742,6 @@ main().catch((e) => {
   console.error(`E2E が異常終了: ${e.stack || e}`);
   killApp();
   vite?.kill();
-  if (fs.existsSync(CONFIG_BACKUP)) {
-    fs.copyFileSync(CONFIG_BACKUP, CONFIG);
-    fs.rmSync(CONFIG_BACKUP);
-    console.log("設定ファイルを元に戻しました");
-  }
+  restoreConfig();
   process.exit(2);
 });
