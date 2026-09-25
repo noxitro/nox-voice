@@ -1,0 +1,217 @@
+name: Release
+
+# タグ vX.Y.Z を push すると、CI と同じ検査を通したうえでインストーラを作り、
+# GitHub Release に公開する。
+#
+#   npm run version:set -- 0.6.0   # 5 か所の版を揃える
+#   git commit -am "chore: 0.6.0 へ上げる" && git push
+#   git tag v0.6.0 && git push origin v0.6.0
+#
+# 手動実行 (Run workflow) は予行演習: 公開も来歴の証明もせず、作った
+# インストーラを Actions の成果物として残すだけ。タグを打つ前に試せる。
+#
+# 版にハイフンを含むタグ (v0.6.0-beta.1) はプレリリースになる。MSI (WiX) は
+# 数字だけの版しか受け付けないので、そのときは NSIS のインストーラだけを作る。
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # リリースは途中で止めない (半端な Release が残る)
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: インストーラを作る
+    needs: ci
+    runs-on: windows-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      # 来歴の証明 (build provenance attestation) に要る
+      id-token: write
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: npm ci
+        run: npm ci
+
+      - name: 版がタグと一致するか
+        if: github.event_name == 'push'
+        run: node scripts/version.mjs check --tag "${{ github.ref_name }}"
+
+      - name: 版が揃っているか (予行演習)
+        if: github.event_name != 'push'
+        run: node scripts/version.mjs check
+
+      # 配布物はキャッシュを使わずに作る。
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo-about を入れる
+        # 版は CI (policy ジョブ) と揃える。about.toml はこの版で検証してある。
+        run: cargo install --locked cargo-about --version 0.9.2 --features cli
+
+      - name: 第三者ライセンス表示を作る
+        run: npm run notices
+
+      - name: インストーラをビルドする
+        shell: pwsh
+        run: |
+          # exe には依存クレートのソースの絶対パスが panic 位置として埋め込まれる
+          # (手元のビルドなら C:\Users\<ユーザー名>\.cargo\...)。付け替えて、
+          # どこでビルドしても同じ文字列になるようにする。
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+          $env:RUSTFLAGS = "--remap-path-prefix=$cargoHome=cargo --remap-path-prefix=$env:GITHUB_WORKSPACE=nox-voice"
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $bundles = if ($version -match '-') { 'nsis' } else { 'nsis,msi' }
+          "版 $version / バンドル $bundles"
+          # tauri.release.conf.json が LICENSE と THIRD_PARTY_NOTICES.txt をインストール先へ入れる
+          npx tauri build --ci --config src-tauri/tauri.release.conf.json --bundles $bundles
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 成果物とハッシュを揃える
+        shell: pwsh
+        run: |
+          $out = New-Item -ItemType Directory -Force release-assets
+          Copy-Item src-tauri/target/release/bundle/nsis/*-setup.exe $out
+          if (Test-Path src-tauri/target/release/bundle/msi) {
+            Copy-Item src-tauri/target/release/bundle/msi/*.msi $out
+          }
+          Copy-Item src-tauri/target/release-extras/THIRD_PARTY_NOTICES.txt $out
+          # sha256sum -c でもそのまま使える書式 ("<ハッシュ>  <ファイル名>")
+          Get-ChildItem $out -File | Sort-Object Name | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
+          } | Set-Content -Path (Join-Path $out 'SHA256SUMS.txt') -Encoding ascii
+          Get-Content (Join-Path $out 'SHA256SUMS.txt')
+
+      - name: NSIS インストーラを実際に入れて起動を確かめる
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem release-assets -Filter '*-setup.exe' | Select-Object -First 1
+          $p = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "インストーラが失敗した (exit $($p.ExitCode))" }
+          # インストール先はアンインストール情報から読む。無ければユーザー単位の
+          # インストール (Tauri の NSIS の既定) の %LOCALAPPDATA%\<productName>。
+          $reg = Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
+            Get-ItemProperty | Where-Object { $_.DisplayName -eq 'nox-voice' } | Select-Object -First 1
+          $dir = if ($reg.InstallLocation) { $reg.InstallLocation.Trim('"') } else { Join-Path $env:LOCALAPPDATA 'nox-voice' }
+          foreach ($f in 'nox-voice.exe', 'LICENSE.txt', 'THIRD_PARTY_NOTICES.txt', 'uninstall.exe') {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "インストール先に $f が無い ($dir)" }
+          }
+          "インストール先: $dir"
+          $env:NOX_E2E_EXE = Join-Path $dir 'nox-voice.exe'
+          node e2e/single-instance.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'インストールした exe で多重起動の E2E が落ちた' }
+          # _?= を付けると、アンインストーラが一時コピーから走り直さずその場で動く。
+          # 付けないと -Wait が本体の終了を待てない (uninstall.exe 自身は残る)。
+          $u = Start-Process -FilePath (Join-Path $dir 'uninstall.exe') -ArgumentList '/S', "_?=$dir" -Wait -PassThru
+          if ($u.ExitCode -ne 0) { throw "アンインストーラが失敗した (exit $($u.ExitCode))" }
+          if (Test-Path (Join-Path $dir 'nox-voice.exe')) { throw 'アンインストール後も exe が残っている' }
+
+      - name: MSI インストーラを実際に入れて起動を確かめる
+        if: ${{ hashFiles('release-assets/*.msi') != '' }}
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem release-assets -Filter '*.msi' | Select-Object -First 1
+          $log = Join-Path $env:RUNNER_TEMP 'msi-install.log'
+          $p = Start-Process msiexec.exe -ArgumentList '/i', "`"$($msi.FullName)`"", '/qn', '/l*v', "`"$log`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content $log -Tail 40; throw "MSI のインストールが失敗した (exit $($p.ExitCode))" }
+          $exe = Get-ChildItem "$env:ProgramFiles\nox-voice", "${env:ProgramFiles(x86)}\nox-voice" -Filter 'nox-voice.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { throw 'MSI のインストール先に nox-voice.exe が見つからない' }
+          foreach ($f in 'LICENSE.txt', 'THIRD_PARTY_NOTICES.txt') {
+            if (-not (Test-Path (Join-Path $exe.DirectoryName $f))) { throw "インストール先に $f が無い ($($exe.DirectoryName))" }
+          }
+          "インストール先: $($exe.DirectoryName)"
+          $env:NOX_E2E_EXE = $exe.FullName
+          node e2e/single-instance.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'MSI で入れた exe で多重起動の E2E が落ちた' }
+          $u = Start-Process msiexec.exe -ArgumentList '/x', "`"$($msi.FullName)`"", '/qn' -Wait -PassThru
+          if ($u.ExitCode -ne 0) { throw "MSI のアンインストールが失敗した (exit $($u.ExitCode))" }
+
+      - name: 来歴の証明 (このリポジトリのこのタグからビルドしたこと)
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            release-assets/*.exe
+            release-assets/*.msi
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-assets
+          path: release-assets/
+          if-no-files-found: error
+
+  publish:
+    name: GitHub Release に公開する
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Release を作るのはこのジョブだけ
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: リリースノートを組み立てて公開する
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          setup="$(cd release-assets && ls -- *-setup.exe)"
+          prerelease=""
+          case "$version" in *-*) prerelease="--prerelease" ;; esac
+
+          {
+            echo "## インストール"
+            echo
+            echo "\`$setup\` を実行してください (ユーザー単位のインストールで、管理者権限は要りません)。"
+            if ls release-assets/*.msi >/dev/null 2>&1; then
+              echo "PC 全体へ入れる場合は MSI (\`$(cd release-assets && ls -- *.msi)\`) を使います。"
+            fi
+            echo
+            echo "> 署名していないため、SmartScreen が警告を出します。「詳細情報」→「実行」で進めてください。"
+            echo
+            echo "## ダウンロードしたファイルの確かめ方"
+            echo
+            echo "- **ハッシュ**: \`SHA256SUMS.txt\` と照合できます (PowerShell: \`Get-FileHash .\\$setup\`)"
+            echo "- **来歴**: この Release のインストーラは、GitHub Actions がこのリポジトリの \`$TAG\` からビルドしたものです。GitHub CLI で検証できます:"
+            echo
+            echo '  ```'
+            echo "  gh attestation verify $setup --repo $GITHUB_REPOSITORY"
+            echo '  ```'
+            echo
+            echo "同梱している第三者ソフトウェアのライセンス表示は \`THIRD_PARTY_NOTICES.txt\` にあります (インストール先にも入ります)。"
+            echo
+            gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" -f tag_name="$TAG" --jq .body
+          } > notes.md
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # 再実行: 既にある Release の成果物だけを差し替える
+            gh release upload "$TAG" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" release-assets/* --repo "$GITHUB_REPOSITORY" \
+              --title "nox-voice $version" --notes-file notes.md --verify-tag $prerelease
+          fi
