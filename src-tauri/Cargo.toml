@@ -3,6 +3,10 @@ name = "nox-voice"
 version = "0.5.1"
 description = "Windows 11 向け AI 音声入力常駐アプリ"
 authors = ["noxitro"]
+license = "MIT"
+repository = "https://github.com/noxitro/nox-voice"
+# crates.io へは出さない (誤って cargo publish しないため)。
+publish = false
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
