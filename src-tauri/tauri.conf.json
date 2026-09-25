@@ -30,12 +30,27 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "noxitro",
+    "copyright": "Copyright (c) 2026 nitro",
+    "homepage": "https://github.com/noxitro/nox-voice",
+    "license": "MIT",
+    "category": "Productivity",
+    "shortDescription": "Windows 向けの常駐型 AI 音声入力",
+    "longDescription": "ホットキーを押して話すと、フィラーと言い直しを取り除き句読点を整えたテキストを、いま入力中のアプリへそのまま貼り付ける常駐アプリ。",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "languages": [
+          "English",
+          "Japanese"
+        ]
+      }
+    }
   }
 }
