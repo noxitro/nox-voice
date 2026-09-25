@@ -1,0 +1,73 @@
+name: Live API
+
+# 実際の Groq / Gemini を呼んで、音声認識と整形がまだ通るかを確かめる。
+# 提供元側の変更 (モデルの廃止・応答形式の変更・障害) は、コードを変えなくても
+# 起きるので、定期的に外から叩いて気づく。
+#
+# 使うのは合成音声 (tests/assets/japanese-sample.wav、SAPI) と固定の例文だけ。
+# 利用者の設定や履歴は一切読まない (live_format_ab_over_history などは対象外)。
+#
+# 有効にするには (リポジトリの Settings → Secrets and variables → Actions):
+#   Secrets   GROQ_API_KEY / GEMINI_API_KEY   … 無料枠のキーでよい
+#   Variables LIVE_API_TESTS = true            … 毎週の定期実行を有効にする
+# 手動実行 (Run workflow) は変数に関係なく走り、キーが無ければ理由を出して落ちる。
+#
+# Secrets はフォークからの PR には渡らない。このワークフローは PR では走らない。
+
+on:
+  schedule:
+    # 毎週水曜 04:17 (UTC)
+    - cron: "17 4 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-api
+  cancel-in-progress: false
+
+jobs:
+  live:
+    name: 実 API の疎通と中身
+    if: github.event_name == 'workflow_dispatch' || vars.LIVE_API_TESTS == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: キーが登録されているか
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        shell: pwsh
+        run: |
+          # テスト側はキーが無いと「スキップします」と言って PASS で終わる。
+          # CI でそれを許すと、何も測っていない緑になる。ここで先に落とす。
+          $missing = @('GROQ_API_KEY', 'GEMINI_API_KEY') | Where-Object { -not [Environment]::GetEnvironmentVariable($_) }
+          if ($missing) {
+            "::error::Secrets に $($missing -join ' / ') が無い。Settings → Secrets and variables → Actions で登録すること"
+            exit 1
+          }
+
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: 実 API のテスト
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        # 無料枠のレート制限に当たらないよう直列で。
+        # live_gemini_screen_ask は _resists_injection (画面の命令に従わない) も拾う。
+        run: >-
+          cargo test --manifest-path src-tauri/Cargo.toml --lib --
+          --ignored --test-threads=1 --nocapture
+          live_groq_transcription
+          live_groq_transcribes_real_japanese
+          live_groq_formatting
+          live_gemini_formatting
+          live_gemini_screen_ask
