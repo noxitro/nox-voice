@@ -1,0 +1,53 @@
+# cargo-deny の方針。CI の policy ジョブとリリースの前に走る。
+#
+#   cargo deny --manifest-path src-tauri/Cargo.toml check
+#
+# 配布するのは Windows (x64) 向けのバイナリだけなので、その依存グラフだけを見る。
+# local-stt (whisper.cpp) も配布しうる構成なので、全フィーチャ込みで確かめる。
+
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+all-features = true
+
+[advisories]
+# 脆弱性の勧告が出た依存が入っていたら落とす (RustSec)。
+# 「メンテナンス終了」の勧告は、自分で選んだ直接の依存についてだけ落とす。
+# Tauri などの奥にある推移的な依存は、こちらからは差し替えられないため。
+unmaintained = "workspace"
+yanked = "warn"
+ignore = []
+
+[licenses]
+# 配布物に同梱して問題ないと確認したライセンスだけを許す。
+# 新しい依存がこれ以外を持ち込んだら CI が落ちる (黙って配布しない)。
+#
+# - MPL-2.0 は cssparser / selectors ほか (Tauri 経由)。改変せずに使う限り、
+#   配布物にライセンス本文と入手先を添えれば足りる。THIRD_PARTY_NOTICES が
+#   それを担う (scripts/third-party-notices.mjs)
+# - GPL / LGPL / AGPL は入れない。入れるなら配布の仕方から考え直すこと
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.93
+
+[bans]
+# tauri と windows 系のクレートは複数の版が同居するのが常態なので咎めない。
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+# crates.io 以外 (git 直指定・野良レジストリ) からは取らない。
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
