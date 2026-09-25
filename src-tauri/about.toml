@@ -1,0 +1,23 @@
+# cargo-about の設定。配布物に同梱する第三者ライセンス表示の Rust 側を作る。
+# 直接は使わない — scripts/third-party-notices.mjs が呼ぶ。
+#
+# accepted は deny.toml の [licenses] allow と同じ並びにしておくこと
+# (方針の検査は cargo-deny、本文の収集は cargo-about、と役割を分けている)。
+accepted = [
+  "0BSD",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+# 配布するのは Windows x64 のバイナリだけ。
+targets = ["x86_64-pc-windows-msvc"]
+# テスト専用の依存はバイナリに入らない。
+ignore-dev-dependencies = true
