@@ -1,0 +1,31 @@
+<!--
+  nox-voice のアプリアイコンの原本。
+
+  Tauri の既定アイコン (Tauri のロゴ) のまま配布しないこと。
+  Tauri の商標ガイドラインが明示している: https://tauri.app/about/trademark/
+
+  このファイルを直したら、同じディレクトリの PNG / ICO / ICNS を作り直す:
+    npx tauri icon src-tauri/icons/app-icon.svg -o <一時ディレクトリ>
+  出力のうちデスクトップ用 (32x32.png / 128x128.png / 128x128@2x.png /
+  icon.png / icon.ico / icon.icns / Square*Logo.png / StoreLogo.png) だけを
+  ここへ写す。android/ と ios/ は使わない。
+
+  意匠: 夜 (nox) の地に、声の強弱を表す 3 本の棒。中央だけアクセント色。
+  トレイの 16px でも棒が潰れないよう、本数を 3 本に抑えて太くしてある。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="night" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#27345f"/>
+      <stop offset="1" stop-color="#11141f"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8fb8f7"/>
+      <stop offset="1" stop-color="#4f86ec"/>
+    </linearGradient>
+  </defs>
+  <rect x="48" y="48" width="928" height="928" rx="216" fill="url(#night)"/>
+  <rect x="197" y="347" width="150" height="330" rx="75" fill="#f2f2f4"/>
+  <rect x="437" y="232" width="150" height="560" rx="75" fill="url(#accent)"/>
+  <rect x="677" y="347" width="150" height="330" rx="75" fill="#f2f2f4"/>
+</svg>
