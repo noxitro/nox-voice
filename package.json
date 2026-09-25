@@ -15,6 +15,8 @@
     "sim": "npm run sim:instance && npm run sim:ui",
     "sim:instance": "cargo test --manifest-path src-tauri/Cargo.toml --lib instance::sim -- --nocapture",
     "sim:ui": "node e2e/sim-ui.mjs",
+    "version:check": "node scripts/version.mjs check",
+    "version:set": "node scripts/version.mjs set",
     "notices": "node scripts/third-party-notices.mjs src-tauri/target/release-extras/THIRD_PARTY_NOTICES.txt"
   },
   "dependencies": {
