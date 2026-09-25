@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "resources": {
+      "../LICENSE": "LICENSE.txt",
+      "target/release-extras/THIRD_PARTY_NOTICES.txt": "THIRD_PARTY_NOTICES.txt"
+    }
+  }
+}
