@@ -1,5 +1,8 @@
 # nox-voice
 
+[![CI](https://github.com/noxitro/nox-voice/actions/workflows/ci.yml/badge.svg)](https://github.com/noxitro/nox-voice/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/noxitro/nox-voice/actions/workflows/codeql.yml/badge.svg)](https://github.com/noxitro/nox-voice/actions/workflows/codeql.yml)
+
 Windows 11 向けの常駐型 AI 音声入力アプリ。ホットキーを押して話すと、フィラーと言い直しを取り除き句読点を整えたテキストが、**いま入力中のアプリへそのまま貼り付けられます**。
 
 チャット・エディタ・ブラウザなど、貼り付け先は問いません。
@@ -36,9 +39,22 @@ Windows 11 向けの常駐型 AI 音声入力アプリ。ホットキーを押�
 
 ## インストール
 
-リリースページの `nox-voice_x.y.z_x64-setup.exe` を実行してください。
+[リリースページ](https://github.com/noxitro/nox-voice/releases/latest)の `nox-voice_x.y.z_x64-setup.exe` を実行してください(ユーザー単位のインストールで、管理者権限は要りません)。PC 全体へ入れる場合は同じページの MSI を使います。
 
-> **署名していないため、SmartScreen が警告を出します。** 「詳細情報」→「実行」で進めてください。気になる場合は下記の手順で自分でビルドしてください。
+> **署名していないため、SmartScreen が警告を出します。** 「詳細情報」→「実行」で進めてください。気になる場合は、下記の方法で配布物を確かめるか、自分でビルドしてください。
+
+### ダウンロードしたファイルの確かめ方
+
+配布物はすべて GitHub Actions がこのリポジトリのタグからビルドしたもので、手元でビルドしたものは置いていません。
+
+- **ハッシュ**: 同じページの `SHA256SUMS.txt` と照合できます(PowerShell: `Get-FileHash .\nox-voice_x.y.z_x64-setup.exe`)
+- **来歴**: どのリポジトリのどのタグから Actions がビルドしたかを、[GitHub CLI](https://cli.github.com/) で検証できます
+
+  ```
+  gh attestation verify nox-voice_x.y.z_x64-setup.exe --repo noxitro/nox-voice
+  ```
+
+同梱している第三者ソフトウェアのライセンス表示は `THIRD_PARTY_NOTICES.txt` にあります(インストール先にも入ります)。
 
 ## API キーの設定
 
@@ -88,6 +104,8 @@ Node.js 24 以上と Rust の安定版が要ります。成果物は `src-tauri/
 
 ローカル音声認識を含める場合は `--features local-stt` を付けます。whisper.cpp のビルドに CMake と C++ ツールチェーンが必要になるため、既定では外してあります。
 
+> 手元でビルドした exe には、依存クレートの絶対パス(`C:\Users\<ユーザー名>\.cargo\...`)が埋め込まれます。人に配るものは、下の「リリースの手順」で CI に作らせてください(CI はパスを付け替え、ライセンス表示を同梱します)。
+
 ### 検証
 
 ```bash
@@ -95,7 +113,37 @@ npm run build                                                    # 型検査 + �
 cargo clippy --manifest-path src-tauri/Cargo.toml --lib --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml --lib
 npm run sim                                                      # 疑似 E2E
+npm run version:check                                            # 版が 5 か所で揃っているか
 ```
+
+実機 E2E(`npm run e2e:hotkey` など)は実行中のアプリを落とし、本物の設定ファイルを書き換えます。走らせる前に [docs/hotkey-e2e.md](docs/hotkey-e2e.md) を読んでください。
+
+## CI とリリース
+
+GitHub Actions で次を回しています。
+
+| ワークフロー | いつ | 何をするか |
+|---|---|---|
+| CI | main への push / PR | 型検査・clippy・単体テスト・疑似 E2E、リリース構成の exe での実機 E2E(Windows ランナー)、依存のライセンス・脆弱性の検査 |
+| CodeQL | main への push / PR / 毎週 | コードの静的解析(結果は Security タブ) |
+| Release | タグ `v*.*.*` | CI を通したうえでインストーラを作り、実際に入れて起動を確かめてから Release に公開 |
+| Live API | 毎週(要設定)/ 手動 | 実際の Groq / Gemini で音声認識と整形がまだ通るか |
+
+依存の更新 PR は Dependabot が毎週作ります。Tauri だけは、Rust 側と JS 側の版(major.minor)を揃えて手で上げます。
+
+### リリースの手順
+
+```bash
+npm run version:set -- 0.6.0          # 5 か所の版を揃える
+git commit -am "chore: 0.6.0 へ上げる" && git push
+git tag v0.6.0 && git push origin v0.6.0
+```
+
+タグを打つ前に試したいときは、Actions の Release を手動実行(Run workflow)します。公開はせず、作ったインストーラを成果物として残します。版にハイフンを含むタグ(`v0.6.0-beta.1`)はプレリリースになります。
+
+### 実 API のテストを有効にする
+
+Settings → Secrets and variables → Actions で、Secrets に `GROQ_API_KEY` と `GEMINI_API_KEY`、Variables に `LIVE_API_TESTS` = `true` を登録します。送るのは合成音声と固定の例文だけで、キーはフォークからの PR には渡りません。
 
 ## 既知の制限
 
