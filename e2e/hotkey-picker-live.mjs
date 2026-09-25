@@ -15,13 +15,18 @@
 //     「貼り付け」「クリップボードのみ」の 2 用途だけを診断前の値へ戻す。
 //     スナップショット丸ごとの書き戻しはしない — 一度それで別の変更を消した
 //   - 作業中のマシンでは走らせない。走らせたあとは自分でアプリを起動し直すこと
+//   - 設定ファイルがまだ無いマシン (CI のランナーなど) では、診断で作られた
+//     設定ファイルを終了時に消して「無い」状態へ戻す
+//
+// 測る exe は `NOX_E2E_EXE` で差し替えられる (既定は release ビルド)。
 //
 // 実行: npm run e2e:picker-live
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 
-const REPO = "E:\\dev\\github.com\\noxitro\\nox-voice";
-const EXE = `${REPO}\\src-tauri\\target\\release\\nox-voice.exe`;
+const REPO = path.resolve(import.meta.dirname, "..");
+const EXE = process.env.NOX_E2E_EXE || path.join(REPO, "src-tauri", "target", "release", "nox-voice.exe");
 const LOG = `${process.env.LOCALAPPDATA}\\com.noxitro.nox-voice\\logs\\nox-voice.log`;
 const PORT = 9333;
 const F13 = 124, F14 = 125;
@@ -122,11 +127,16 @@ async function pickViaList(cdp, prefix, vk) {
   })()`);
 }
 
+if (!fs.existsSync(EXE)) {
+  console.error(`exe が無い: ${EXE}\nnpm run release を先に通すこと。`);
+  process.exit(2);
+}
 killApp();
 await sleep(1200);
 // 設定ファイルの現在値を控えておき、最後に戻す (この診断は本当に設定を書き換える)。
+// 無いときは null。終了時に、診断で作られた設定ファイルを消す。
 const cfgPath = `${process.env.APPDATA}\\com.noxitro.nox-voice\\config.json`;
-const cfgBackup = fs.readFileSync(cfgPath, "utf8");
+const cfgBackup = fs.existsSync(cfgPath) ? fs.readFileSync(cfgPath, "utf8") : null;
 
 const app = spawn(EXE, [], {
   env: { ...process.env, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${PORT}`, NOX_VOICE_LOG: "debug" },
@@ -141,8 +151,9 @@ try {
   await cdp.eval(`document.querySelector('.nav-item[data-section="hotkeys"]')?.click()`);
   await sleep(300);
 
-  // --- P0: 貼り付け用をいったん F15 へ (設定は既に F13 なので、F13→F13 では
-  //   Rust が「変更なし」と正しく判断してログが出ない。実際に変わる操作にする)
+  // --- P0: 貼り付け用をいったん F15 へ (開発機の設定は F13 のことが多く、
+  //   F13→F13 では Rust が「変更なし」と正しく判断してログが出ない。
+  //   どの初期値からでも実際に変わる操作にする)
   const F15 = 126;
   let pos = logSize();
   let r = await pickViaList(cdp, "hotkey", F15);
@@ -188,12 +199,17 @@ try {
   // 既知の正しい値へ明示的に戻す。アプリは止めてあるので JSON 直書きで安全。
   killApp();
   await sleep(600);
-  const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
-  const before = JSON.parse(cfgBackup);
-  cfg.hotkey_vk = before.hotkey_vk; cfg.hotkey_mods = before.hotkey_mods;
-  cfg.clipboard_hotkey_vk = before.clipboard_hotkey_vk; cfg.clipboard_hotkey_mods = before.clipboard_hotkey_mods;
-  fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
-  console.log(`ホットキーを診断前の値へ戻しました (貼り付け vk=${cfg.hotkey_vk} / クリップボード vk=${cfg.clipboard_hotkey_vk})`);
+  if (cfgBackup === null) {
+    fs.rmSync(cfgPath, { force: true });
+    console.log("診断前は設定ファイルが無かったので、診断で作られたものを消しました");
+  } else {
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+    const before = JSON.parse(cfgBackup);
+    cfg.hotkey_vk = before.hotkey_vk; cfg.hotkey_mods = before.hotkey_mods;
+    cfg.clipboard_hotkey_vk = before.clipboard_hotkey_vk; cfg.clipboard_hotkey_mods = before.clipboard_hotkey_mods;
+    fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+    console.log(`ホットキーを診断前の値へ戻しました (貼り付け vk=${cfg.hotkey_vk} / クリップボード vk=${cfg.clipboard_hotkey_vk})`);
+  }
 }
 
 const failed = results.filter((x) => !x.ok).length;
