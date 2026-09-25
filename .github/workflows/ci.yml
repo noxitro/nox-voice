@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
-    # 文書だけの変更で windows ランナー (無料枠 2 倍消費) を起こさない
+    # 文書だけの変更で Windows ランナーを起こさない
     paths-ignore:
       - '**.md'
       - 'docs/**'
@@ -17,33 +17,45 @@ on:
       - 'docs/**'
       - '.gitignore'
       - 'LICENSE'
-  # 枠が尽きたとき / 手元で確認したあとに任意で回すため
+  # 手元で確認したあとに任意で回すため
   workflow_dispatch:
+  # release.yml がタグの検証として丸ごと呼ぶ。リリースは CI と同じ門を通す。
+  workflow_call:
 
-# 同じブランチへの連続 push は古い方を止める (Windows ランナーは高くつく)。
+# 既定では何も書けない。フォークからの PR も同じ権限で走る (Secrets は渡らない)。
+permissions:
+  contents: read
+
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # github.workflow は使わない。workflow_call で呼ばれたときは呼び出し元
+  # (Release) の名前になり、呼び出し元と同じグループに入って互いを止め合う。
+  group: ci-${{ github.ref }}
+  # PR は新しい push で古い run を止める。main はコミットごとに結果を残す
+  # (どのコミットで壊れたかを後から追えるように)。
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  build-and-test:
+  check:
+    name: 検査 (型 / clippy / 単体テスト / 疑似 E2E)
     # このアプリは Win32 API (WH_KEYBOARD_LL / UIA / DWM) に直接依存するため、
     # ubuntu では cargo check すら通らない。windows-latest 一択。
     runs-on: windows-latest
-    # 付けていないと事故ったとき 6 時間回り続けて枠を溶かす。
-    # 実測は 1 回 10 分 (= 請求 20 分)。
-    timeout-minutes: 25
+    # 付けていないと事故ったとき 6 時間回り続ける。実測は 1 回 10 分。
+    timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: "24"
           cache: "npm"
 
       - name: npm ci
         run: npm ci
+
+      - name: 版が 5 か所で揃っているか
+        run: npm run version:check
 
       - name: フロントエンド型検査 + ビルド
         run: npm run build
@@ -64,5 +76,151 @@ jobs:
       - name: cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 
+      - name: 実クリップボードを使うテスト (inject の #[ignore] を直列で)
+        # 開発機では利用者のクリップボードに触るので手動にしてあるが、
+        # 使い捨てのランナーなら毎回走らせられる。
+        # (末尾の "::" は YAML の素の値に書くとマッピング扱いになるので、ブロックで渡す)
+        run: >-
+          cargo test --manifest-path src-tauri/Cargo.toml --lib --
+          --ignored --test-threads=1 inject::tests::
+
       - name: 疑似 E2E (headless Edge, モック Tauri)
         run: node e2e/sim-ui.mjs
+
+  e2e:
+    name: 実機 E2E (リリース構成の exe)
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: npm ci
+        run: npm ci
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          # check ジョブ (debug / test) とは成果物が別なのでキャッシュも分ける
+          key: release
+
+      - name: WebView2 ランタイムを確かめる
+        shell: pwsh
+        run: |
+          # Microsoft が案内している検出方法: EdgeUpdate の Clients に pv があれば入っている。
+          $id = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          $pv = @(
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$id",
+            "HKCU:\Software\Microsoft\EdgeUpdate\Clients\$id"
+          ) | ForEach-Object { (Get-ItemProperty -Path $_ -Name pv -ErrorAction SilentlyContinue).pv } |
+            Where-Object { $_ -and $_ -ne '0.0.0.0' } | Select-Object -First 1
+          if ($pv) { "WebView2 Runtime $pv"; exit 0 }
+          'WebView2 Runtime が無いので入れる'
+          $setup = Join-Path $env:RUNNER_TEMP 'MicrosoftEdgeWebview2Setup.exe'
+          Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $setup
+          Start-Process -FilePath $setup -ArgumentList '/silent', '/install' -Wait
+
+      - name: リリース構成でビルド (tauri build --no-bundle)
+        id: build
+        # cargo build --release だけでは frontendDist を同梱しない dev 焼き込みの exe に
+        # なる (docs/handoff.md)。配布物と同じ tauri build を通す。Rust 側と JS 側の
+        # Tauri の版ずれ (major.minor) もここで検出される。
+        run: npx tauri build --no-bundle
+
+      - name: 多重起動 (single-instance)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          NOX_E2E_EXE: ${{ github.workspace }}\src-tauri\target\release\nox-voice.exe
+        run: node e2e/single-instance.mjs
+
+      - name: ホットキーの一覧選択 (picker-live)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          NOX_E2E_EXE: ${{ github.workspace }}\src-tauri\target\release\nox-voice.exe
+        run: node e2e/hotkey-picker-live.mjs
+
+      - name: ホットキー経路 (hotkey、録音デバイス無し)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          NOX_E2E_EXE: ${{ github.workspace }}\src-tauri\target\release\nox-voice.exe
+          # ランナーには音声デバイスが無い。測れないもの (録音の確定 / T11 / T12) は
+          # ハーネスが集計に書く (docs/hotkey-e2e.md の「CI で走らせる」)。
+          NOX_E2E_NO_AUDIO: "1"
+        run: node e2e/hotkey.mjs
+
+      - name: 失敗したらアプリのログを集める
+        if: failure()
+        shell: pwsh
+        run: |
+          $logs = Join-Path $env:LOCALAPPDATA 'com.noxitro.nox-voice\logs'
+          New-Item -ItemType Directory -Force e2e-logs | Out-Null
+          if (Test-Path $logs) { Copy-Item "$logs\*" e2e-logs -Recurse }
+
+      - name: アプリのログを残す
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: e2e-app-logs
+          path: e2e-logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  policy:
+    name: 依存の方針と第三者ライセンス表示
+    # cargo metadata と cargo-about / cargo-deny はビルドしないので ubuntu で足りる。
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: npm ci
+        run: npm ci
+
+      - name: 検査ツールのキャッシュ
+        id: tools
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo-tools
+          # 設定 (deny.toml / about.toml) はこの版で検証してある。上げるときは両方を見直す。
+          key: cargo-tools-${{ runner.os }}-deny-0.20.2-about-0.9.2
+
+      - name: cargo-deny / cargo-about を入れる
+        if: steps.tools.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked --root ~/.cargo-tools cargo-deny --version 0.20.2
+          cargo install --locked --root ~/.cargo-tools cargo-about --version 0.9.2 --features cli
+
+      - run: echo "$HOME/.cargo-tools/bin" >> "$GITHUB_PATH"
+
+      - name: cargo deny (ライセンス / RustSec の勧告 / 取得元)
+        run: cargo deny --manifest-path src-tauri/Cargo.toml check
+
+      - name: 第三者ライセンス表示を作れるか (リリースと同じ手順)
+        run: npm run notices
+
+  dependency-review:
+    name: 依存の差分 (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 新しく入る依存に重大な脆弱性が無いか
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high

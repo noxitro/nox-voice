@@ -1,0 +1,39 @@
+# 依存の更新 PR を毎週作る。PR には CI (Windows の検査と実機 E2E) が走るので、
+# 緑のものを取り込めばよい。
+#
+# Tauri だけは手で上げる: Rust 側 (tauri / tauri-plugin-*) と JS 側
+# (@tauri-apps/*) の major.minor が揃っていないと tauri build が失敗する。
+# 片側だけ上げる PR は必ず落ちるので、minor 以上は作らせない (patch は揃えなくてよい)。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      npm-minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "@tauri-apps/*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "tauri"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "tauri-*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
