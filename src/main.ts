@@ -1851,6 +1851,19 @@ let captureProgressSeq = 0;
  * Rust がまだ捕獲モードに入っていないうちに確定が届いて弾かれる。 */
 let captureStartPending: Promise<boolean> | null = null;
 
+/** アプリ自身がフックの生存確認に送るダミーキーの VK (`VK_NONAME`、
+ * Rust 側 `hotkey::HEARTBEAT_VK`)。捕獲はこれを押されたキーとして数えない。
+ *
+ * 捕獲の開始時、Rust はフックの生存を 1 回確かめるために、このキーを
+ * `SendInput` で自分宛てに送る (`hotkey::ensure_hook_alive_async`)。合成キーは
+ * 前景のウィンドウにも届くので、ボタンを押した直後 = この画面が前景のときは
+ * 捕獲の keydown / keyup に入ってくる。`code` が空 ("Unidentified") なので、
+ * 拾うと押してもいないのに「このキー (Unidentified) はホットキーに使えません」
+ * と出る (2026-09-26、画面が必ず前景になる CI の実機 E2E で発覚)。
+ * `VK_NONAME` は Microsoft が「ダミーのキーストローク用」とする VK で、
+ * 物理キーからは来ない。`code` では見分けられないので `keyCode` で見る。 */
+const HEARTBEAT_KEY_CODE = 0xfc;
+
 /** Rust 側 `CAPTURE_TIMEOUT` と揃えた既定の残り秒。
  *
  * 正は Rust (`start_hotkey_capture` の戻り値)。捕獲の受け入れ態勢を IPC より
@@ -1954,6 +1967,7 @@ function onCaptureKeyDown(event: KeyboardEvent) {
   if (!capturingMode) return;
   event.preventDefault();
   event.stopPropagation();
+  if (event.keyCode === HEARTBEAT_KEY_CODE) return;
   // オートリピートは 1 回の押下に畳む (フック側と同じ扱い)。
   if (event.repeat) return;
   // `code` が空になる環境がある (IME 経由の合成キーなど)。捨てずに
@@ -1975,6 +1989,7 @@ function onCaptureKeyUp(event: KeyboardEvent) {
   if (!capturingMode) return;
   event.preventDefault();
   event.stopPropagation();
+  if (event.keyCode === HEARTBEAT_KEY_CODE) return;
   const code = event.code || "Unidentified";
   // 捕獲開始前から押されていたキーの離しは無視する。さもないと
   // 「押してもいないキーを離した」だけで確定処理が走る。
