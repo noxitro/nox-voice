@@ -561,13 +561,9 @@ fn start_hotkey_capture(app: AppHandle, mode: Option<String>) -> Result<u64, Str
 
     let generation = hotkey::begin_capture();
 
-    // 捕獲そのものはフックに依存しなくなったが、**設定したホットキーを押す
-    // 経路は依存したまま**。ユーザーがこの画面に居るということは、直後に
-    // 押して試すということなので、ここでフックの生存を 1 回確かめておく。
-    // 「設定はできたのに押しても録音が始まらない」を減らすための止血
-    // ([`hotkey::ensure_hook_alive_async`] の doc)。捕獲の表示を遅らせない
-    // よう、確認は別スレッドで走る。
-    hotkey::ensure_hook_alive_async("キー捕獲の開始");
+    // フックの生存確認はここでは行わない。設定画面が前景のあいだは確かめようが
+    // ない (hotkey::HookProbe::OwnWindowForeground)。設定画面から離れた瞬間に
+    // 確かめる (run の on_window_event)。
 
     // 時間で必ず畳む。自分の世代のときだけ効く。
     let timer_app = app.clone();
@@ -1280,6 +1276,7 @@ pub fn run() {
             describe_hotkey_codes,
             describe_hotkey_vks,
             finish_hotkey_capture,
+            window_hotkey_key,
             list_hotkey_keys,
             set_hotkey_from_list,
             clear_hotkey,
@@ -1368,6 +1365,14 @@ pub fn run() {
                 api.prevent_close();
                 if let Err(e) = window.hide() {
                     log::warn!("ウィンドウの非表示に失敗: {e}");
+                }
+            }
+            // 設定画面から離れた瞬間に、フックの生存を 1 回確かめる。利用者は
+            // ホットキーを設定したあと、他のアプリへ移って押して試す。設定画面が
+            // 前景のあいだは確かめようがない ([`hotkey::ensure_hook_alive_async`] の doc)。
+            if let tauri::WindowEvent::Focused(false) = event {
+                if window.label() == "main" {
+                    hotkey::ensure_hook_alive_async("設定画面から離れた");
                 }
             }
         })
@@ -3118,6 +3123,17 @@ enum CaptureVerdict {
     Rejected { message: String },
     /// 捕獲が既に畳まれていた (タイムアウト・区画切替・窓から離れた)。
     Expired { message: String },
+}
+
+/// 設定画面のページが受けたキーを、ホットキーの状態機械へ渡す
+/// ([`hotkey::feed_window_key`])。
+///
+/// 設定画面 (WebView2) が前景のあいだ、Windows は低レベルフックを呼ばない
+/// (`docs/hotkey-e2e.md`)。そのあいだもホットキーが効くよう、フロントが
+/// `keydown` / `keyup` の `KeyboardEvent.code` を順番どおりに送ってくる。
+#[tauri::command]
+fn window_hotkey_key(code: String, down: bool) {
+    hotkey::feed_window_key(&code, down);
 }
 
 /// 設定 UI のキー捕獲を確定する (フロントの DOM が「全キーを離した」と判断した時点)。

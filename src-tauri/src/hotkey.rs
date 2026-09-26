@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{
     GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
 };
@@ -31,9 +32,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY, VK_LCONTROL, VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL,
-    WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW,
+    GetWindowThreadProcessId, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
+    HC_ACTION, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT,
+    WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 /// 短押し判定のしきい値。これ未満で離すとトグルモードに入る。
@@ -998,6 +1000,16 @@ static HOOK_EVENTS_SEEN: AtomicU64 = AtomicU64::new(0);
 static HEARTBEAT_SEEN: AtomicU64 = AtomicU64::new(0);
 /// フックを再設置した回数 (診断用)。
 static HOOK_REINSTALLS: AtomicU64 = AtomicU64::new(0);
+/// フックが最後にキーイベントを観測した時刻 (`GetTickCount` のミリ秒。0 = 未観測)。
+///
+/// ページから来たキー ([`feed_window_key`]) を使うかどうかの判断に使う。
+static LAST_HOOK_KEY_TICK: AtomicU32 = AtomicU32::new(0);
+/// フックがこの時間内にキーを観測していれば、ページから来たキーは使わない
+/// ([`feed_window_key`] の doc)。
+///
+/// ページのキーは同じ打鍵をフックより数 ms 遅れて (IPC を 1 往復して) 届く。
+/// 人が打つ間隔よりは十分短く、IPC の遅れよりは十分長い値にする。
+const WINDOW_KEY_HOOK_GRACE_MS: u32 = 250;
 
 /// フックの生存確認を行う間隔。
 ///
@@ -1088,12 +1100,79 @@ fn handle_key_event(message: u32, lparam: LPARAM) {
 
     // 「フックが呼ばれている」ことの証拠。番犬がこれを見て生死を判断する。
     HOOK_EVENTS_SEEN.fetch_add(1, Ordering::SeqCst);
+    // ページから来たキーと重ねないための時刻 ([`feed_window_key`])。
+    // GetTickCount は共有メモリを読むだけで、呼び出しの不変条件に触れない。
+    // SAFETY: 引数なし。
+    LAST_HOOK_KEY_TICK.store(unsafe { GetTickCount() }.max(1), Ordering::SeqCst);
 
     let is_down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
     let is_up = matches!(message, WM_KEYUP | WM_SYSKEYUP);
     if !is_down && !is_up {
         return;
     }
+    interpret_key(info.vkCode, is_down, KeySource::Hook);
+}
+
+/// キーがどこから来たか ([`interpret_key`])。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeySource {
+    /// 低レベルフック。キーが前景アプリへ届く**前**に観測する。
+    Hook,
+    /// 設定画面のページ ([`feed_window_key`])。キーは既に自分へ届いた後。
+    Window,
+}
+
+/// 設定画面 (nox-voice 自身の WebView2) のページが受けたキーを、フックと
+/// 同じ状態機械へ渡す。`code` は `KeyboardEvent.code` ([`code_to_vk`])。
+///
+/// # なぜ要るのか (2026-09-26)
+///
+/// nox-voice の設定画面 (Chromium 系のウィンドウ) が前景のあいだ、Windows は
+/// `WH_KEYBOARD_LL` のフックを呼ばない (`docs/hotkey-e2e.md`)。キーは画面に
+/// 届いているのにフックだけが沈黙し、**ホットキーを設定した直後に、その画面の
+/// まま押して試すと効かなかった**。そのあいだはページの `keydown` / `keyup` を
+/// ここへ渡して PTT を成り立たせる。捕獲 (DOM 方式) と同じ考え方。
+///
+/// # フックが生きていればフックに任せる
+///
+/// 他のプロセスの LL フックが入っている機械では、このあいだもフックが呼ばれる
+/// (観察者効果、`docs/hotkey-e2e.md`)。そのときは同じ打鍵がフックとページの
+/// 両方から届く。状態機械は押下・離しを 1 回へ畳む ([`KEY_IS_DOWN`] の swap) が、
+/// ページ側は IPC の分だけ遅れて届くので、短く叩くとフックの「押下・離し」の
+/// **後に**ページの押下が着き、2 回目の打鍵に化けうる (トグルが即座に戻る)。
+/// そこで、フックが直前 ([`WINDOW_KEY_HOOK_GRACE_MS`] 以内) にキーを観測して
+/// いれば、ページのキーは捨てる。フックが沈黙している機械ではページだけが効く。
+///
+/// 前景ウィンドウを見て片方を止める作りにしないのは、フォーカスの移り変わりと
+/// 入力の到着の順序に依存させないため。
+pub fn feed_window_key(code: &str, is_down: bool) {
+    let Some(vk) = code_to_vk(code) else {
+        return; // 写せないキーはホットキーの部品になりえない。
+    };
+    if hook_saw_keys_recently() {
+        return; // フックが同じ打鍵を解釈済み。
+    }
+    interpret_key(vk, is_down, KeySource::Window);
+}
+
+/// フックが [`WINDOW_KEY_HOOK_GRACE_MS`] 以内にキーを観測したか。
+fn hook_saw_keys_recently() -> bool {
+    let last = LAST_HOOK_KEY_TICK.load(Ordering::SeqCst);
+    if last == 0 {
+        return false;
+    }
+    // SAFETY: 引数なし。
+    let now = unsafe { GetTickCount() };
+    // GetTickCount は 49.7 日で一周する。差はラップを考慮して取る。
+    now.wrapping_sub(last) < WINDOW_KEY_HOOK_GRACE_MS
+}
+
+/// キーの押下・離しを PTT / キャンセルとして解釈する (フックとページの共通部分)。
+///
+/// フックコールバックからも呼ばれるので、モジュール冒頭の不変条件
+/// (確保・ロック・IO・panic 禁止) はここにもそのまま掛かる。
+fn interpret_key(vk: u32, is_down: bool, source: KeySource) {
+    let is_up = !is_down;
 
     // 設定済み修飾キーの押下状態を常に追跡する。捕獲モード中も更新してよい
     // (捕獲を確定した時点で set_mode_hotkey が畳むが、取り消し経路のために
@@ -1106,7 +1185,7 @@ fn handle_key_event(message: u32, lparam: LPARAM) {
             continue; // 未設定のスロット。
         }
         let combo = unpack_combo(raw);
-        if let Some(bit) = combo.mod_bit(info.vkCode) {
+        if let Some(bit) = combo.mod_bit(vk) {
             if is_down {
                 MODS_DOWN[slot].fetch_or(1 << bit, Ordering::SeqCst);
             } else {
@@ -1129,9 +1208,9 @@ fn handle_key_event(message: u32, lparam: LPARAM) {
     }
 
     // 捕獲直後の押しっぱなしを締め出す。離した時点で解除する。
-    if is_suppressed(info.vkCode) {
+    if is_suppressed(vk) {
         if is_up {
-            clear_suppression(info.vkCode);
+            clear_suppression(vk);
         }
         return;
     }
@@ -1139,7 +1218,7 @@ fn handle_key_event(message: u32, lparam: LPARAM) {
     // 録音中のキャンセルキー。押下で Cancel を 1 回だけ報告し、離しで状態を戻す。
     // ホットキー経路の前に判定する (録音中は PTT の解釈より破棄が優先)。
     let cancel_vk = CANCEL_VK.load(Ordering::SeqCst);
-    if cancel_vk != 0 && info.vkCode == cancel_vk && RECORDING_ACTIVE.load(Ordering::SeqCst) {
+    if cancel_vk != 0 && vk == cancel_vk && RECORDING_ACTIVE.load(Ordering::SeqCst) {
         if is_down {
             // オートリピートの連打を 1 回の押下に畳む。
             if !CANCEL_IS_DOWN.swap(true, Ordering::SeqCst) {
@@ -1173,7 +1252,7 @@ fn handle_key_event(message: u32, lparam: LPARAM) {
 
     for slot in order {
         let Some(combo) = combos[slot] else { continue };
-        if info.vkCode != combo.vk {
+        if vk != combo.vk {
             continue;
         }
         let kind = if is_down {
@@ -1219,7 +1298,10 @@ fn handle_key_event(message: u32, lparam: LPARAM) {
         //
         // ここに置く (`send` の前) のは、チャネルが満杯でも撒くため。
         // 「録音を取りこぼしたうえにフォーカスも失う」を作らない。
-        if is_up {
+        //
+        // ページから来たキー ([`KeySource::Window`]) では撒かない。ページが受け
+        // 取った時点で、その離しはもう前景アプリ (= 自分) に届いた後なので効かない。
+        if is_up && source == KeySource::Hook {
             break_lone_alt(combo.vk);
         }
 
@@ -1500,6 +1582,8 @@ fn spawn_hook_watchdog() {
                     HookProbe::Alive => {}
                     // 送れないときは判定しない (欠測であって故障ではない)。
                     HookProbe::Unknown => {}
+                    // 自分の画面が前景のあいだは確かめようがない (フックが呼ばれない)。
+                    HookProbe::OwnWindowForeground => {}
                     HookProbe::Silent => request_rehook(tid, "定期の生存確認"),
                 }
                 last_seen = HOOK_EVENTS_SEEN.load(Ordering::SeqCst);
@@ -1527,10 +1611,20 @@ enum HookProbe {
     Silent,
     /// そもそも送れなかった。判定不能 (欠測)。
     Unknown,
+    /// nox-voice 自身のウィンドウが前景なので確かめなかった。
+    ///
+    /// 設定画面 (WebView2 = Chromium 系) が前景のあいだ、Windows は LL フックを
+    /// 呼ばない (`docs/hotkey-e2e.md`)。ダミーキーを送っても必ず `Silent` になり、
+    /// 生きているフックの再設置と「応答しません」の警告を毎回生むだけだった。
+    /// そのあいだのホットキーはページが受ける ([`feed_window_key`])。
+    OwnWindowForeground,
 }
 
 /// ダミーキーを 1 打送って、自分のフックが観測できるか確かめる。
 fn probe_hook_alive() -> HookProbe {
+    if own_window_is_foreground() {
+        return HookProbe::OwnWindowForeground;
+    }
     let before = HEARTBEAT_SEEN.load(Ordering::SeqCst);
     if !send_heartbeat_key() {
         return HookProbe::Unknown;
@@ -1544,6 +1638,19 @@ fn probe_hook_alive() -> HookProbe {
     } else {
         HookProbe::Alive
     }
+}
+
+/// 前景のウィンドウが nox-voice 自身のものか ([`HookProbe::OwnWindowForeground`])。
+fn own_window_is_foreground() -> bool {
+    // SAFETY: 引数なし。戻り値は NULL でありうるので下で見る。
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return false;
+    }
+    let mut process_id: u32 = 0;
+    // SAFETY: hwnd は非 NULL、出力先はスタック上の有効な u32。
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    process_id != 0 && process_id == std::process::id()
 }
 
 /// フックスレッドへ再設置を要求する。
@@ -1578,17 +1685,23 @@ fn request_rehook(tid: u32, reason: &str) {
 
 /// 「今すぐ」フックの生存を確かめ、応答が無ければ再設置させる。
 ///
-/// # なぜ捕獲の開始時に呼ぶのか
+/// # なぜ設定画面から離れた瞬間に呼ぶのか
 ///
 /// 捕獲そのものは DOM イベントへ移したのでフックに依存しない
-/// ([`CAPTURE_MODE`] の doc)。しかし**PTT 経路は引き続きフックに依存する**。
-/// ホットキーを設定した直後こそユーザーが押して試す瞬間なので、
-/// そこで「設定はできたのに押しても録音が始まらない」に当たると、
+/// ([`CAPTURE_MODE`] の doc)。しかし**他のアプリの上での PTT は引き続き
+/// フックに依存する**。ホットキーを設定した利用者は、他のアプリへ移って
+/// 押して試す。そこで「設定はできたのに押しても録音が始まらない」に当たると、
 /// 原因がフックの脱落だと気づく手掛かりが何も無い。
 ///
 /// 定期の番犬 ([`spawn_hook_watchdog`]) は 15 秒周期で、しかも
-/// 「無操作のとき」しか確認しない。捕獲の前後はまさに人がキーを打っている
-/// 時間帯なので、番犬は動かない。ここで能動的に 1 回確かめる。
+/// 「無操作のとき」しか確認しないので、移った直後には間に合わない。
+/// 設定画面から離れた瞬間 (`WindowEvent::Focused(false)`) に能動的に 1 回確かめる。
+///
+/// 以前は捕獲の開始時に呼んでいた。そのときは設定画面 (WebView2) が前景で、
+/// Windows は LL フックを呼ばないので確認は必ず「応答なし」になり、生きている
+/// フックの再設置と誤った警告を毎回生んでいた (2026-09-26、`docs/hotkey-e2e.md`)。
+/// 設定画面が前景のあいだは確かめずに見送る ([`HookProbe::OwnWindowForeground`])。
+/// 設定画面で押して試すホットキーはページが受ける ([`feed_window_key`])。
 ///
 /// 呼び出し側をブロックしないよう、確認は自前のスレッドで行う
 /// (最悪 [`HEARTBEAT_GRACE`] + 再確認ぶん待つ)。捕獲の開始表示を
@@ -1605,6 +1718,10 @@ pub fn ensure_hook_alive_async(reason: &'static str) {
             HookProbe::Unknown => {
                 log::info!("フックの生存確認を送れませんでした ({reason})。判定は見送る")
             }
+            HookProbe::OwnWindowForeground => log::info!(
+                "設定画面が前景なので、フックの生存確認は見送る ({reason})。\
+                 このあいだのホットキーは設定画面が受ける"
+            ),
             HookProbe::Silent => {
                 request_rehook(tid, reason);
                 // 再設置が効いたかまで見る。効いていなければ、次に押しても
@@ -1615,7 +1732,7 @@ pub fn ensure_hook_alive_async(reason: &'static str) {
                     HookProbe::Silent => log::warn!(
                         "再設置してもフックが応答しません。ホットキーが効かない可能性があります"
                     ),
-                    HookProbe::Unknown => {}
+                    HookProbe::Unknown | HookProbe::OwnWindowForeground => {}
                 }
             }
         });
@@ -2709,6 +2826,144 @@ mod tests {
         );
 
         set_mode_hotkey(HotkeyMode::Inject, Some(HotkeyCombo::default()));
+    }
+
+    // --- 設定画面が前景のあいだ、ページから来たキー (2026-09-26) ---------------
+    //
+    // 設定画面 (WebView2) が前景のあいだ Windows は LL フックを呼ばない
+    // (docs/hotkey-e2e.md) ので、ページの keydown / keyup を feed_window_key で
+    // 同じ状態機械へ渡す。フックが生きている機械では両方から届くので、二重に
+    // 数えないことも押さえる。
+
+    /// フックが最後にキーを見た時刻を消す (ページのキーが使われる状態)。
+    fn forget_hook_activity() {
+        LAST_HOOK_KEY_TICK.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn window_keys_drive_the_same_chord_as_the_hook() {
+        let _guard = hook_state_lock();
+        let rx = hook_events();
+        set_mode_hotkey(HotkeyMode::Inject, Some(ctrl_space()));
+        drain(&rx);
+        forget_hook_activity();
+
+        // Space 単独では何も起きない (設定画面での普通の入力)。
+        feed_window_key("Space", true);
+        feed_window_key("Space", false);
+        assert!(rx.try_recv().is_err(), "修飾子なしの Space で発火した");
+
+        feed_window_key("ControlLeft", true);
+        feed_window_key("Space", true);
+        assert_eq!(
+            rx.try_recv().map(|e| e.kind).ok(),
+            Some(HotkeyEventKind::Press { mode: HotkeyMode::Inject }),
+            "設定画面でホットキーを押しても発火しない"
+        );
+        feed_window_key("Space", false);
+        assert_eq!(
+            rx.try_recv().map(|e| e.kind).ok(),
+            Some(HotkeyEventKind::Release { mode: HotkeyMode::Inject })
+        );
+        feed_window_key("ControlLeft", false);
+        assert!(rx.try_recv().is_err());
+
+        set_mode_hotkey(HotkeyMode::Inject, Some(HotkeyCombo::default()));
+    }
+
+    #[test]
+    fn window_keys_are_dropped_while_the_hook_is_hearing_the_same_keys() {
+        let _guard = hook_state_lock();
+        let rx = hook_events();
+        set_mode_hotkey(HotkeyMode::Inject, Some(ctrl_space()));
+        drain(&rx);
+
+        // 他のフックが入っている機械では、設定画面が前景でもフックが呼ばれる。
+        feed_key(0xA2, WM_KEYDOWN);
+        feed_key(0x20, WM_KEYDOWN);
+        assert_eq!(
+            rx.try_recv().map(|e| e.kind).ok(),
+            Some(HotkeyEventKind::Press { mode: HotkeyMode::Inject })
+        );
+        feed_key(0x20, WM_KEYUP);
+        assert_eq!(
+            rx.try_recv().map(|e| e.kind).ok(),
+            Some(HotkeyEventKind::Release { mode: HotkeyMode::Inject })
+        );
+        // ページの分は IPC の分だけ遅れて、フックの離しの**後に**着きうる。
+        // 使うと 2 回目の打鍵に化ける (短押しのトグルが即座に戻る)。
+        feed_window_key("ControlLeft", true);
+        feed_window_key("Space", true);
+        feed_window_key("Space", false);
+        feed_window_key("ControlLeft", false);
+        assert!(
+            rx.try_recv().is_err(),
+            "フックが解釈済みの打鍵を、ページからもう一度数えた"
+        );
+
+        feed_key(0xA2, WM_KEYUP);
+        set_mode_hotkey(HotkeyMode::Inject, Some(HotkeyCombo::default()));
+    }
+
+    #[test]
+    fn window_keys_never_scatter_the_lone_alt_dummy() {
+        let _guard = hook_state_lock();
+        let rx = hook_events();
+        set_mode_hotkey(HotkeyMode::Inject, HotkeyCombo::from_parts(&[], 0xA5));
+        drain(&rx);
+        forget_hook_activity();
+
+        let before = lone_alt_breaks();
+        feed_window_key("AltRight", true);
+        assert_eq!(
+            rx.try_recv().map(|e| e.kind).ok(),
+            Some(HotkeyEventKind::Press { mode: HotkeyMode::Inject })
+        );
+        feed_window_key("AltRight", false);
+        assert_eq!(
+            rx.try_recv().map(|e| e.kind).ok(),
+            Some(HotkeyEventKind::Release { mode: HotkeyMode::Inject })
+        );
+        // ページが受け取った時点で Alt の離しはもう自分に届いた後。撒いても効かず、
+        // 設定画面へ余計な打鍵が入るだけ ([`break_lone_alt`] の doc)。
+        assert_eq!(lone_alt_breaks(), before, "ページのキーでダミーキーを撒いた");
+
+        set_mode_hotkey(HotkeyMode::Inject, Some(HotkeyCombo::default()));
+    }
+
+    #[test]
+    fn window_keys_are_silenced_while_capturing() {
+        let _guard = hook_state_lock();
+        let rx = hook_events();
+        set_mode_hotkey(HotkeyMode::Inject, Some(ctrl_space()));
+        drain(&rx);
+        forget_hook_activity();
+
+        // 捕獲中に押されるのは、いま設定しようとしているキーそのもの。
+        let generation = begin_capture();
+        feed_window_key("ControlLeft", true);
+        feed_window_key("Space", true);
+        feed_window_key("Space", false);
+        feed_window_key("ControlLeft", false);
+        assert!(rx.try_recv().is_err(), "捕獲中のキーで録音が始まった");
+        end_capture(Some(generation));
+
+        set_mode_hotkey(HotkeyMode::Inject, Some(HotkeyCombo::default()));
+    }
+
+    #[test]
+    fn unmappable_window_codes_are_ignored() {
+        let _guard = hook_state_lock();
+        let rx = hook_events();
+        drain(&rx);
+        forget_hook_activity();
+
+        // code が空のキー (生存確認のダミーキーなど) と、写せない code。
+        for code in ["", "Unidentified"] {
+            feed_window_key(code, true);
+            feed_window_key(code, false);
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     // --- 単独 Alt のメニュー起動をつぶす (2026-08-29) -------------------------

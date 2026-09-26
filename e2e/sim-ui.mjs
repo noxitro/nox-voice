@@ -555,6 +555,61 @@ async function main() {
     };
   });
 
+  // --- U2f: 設定画面が前景のあいだ、キーはページから Rust の状態機械へ渡る
+  //
+  // 設定画面 (WebView2) が前景のあいだ Windows は低レベルフックを呼ばない
+  // (docs/hotkey-e2e.md)。ホットキーが効くよう、ページが受けたキーを
+  // window_hotkey_key で順番どおりに送る (hotkey::feed_window_key)。
+  // 捕獲中のキーは捕獲のもの、オートリピートと生存確認のダミーキーは送らない。
+  await check("U2f 設定画面のキーは window_hotkey_key で順番どおり Rust へ渡る (捕獲中・オートリピート・ダミーキーは渡さない)", async () => {
+    const r = await cdp.run(`
+      // 前の捕獲が残っていれば畳む (区画を移ると畳まれる)。
+      document.querySelector('.nav-item[data-section="home"]').click();
+      await new Promise((r) => setTimeout(r, 200));
+      window.__NOX_MOCK__.reset();
+      const key = (type, init) =>
+        window.dispatchEvent(new KeyboardEvent(type, { bubbles: true, cancelable: true, ...init }));
+      const sent = () =>
+        window.__NOX_MOCK__.invokes
+          .filter((i) => i.cmd === "window_hotkey_key")
+          .map((i) => i.args.code + ":" + (i.args.down ? "down" : "up"));
+
+      key("keydown", { code: "ControlLeft" });
+      key("keydown", { code: "Space" });
+      key("keydown", { code: "Space", repeat: true }); // オートリピート
+      key("keyup", { code: "Space" });
+      key("keyup", { code: "ControlLeft" });
+      key("keydown", { key: "Unidentified", keyCode: 0xfc }); // 生存確認のダミーキー
+      key("keyup", { key: "Unidentified", keyCode: 0xfc });
+      await new Promise((r) => setTimeout(r, 200));
+      const idle = sent();
+
+      // 捕獲中は捕獲のもの。確定まで通して、そのあいだ 1 件も送らないこと。
+      window.__NOX_MOCK__.reset();
+      document.getElementById("hotkey-capture").click();
+      await new Promise((r) => setTimeout(r, 150));
+      key("keydown", { code: "ControlLeft" });
+      key("keydown", { code: "F14" });
+      await new Promise((r) => setTimeout(r, 60));
+      key("keyup", { code: "F14" });
+      key("keyup", { code: "ControlLeft" });
+      await new Promise((r) => setTimeout(r, 300));
+      return {
+        idle,
+        duringCapture: sent(),
+        finished: window.__NOX_MOCK__.count("finish_hotkey_capture"),
+      };
+    `);
+    return {
+      ok:
+        JSON.stringify(r.idle) ===
+          JSON.stringify(["ControlLeft:down", "Space:down", "Space:up", "ControlLeft:up"]) &&
+        r.duringCapture.length === 0 &&
+        r.finished === 1,
+      detail: JSON.stringify(r),
+    };
+  });
+
   // --- U2c: 修飾キー単独を割り当てると注意が出る (2026-08-29 の不具合の名残)
   //
   // 単独 Alt はフックが握り潰さないので入力先アプリにも流れ、Chrome は

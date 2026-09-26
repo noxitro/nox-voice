@@ -1854,12 +1854,13 @@ let captureStartPending: Promise<boolean> | null = null;
 /** アプリ自身がフックの生存確認に送るダミーキーの VK (`VK_NONAME`、
  * Rust 側 `hotkey::HEARTBEAT_VK`)。捕獲はこれを押されたキーとして数えない。
  *
- * 捕獲の開始時、Rust はフックの生存を 1 回確かめるために、このキーを
- * `SendInput` で自分宛てに送る (`hotkey::ensure_hook_alive_async`)。合成キーは
- * 前景のウィンドウにも届くので、ボタンを押した直後 = この画面が前景のときは
- * 捕獲の keydown / keyup に入ってくる。`code` が空 ("Unidentified") なので、
- * 拾うと押してもいないのに「このキー (Unidentified) はホットキーに使えません」
- * と出る (2026-09-26、画面が必ず前景になる CI の実機 E2E で発覚)。
+ * Rust はフックの生存を確かめるために、このキーを `SendInput` で自分宛てに
+ * 送る (`hotkey::probe_hook_alive`)。合成キーは前景のウィンドウにも届く。
+ * 以前は捕獲の開始時 = この画面が前景のときに送っていたので、捕獲の
+ * keydown / keyup に入ってきた。`code` が空 ("Unidentified") なので、拾うと
+ * 押してもいないのに「このキー (Unidentified) はホットキーに使えません」と
+ * 出た (2026-09-26、画面が必ず前景になる CI の実機 E2E で発覚)。いまは
+ * nox-voice のウィンドウが前景のあいだは送らないが、届いても数えない。
  * `VK_NONAME` は Microsoft が「ダミーのキーストローク用」とする VK で、
  * 物理キーからは来ない。`code` では見分けられないので `keyCode` で見る。 */
 const HEARTBEAT_KEY_CODE = 0xfc;
@@ -1999,6 +2000,32 @@ function onCaptureKeyUp(event: KeyboardEvent) {
   const codes = captureSessionCodes.slice();
   captureSessionCodes = [];
   void finishHotkeyCapture(codes);
+}
+
+/* --- 設定画面が前景のあいだのホットキー (2026-09-26) -----------------------
+ *
+ * nox-voice の設定画面 (WebView2 = Chromium 系のウィンドウ) が前景のあいだ、
+ * Windows は低レベルキーボードフックを呼ばない (docs/hotkey-e2e.md)。
+ * ホットキーを設定した直後に、この画面のまま押して試すと効かなかった。
+ * そのあいだはページが受けたキーを Rust の同じ状態機械へ渡す
+ * (`hotkey::feed_window_key`)。フックが生きている機械では Rust 側が
+ * フックの方を採り、こちらの分は捨てる (二重に数えない)。 */
+
+/** 送った順に Rust へ届ける。keydown より先に keyup が着くと、押したまま扱いになる。 */
+let windowKeyChain: Promise<unknown> = Promise.resolve();
+
+/** 設定画面が受けたキーを、ホットキーの状態機械へ渡す。捕獲中は何もしない。 */
+function forwardWindowKey(event: KeyboardEvent, down: boolean) {
+  // 捕獲中のキーは捕獲のもの (onCaptureKeyDown / onCaptureKeyUp)。
+  if (capturingMode) return;
+  // オートリピートは Rust 側でも 1 回に畳むが、往復を増やさない。
+  if (event.repeat) return;
+  // 生存確認のダミーキーと、物理位置 (code) の無いキーはホットキーになりえない。
+  if (event.keyCode === HEARTBEAT_KEY_CODE || !event.code) return;
+  const code = event.code;
+  windowKeyChain = windowKeyChain
+    .then(() => invoke("window_hotkey_key", { code, down }))
+    .catch((e) => console.warn("ホットキーの入力を渡せません", e));
 }
 
 /** 押している最中の表示名を Rust に作らせて描く。
@@ -2637,6 +2664,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   // 捕獲が即キャンセルされる)。捕獲していない間は素通しする。
   window.addEventListener("keydown", onCaptureKeyDown, true);
   window.addEventListener("keyup", onCaptureKeyUp, true);
+  // 設定画面が前景のあいだのホットキー (forwardWindowKey の doc)。捕獲の後に
+  // 登録する: 同じ capture フェーズなので、捕獲が stopPropagation しても呼ばれる
+  // (捕獲中かどうかは forwardWindowKey 自身が見る)。
+  window.addEventListener("keydown", (event) => forwardWindowKey(event, true), true);
+  window.addEventListener("keyup", (event) => forwardWindowKey(event, false), true);
 
   // ウィンドウから離れたら捕獲をやめる。設定画面を離れたまま
   // 捕獲が続くと、キーがどこにも届かないまま時間だけ過ぎる
