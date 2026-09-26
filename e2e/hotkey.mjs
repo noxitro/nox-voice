@@ -6,7 +6,11 @@
 //   「自プロセスの dwExtraInfo マーカーだけを弾く」形になっていることが前提。
 //   一律 LLKHF_INJECTED 除外に戻すと、このテストは**全滅する**(陽性コントロール)。
 // - 合成キーは前景アプリにも流れる。トリガーには物理キーボードに存在しない
-//   F13..F16 を使い、さらに nox-voice 自身のウィンドウを前景にしてから送る。
+//   F13..F16 を使い、さらに E2E 自身の空ウィンドウ (send-keys.ps1 -Sink) を
+//   前景にしてから送る。利用者の作業中のウィンドウへは流さない。
+// - nox-voice 自身 (WebView2 の設定画面) が前景のときは T1w で別に測る。
+//   Chromium 系のウィンドウが前景のあいだ、Windows は LL フックを呼ばないことが
+//   ある (docs/hotkey-e2e.md「Chromium 系のウィンドウが前景だとフックが呼ばれない」)。
 // - 設定ファイルは実物 (app_config_dir) を使う。開始時に退避し、終了時に必ず戻す。
 //
 // 2026-08-28: キー捕獲は DOM の keydown/keyup へ移った。捕獲系のテスト
@@ -25,10 +29,13 @@
 //                    ポリシーで同じポートを渡す (docs/hotkey-e2e.md)
 // - NOX_E2E_NO_INJECTION 合成入力がフックまで届かない環境で 1 にする。
 //                    下の NO_INJECTION の doc を参照 (e2e/probe-input.ps1 で判定できる)
+// - NOX_E2E_EDGE     1 にすると、Edge のウィンドウを前景にして PTT を押す参考の
+//                    計測も行う (Edge を 1 枚開いて閉じる。CI で有効にしている)
 //
 // 使い方: node e2e/hotkey.mjs
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import { describeCdpFailure } from "./cdp-diagnose.mjs";
@@ -71,15 +78,15 @@ const NO_AUDIO = process.env.NOX_E2E_NO_AUDIO === "1";
 
 /** 合成入力 (SendInput) がフックまで届かない環境で走らせる (`NOX_E2E_NO_INJECTION=1`)。
  *
- * GitHub Actions の Windows ランナーがそう: アプリの番犬が、自分で送った生存確認の
- * キーすら観測できない (2026-09-26 のログ)。OS だけで同じことを確かめるのが
- * e2e/probe-input.ps1 で、CI はその結果でこのモードを決める。
+ * 届くかどうかを OS だけで確かめるのが e2e/probe-input.ps1 で、CI はその結果で
+ * このモードを決める (GitHub Actions の Windows ランナーはいまのところ届く)。
  *
  * このモードではキーを送らない。キー送出を要するテストは、結果を見ずに SKIP と書く
  * (陰性側のテストも「何も起きなかった」を合格と読まない — 送っていないのだから)。
- * 測るのは CDP から DOM へキーを入れる捕獲系 (T3 / T7 / T10)、再起動後の設定の
- * 読み込み (T6b)、多重起動 (T8)。SKIP は集計に出すが、モードを指定した時点で
- * 測らないと決めてあるので、それだけでは終了コードを落とさない。 */
+ * 測るのは CDP から DOM へキーを入れる捕獲系 (T3 / T7 / T10)、アプリ自身の
+ * ダミーキーが捕獲へ混ざらないか (T3a)、再起動後の設定の読み込み (T6b)、
+ * 多重起動 (T8)。SKIP は集計に出すが、モードを指定した時点で測らないと決めて
+ * あるので、それだけでは終了コードを落とさない。 */
 const NO_INJECTION = process.env.NOX_E2E_NO_INJECTION === "1";
 
 const VK = {
@@ -214,6 +221,53 @@ function probeInput() {
     { encoding: "utf8" },
   );
   return (r.stdout || r.stderr || `(出力なし: exit ${r.status})`).trim();
+}
+
+const EDGE_CANDIDATES = [
+  "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+  "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+];
+
+/** Edge (Chromium) のウィンドウを前景にして 左Ctrl+Space を押し、発火したかを返す。
+ *
+ * 参考の計測で、判定には使わない。T1w (nox-voice 自身の WebView2 が前景) と同じ
+ * 現象が、他社の Chromium 系アプリ (ブラウザ・Electron) でも起きるかを見る。
+ * 使い捨てのプロファイルで 1 枚開き、終わったらそのプロファイルの Edge だけを落とす。 */
+async function pttWithEdgeForeground() {
+  const edge = EDGE_CANDIDATES.find((p) => fs.existsSync(p));
+  if (!edge) return "Edge が無いので測っていない";
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "nox-e2e-edge-"));
+  const browser = spawn(
+    edge,
+    ["--no-first-run", "--no-default-browser-check", "--disable-extensions", `--user-data-dir=${profile}`, "--new-window", "about:blank"],
+    { stdio: "ignore" },
+  );
+  try {
+    await sleep(5000); // ウィンドウが出るまで
+    markLog();
+    const focusLine = sendKeys(`down:A2,down:20,sleep:800,up:20,up:A2`, browser.pid).split(/\r?\n/)[0];
+    const fired = await waitForFired(5000);
+    await settleRecording();
+    return `${fired ? "発火した" : "発火しない"} [${focusLine}]`;
+  } finally {
+    spawnSync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-Command",
+        "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | " +
+          `Where-Object { $_.CommandLine -like '*${path.basename(profile)}*' } | ` +
+          "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+      ],
+      { encoding: "utf8" },
+    );
+    await sleep(500);
+    try {
+      fs.rmSync(profile, { recursive: true, force: true });
+    } catch {
+      /* 消せなくても実害は無い (temp 配下) */
+    }
+  }
 }
 
 // --- CDP ---------------------------------------------------------------------
@@ -492,8 +546,12 @@ async function main() {
 
     // --- T1: 既定の組み合わせ (左Ctrl+Space) の長押しで録音が始まり、離すと確定する
     //   (録音デバイスの無いモードでは「発火した」までを見る)
+    //
+    // キーは**他のアプリが前景**の状態で送る (send-keys.ps1 -Sink の空ウィンドウ)。
+    // 実際の使われ方がそれで、利用者の作業中のウィンドウへキーを流さずにも済む。
+    // nox-voice 自身が前景のときは T1w で別に測る。
     markLog();
-    sendKeys(`down:A2,down:20,sleep:800,up:20,up:A2`, pid);
+    sendKeys(`down:A2,down:20,sleep:800,up:20,up:A2`, "sink");
     const started = await waitForFired(5000);
     const finalized = await settleRecording();
     // T1 は較正も兼ねる。ここが通らない環境では、以降のキー依存テストは
@@ -505,19 +563,8 @@ async function main() {
     const noDevice = !started && readNewLog().includes(NO_DEVICE);
     // 届かなかったのが環境かアプリか、その場で切り分ける材料を残す (probeInput の doc)。
     const probe = !started && !noDevice && !NO_INJECTION ? probeInput() : "";
-    // 前景を nox-voice 以外 (send-keys.ps1 の空ウィンドウ) にして同じキーを送る。
-    // 発火するなら、届かないのは「nox-voice 自身が前景のとき」に限られる
-    // (実際の使われ方は、他のアプリが前景のときに押す)。判定には使わない。
-    let sink = "";
-    if (probe) {
-      markLog();
-      const focusLine = sendKeys(`down:A2,down:20,sleep:800,up:20,up:A2`, "sink").split(/\r?\n/)[0];
-      const sinkFired = await waitForFired(5000);
-      await settleRecording();
-      sink = `前景を E2E の空ウィンドウにして同じキーを送ると: ${sinkFired ? `発火した (${sinkFired.trim()})` : "発火しない"} [${focusLine}]`;
-    }
     record(
-      "T1 既定 左Ctrl+Space の長押し PTT",
+      "T1 既定 左Ctrl+Space の長押し PTT (他のアプリが前景)",
       Boolean(started && (NO_AUDIO || finalized)),
       started
         ? `開始=${started.trim()}${NO_AUDIO ? " (録音デバイス無しモード: 確定は測っていない)" : ""}`
@@ -526,8 +573,7 @@ async function main() {
             "フック経路だけを測るなら NOX_E2E_NO_AUDIO=1 で走らせること"
           : "「録音開始」がログに出ない — 合成入力がフックへ届いていない可能性が高い。" +
             "物理キーボードで同じ操作を試して切り分けること" +
-            (probe ? `\n        アプリ起動中に測り直した probe-input.ps1: ${probe}` : "") +
-            (sink ? `\n        ${sink}` : ""),
+            (probe ? `\n        アプリ起動中に測り直した probe-input.ps1: ${probe}` : ""),
       NO_INJECTION,
     );
     if (!injectionReachesHook) {
@@ -545,9 +591,33 @@ async function main() {
       );
     }
 
+    // --- T1w: 設定画面 (nox-voice 自身の WebView2) が前景でも効く
+    //
+    // ホットキーを設定した直後に、その画面のまま押して試すのは自然な使い方
+    // (hotkey::ensure_hook_alive_async の doc)。ところが Chromium 系のウィンドウ
+    // (WebView2 を含む) が前景のあいだ、Windows は WH_KEYBOARD_LL のフックを呼ばない
+    // ことがある。他のプロセスの LL フックが入っている機械では呼ばれる (観察者効果) ので
+    // 手元では再現しないことが多いが、他のフックが無い CI のランナーでは毎回呼ばれない
+    // (2026-09-26 に確認、docs/hotkey-e2e.md)。直るまでは FAIL になる。
+    markLog();
+    sendKeys(`down:A2,down:20,sleep:800,up:20,up:A2`, pid);
+    const startedInSettings = await waitForFired(5000);
+    await settleRecording();
+    record(
+      "T1w 設定画面 (WebView2) が前景でも 左Ctrl+Space の PTT が効く",
+      Boolean(startedInSettings),
+      startedInSettings
+        ? ""
+        : "設定画面が前景のあいだ、アプリのフックが呼ばれない (Chromium 系のウィンドウが前景だと" +
+            " LL フックが呼ばれない現象。docs/hotkey-e2e.md)",
+    );
+    if (process.env.NOX_E2E_EDGE === "1" && injectionReachesHook) {
+      console.log(`--    参考: Edge (Chromium) が前景のときの 左Ctrl+Space: ${await pttWithEdgeForeground()}`);
+    }
+
     // --- T2: 修飾キー無しで Space だけ押しても発火しない (陰性側)
     markLog();
-    sendKeys(`down:20,sleep:600,up:20`, pid);
+    sendKeys(`down:20,sleep:600,up:20`, "sink");
     const spuriousSpace = await waitForFired(2500);
     record(
       "T2 Space 単独では発火しない",
@@ -611,7 +681,7 @@ async function main() {
 
     // --- T4: 設定した新しい組み合わせが実際に効く
     markLog();
-    sendKeys(`down:A2,down:7D,sleep:800,up:7D,up:A2`, pid);
+    sendKeys(`down:A2,down:7D,sleep:800,up:7D,up:A2`, "sink");
     const newStarted = await waitForFired(5000);
     await settleRecording();
     record(
@@ -622,7 +692,7 @@ async function main() {
 
     // --- T5: 古い組み合わせはもう効かない (陰性側)
     markLog();
-    sendKeys(`down:A2,down:20,sleep:600,up:20,up:A2`, pid);
+    sendKeys(`down:A2,down:20,sleep:600,up:20,up:A2`, "sink");
     const oldStill = await waitForFired(2500);
     record(
       "T5 旧 左Ctrl+Space はもう効かない",
@@ -647,7 +717,7 @@ async function main() {
       false,
     );
     markLog();
-    sendKeys(`down:A2,down:7D,sleep:800,up:7D,up:A2`, app.pid);
+    sendKeys(`down:A2,down:7D,sleep:800,up:7D,up:A2`, "sink");
     const afterRestart = await waitForFired(6000);
     await settleRecording();
     record(
@@ -718,7 +788,7 @@ async function main() {
     // ここは「押した直後に効く」ではなく「放置したあとでも効く」を見る。
     markLog();
     if (!NO_INJECTION) await sleep(20000);
-    sendKeys(`down:A2,down:7D,sleep:800,up:7D,up:A2`, app.pid);
+    sendKeys(`down:A2,down:7D,sleep:800,up:7D,up:A2`, "sink");
     const afterIdle = await waitForFired(6000);
     const reinstalled = readNewLog().includes("再設置");
     record(
@@ -792,7 +862,7 @@ async function main() {
       await startApp();
       markLog();
       const breaksBefore = lastLoneAltBreaks(readNewLog());
-      sendKeys(`down:A5,sleep:800,up:A5`, app.pid);
+      sendKeys(`down:A5,sleep:800,up:A5`, "sink");
       const altStarted = await waitForLog(STARTED, 6000);
       const altFinalized = await waitForLog("録音確定", 8000);
       const altLog = readNewLog();
