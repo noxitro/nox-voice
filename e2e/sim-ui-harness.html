@@ -413,6 +413,11 @@
               return Promise.resolve(10);
             case "cancel_hotkey_capture":
               return Promise.resolve();
+            // 設定画面が前景のあいだのホットキー (2026-09-26)。フロントは
+            // KeyboardEvent.code を順番どおりに送るだけで、解釈は Rust
+            // (hotkey::feed_window_key) が行う。モックは記録するだけ。
+            case "window_hotkey_key":
+              return Promise.resolve();
             // --- キー捕獲は DOM 方式 (2026-08-28)。フロントが集めた
             // `KeyboardEvent.code` の列を Rust へ渡し、VK への変換・許可判定・
             // 表示名は Rust 側が行う (src-tauri/src/hotkey.rs)。

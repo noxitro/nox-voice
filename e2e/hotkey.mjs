@@ -9,8 +9,8 @@
 //   F13..F16 を使い、さらに E2E 自身の空ウィンドウ (send-keys.ps1 -Sink) を
 //   前景にしてから送る。利用者の作業中のウィンドウへは流さない。
 // - nox-voice 自身 (WebView2 の設定画面) が前景のときは T1w で別に測る。
-//   Chromium 系のウィンドウが前景のあいだ、Windows は LL フックを呼ばないことが
-//   ある (docs/hotkey-e2e.md「Chromium 系のウィンドウが前景だとフックが呼ばれない」)。
+//   このあいだ Windows は LL フックを呼ばないので、ホットキーはページが受ける
+//   (docs/hotkey-e2e.md「Chromium 系のウィンドウが前景だとフックが呼ばれない」)。
 // - 設定ファイルは実物 (app_config_dir) を使う。開始時に退避し、終了時に必ず戻す。
 //
 // 2026-08-28: キー捕獲は DOM の keydown/keyup へ移った。捕獲系のテスト
@@ -593,12 +593,12 @@ async function main() {
 
     // --- T1w: 設定画面 (nox-voice 自身の WebView2) が前景でも効く
     //
-    // ホットキーを設定した直後に、その画面のまま押して試すのは自然な使い方
-    // (hotkey::ensure_hook_alive_async の doc)。ところが Chromium 系のウィンドウ
-    // (WebView2 を含む) が前景のあいだ、Windows は WH_KEYBOARD_LL のフックを呼ばない
-    // ことがある。他のプロセスの LL フックが入っている機械では呼ばれる (観察者効果) ので
-    // 手元では再現しないことが多いが、他のフックが無い CI のランナーでは毎回呼ばれない
-    // (2026-09-26 に確認、docs/hotkey-e2e.md)。直るまでは FAIL になる。
+    // ホットキーを設定した直後に、その画面のまま押して試すのは自然な使い方。
+    // ところが nox-voice の設定画面 (Chromium 系のウィンドウ) が前景のあいだ、
+    // Windows は WH_KEYBOARD_LL のフックを呼ばない (2026-09-26、docs/hotkey-e2e.md)。
+    // そのあいだはページが受けたキーを Rust の同じ状態機械へ渡す
+    // (src/main.ts の forwardWindowKey → hotkey::feed_window_key)。他のフックが
+    // 無い CI のランナーでは、発火はこの経路だけから来る。
     markLog();
     sendKeys(`down:A2,down:20,sleep:800,up:20,up:A2`, pid);
     const startedInSettings = await waitForFired(5000);
@@ -608,8 +608,8 @@ async function main() {
       Boolean(startedInSettings),
       startedInSettings
         ? ""
-        : "設定画面が前景のあいだ、アプリのフックが呼ばれない (Chromium 系のウィンドウが前景だと" +
-            " LL フックが呼ばれない現象。docs/hotkey-e2e.md)",
+        : "設定画面が前景のあいだのホットキーが効かない。フックはこのあいだ呼ばれないので、" +
+            "ページからの経路 (forwardWindowKey → window_hotkey_key → hotkey::feed_window_key) を見ること",
     );
     if (process.env.NOX_E2E_EDGE === "1" && injectionReachesHook) {
       console.log(`--    参考: Edge (Chromium) が前景のときの 左Ctrl+Space: ${await pttWithEdgeForeground()}`);
