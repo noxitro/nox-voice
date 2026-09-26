@@ -1,9 +1,15 @@
 # 依存の更新 PR を毎週作る。PR には CI (Windows の検査と実機 E2E) が走るので、
 # 緑のものを取り込めばよい。
 #
-# Tauri だけは手で上げる: Rust 側 (tauri / tauri-plugin-*) と JS 側
+# Tauri は手で上げる: Rust 側 (tauri / tauri-plugin-*) と JS 側
 # (@tauri-apps/*) の major.minor が揃っていないと tauri build が失敗する。
 # 片側だけ上げる PR は必ず落ちるので、minor 以上は作らせない (patch は揃えなくてよい)。
+#
+# windows 系 (windows / windows-core / windows-future) の世代 (0.62 → 0.100 など) も
+# 手で上げる。3 つは同じ世代で揃えないと型が別物になり、さらに cpal (録音) と Tauri も
+# それぞれ決まった世代の windows に依存している。こちらだけ上げると世代が混ざって
+# コンパイルできない (2026-09-26、windows-core / windows-future を単独で上げる PR が
+# どちらも cpal のコンパイルで落ちた)。patch は 3 つまとめて 1 本の PR にする。
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -30,10 +36,17 @@ updates:
     schedule:
       interval: weekly
     groups:
+      # 先に書いたグループが優先される。windows 系は他の依存と混ぜない。
+      windows-rs:
+        patterns: ["windows", "windows-*"]
       cargo-minor-and-patch:
         update-types: [minor, patch]
     ignore:
       - dependency-name: "tauri"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: "tauri-*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "windows"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "windows-*"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
