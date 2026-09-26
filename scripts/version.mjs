@@ -28,10 +28,13 @@ function writeJson(rel, value) {
   fs.writeFileSync(file(rel), JSON.stringify(value, null, 2) + "\n");
 }
 
+// 改行は \r?\n で受ける。Windows で core.autocrlf=true のまま checkout すると
+// (GitHub Actions の Windows ランナーがそう)、.gitattributes で LF を固定して
+// いない Cargo.lock は CRLF になる。置き換えは版の文字列だけなので、改行は保たれる。
 /** Cargo.toml の [package] 節にある version 行。 */
-const CARGO_TOML_RE = /(\[package\][^[]*?\nversion = ")([^"]+)(")/;
+const CARGO_TOML_RE = /(\[package\][^[]*?\r?\nversion = ")([^"]+)(")/;
 /** Cargo.lock の nox-voice 自身の項目にある version 行。 */
-const CARGO_LOCK_RE = /(\[\[package\]\]\nname = "nox-voice"\nversion = ")([^"]+)(")/;
+const CARGO_LOCK_RE = /(\[\[package\]\]\r?\nname = "nox-voice"\r?\nversion = ")([^"]+)(")/;
 
 function readAll() {
   const pkg = readJson("package.json");
