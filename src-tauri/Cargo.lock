@@ -2664,7 +2664,7 @@ dependencies = [
  "crossbeam-channel",
  "hound",
  "log",
- "png 0.17.16",
+ "png 0.18.1",
  "reqwest",
  "rusqlite",
  "serde",
