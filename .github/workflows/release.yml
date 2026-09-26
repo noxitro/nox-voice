@@ -131,6 +131,12 @@ jobs:
           $u = Start-Process -FilePath (Join-Path $dir 'uninstall.exe') -ArgumentList '/S', "_?=$dir" -Wait -PassThru
           if ($u.ExitCode -ne 0) { throw "アンインストーラが失敗した (exit $($u.ExitCode))" }
           if (Test-Path (Join-Path $dir 'nox-voice.exe')) { throw 'アンインストール後も exe が残っている' }
+          # NSIS はインストール先を HKCU\Software\<発行者>\<製品名> の既定値に書き、サイレントの
+          # アンインストールでは消さない (アプリのデータも消す指定のときだけ消す)。Tauri の MSI は
+          # この値を「前回のインストール先」として読んでそこへ入れるので、残すと次の MSI の確認が
+          # %LOCALAPPDATA% に入ってしまう。新しい PC と同じ状態に戻してから MSI を確かめる。
+          $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          Remove-Item "HKCU:\Software\$($conf.bundle.publisher)\$($conf.productName)" -Recurse -ErrorAction SilentlyContinue
 
       - name: MSI インストーラを実際に入れて起動を確かめる
         if: ${{ hashFiles('release-assets/*.msi') != '' }}
@@ -140,17 +146,26 @@ jobs:
           $log = Join-Path $env:RUNNER_TEMP 'msi-install.log'
           $p = Start-Process msiexec.exe -ArgumentList '/i', "`"$($msi.FullName)`"", '/qn', '/l*v', "`"$log`"" -Wait -PassThru
           if ($p.ExitCode -ne 0) { Get-Content $log -Tail 40; throw "MSI のインストールが失敗した (exit $($p.ExitCode))" }
-          $exe = Get-ChildItem "$env:ProgramFiles\nox-voice", "${env:ProgramFiles(x86)}\nox-voice" -Filter 'nox-voice.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $exe) { throw 'MSI のインストール先に nox-voice.exe が見つからない' }
-          foreach ($f in 'LICENSE.txt', 'THIRD_PARTY_NOTICES.txt') {
-            if (-not (Test-Path (Join-Path $exe.DirectoryName $f))) { throw "インストール先に $f が無い ($($exe.DirectoryName))" }
+          # インストール先は MSI 自身が HKCU\Software\<発行者>\<製品名> の InstallDir に記録する。
+          # 新しい PC なら PC 全体向け (Program Files) に入る。前回の NSIS の場所を引き継いで
+          # いないことも、ここで確かめる (上の NSIS の確認の最後を参照)。
+          $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $key = "HKCU:\Software\$($conf.bundle.publisher)\$($conf.productName)"
+          $dir = (Get-ItemProperty $key -Name InstallDir -ErrorAction SilentlyContinue).InstallDir
+          if (-not $dir) { throw "MSI がインストール先を記録していない ($key の InstallDir)" }
+          $dir = $dir.TrimEnd('\')
+          $expected = Join-Path $env:ProgramFiles $conf.productName
+          if ($dir -ne $expected) { throw "MSI のインストール先が想定と違う: $dir (想定: $expected)" }
+          foreach ($f in 'nox-voice.exe', 'LICENSE.txt', 'THIRD_PARTY_NOTICES.txt') {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "インストール先に $f が無い ($dir)" }
           }
-          "インストール先: $($exe.DirectoryName)"
-          $env:NOX_E2E_EXE = $exe.FullName
+          "インストール先: $dir"
+          $env:NOX_E2E_EXE = Join-Path $dir 'nox-voice.exe'
           node e2e/single-instance.mjs
           if ($LASTEXITCODE -ne 0) { throw 'MSI で入れた exe で多重起動の E2E が落ちた' }
           $u = Start-Process msiexec.exe -ArgumentList '/x', "`"$($msi.FullName)`"", '/qn' -Wait -PassThru
           if ($u.ExitCode -ne 0) { throw "MSI のアンインストールが失敗した (exit $($u.ExitCode))" }
+          if (Test-Path $env:NOX_E2E_EXE) { throw 'MSI のアンインストール後も exe が残っている' }
 
       - name: 来歴の証明 (このリポジトリのこのタグからビルドしたこと)
         if: github.event_name == 'push'
