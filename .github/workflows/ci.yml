@@ -48,9 +48,9 @@ jobs:
       CARGO_TERM_COLOR: always
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: "npm"
@@ -74,7 +74,7 @@ jobs:
           rustc --version
 
       - name: Cargo のキャッシュ
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
@@ -112,9 +112,9 @@ jobs:
       CARGO_TERM_COLOR: always
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: "npm"
@@ -134,7 +134,7 @@ jobs:
       - name: Cargo のキャッシュ (復元)
         id: cargo-cache
         # 保存はビルドの直後に自分で行う (下の「Cargo のキャッシュ (保存)」)
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index/
@@ -186,7 +186,7 @@ jobs:
         # actions/cache の自動保存はジョブが成功したときしか走らない。E2E が落ちた
         # run でもビルドは使い回せるよう、ビルドの直後に保存する。
         if: steps.build.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         with:
           path: |
             ~/.cargo/registry/index/
@@ -252,7 +252,7 @@ jobs:
 
       - name: アプリのログを残す
         if: failure()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-app-logs
           path: e2e-logs/
@@ -266,9 +266,9 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: "npm"
@@ -278,7 +278,7 @@ jobs:
 
       - name: 検査ツールのキャッシュ
         id: tools
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cargo-tools
           # 設定 (deny.toml / about.toml) はこの版で検証してある。上げるときは両方を見直す。
@@ -305,9 +305,9 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: 新しく入る依存に重大な脆弱性が無いか
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
         with:
           fail-on-severity: high

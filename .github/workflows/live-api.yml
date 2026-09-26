@@ -52,7 +52,7 @@ jobs:
             exit 1
           }
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Rust (stable)
         # サードパーティのアクションは使わない (CodeQL: 参照がコミットで固定されていない)。
@@ -64,7 +64,7 @@ jobs:
           rustc --version
 
       - name: Cargo のキャッシュ
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
