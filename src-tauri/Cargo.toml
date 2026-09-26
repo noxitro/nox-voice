@@ -36,7 +36,7 @@ hound = "3.5"
 # バージョンは `windows` 0.62 が使っているものと同一 (lock で共有される)。
 # 辞書の自動学習 (learn.rs) が UIA のイベントハンドラを実装するため、
 # **本番ビルドにも要る** (かつては uia_spike 用に dev-dependencies だけだった)。
-windows-core = "0.62"
+windows-core = "0.100"
 # WinRT の非同期 (`IAsyncOperation`) の完了ハンドラ型。ローカル OCR の
 # `RecognizeAsync` を**時間を切って**待つのに要る (screen/win32.rs)。
 # `windows` 0.62 はこれを再エクスポートしていないので、`windows-core` と
