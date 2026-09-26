@@ -46,6 +46,7 @@ const LOG = path.join(process.env.LOCALAPPDATA, "com.noxitro.nox-voice", "logs",
 const REPO = path.resolve(import.meta.dirname, "..");
 const EXE = process.env.NOX_E2E_EXE || path.join(REPO, "src-tauri", "target", "debug", "nox-voice.exe");
 const SEND_KEYS = path.join(REPO, "e2e", "send-keys.ps1");
+const PROBE_INPUT = path.join(REPO, "e2e", "probe-input.ps1");
 
 /** 録音が本当に始まったときの行。`録音開始 [貼り付け] (挿入先: …)`。
  *
@@ -196,6 +197,20 @@ function sendKeys(steps, focusPid) {
   const out = r.stdout.trim();
   if (process.env.NOX_E2E_VERBOSE) console.log(`        [keys] ${out.replace(/\s+/g, " ")}`);
   return out;
+}
+
+/** 合成入力がフックへ届くかを、アプリを使わずに OS だけで測る (e2e/probe-input.ps1)。
+ *
+ * T1 が落ちたときの切り分けに使う。アプリが起動して前景にいる状態で `reachable`
+ * なら、届かなかったのはアプリのフックの側。`blocked` なら環境の側
+ * (CI はジョブの最初、アプリが居ないときにも同じものを測っている)。 */
+function probeInput() {
+  const r = spawnSync(
+    "powershell.exe",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", PROBE_INPUT],
+    { encoding: "utf8" },
+  );
+  return (r.stdout || r.stderr || `(出力なし: exit ${r.status})`).trim();
 }
 
 // --- CDP ---------------------------------------------------------------------
@@ -485,6 +500,8 @@ async function main() {
     injectionReachesHook = Boolean(started);
     // 録音デバイスが無いだけなら、フックは生きている。取り違えないよう別に言う。
     const noDevice = !started && readNewLog().includes(NO_DEVICE);
+    // 届かなかったのが環境かアプリか、その場で切り分ける材料を残す (probeInput の doc)。
+    const probe = !started && !noDevice && !NO_INJECTION ? probeInput() : "";
     record(
       "T1 既定 左Ctrl+Space の長押し PTT",
       Boolean(started && (NO_AUDIO || finalized)),
@@ -494,7 +511,8 @@ async function main() {
           ? "ホットキーは発火したが、録音デバイスが無くて録音できない。" +
             "フック経路だけを測るなら NOX_E2E_NO_AUDIO=1 で走らせること"
           : "「録音開始」がログに出ない — 合成入力がフックへ届いていない可能性が高い。" +
-            "物理キーボードで同じ操作を試して切り分けること",
+            "物理キーボードで同じ操作を試して切り分けること" +
+            (probe ? `\n        アプリ起動中に測り直した probe-input.ps1: ${probe}` : ""),
       NO_INJECTION,
     );
     if (!injectionReachesHook) {
@@ -530,6 +548,35 @@ async function main() {
     markLog();
     await cdp.eval(`document.getElementById("hotkey-capture").click()`);
     const capStart = await waitForLog("キー捕獲モード: 開始", 5000);
+
+    // --- T3a: 捕獲を開いただけでは何も拾わない
+    //
+    // 捕獲の開始で、アプリはフックの生存確認に VK_NONAME を 1 打送る
+    // (hotkey::ensure_hook_alive_async)。設定画面が前景だとそのキーは捕獲にも届き、
+    // 拾うと押してもいないのに「このキー (Unidentified) はホットキーに使えません」と
+    // 出る (2026-09-26、画面が前景になる CI で発覚)。フックが応答しないと再設置して
+    // もう 1 打送るので、両方が届き終わるまで待ってから見る (500 + 200 + 500ms)。
+    // 設定画面が前景に無ければダミーキーは別のウィンドウへ行き、ここでは測れない
+    // (陰性側のテストなので素通りする)。前景だったかを結果に書く。
+    await sleep(1500);
+    const idle = await cdp.eval(`({
+      focused: document.hasFocus(),
+      label: document.getElementById("hotkey-label").textContent,
+      banner: document.getElementById("error")?.hidden === false ? document.getElementById("error").textContent : "",
+    })`);
+    const picked = readNewLog()
+      .split(/\r?\n/)
+      .find((l) => l.includes("写せない code") || l.includes("使えない組み合わせ") || l.includes("ホットキー確定"));
+    // 帯は録音デバイス無しモードの T1 の失敗表示が残っていることがあるので、捕獲の拒否文だけを見る。
+    const rejectedBanner = /ホットキーに使えません/.test(idle.banner) ? idle.banner : "";
+    record(
+      "T3a 捕獲を開いただけでは何も拾わない (生存確認のダミーキーが混ざらない)",
+      Boolean(capStart) && !picked && !rejectedBanner,
+      `設定画面が前景=${idle.focused}${idle.focused ? "" : " (ダミーキーは別のウィンドウへ行くので測れていない)"}` +
+        ` / ラベル="${idle.label}"${picked ? ` / ${picked.trim()}` : ""}${rejectedBanner ? ` / 帯="${rejectedBanner}"` : ""}`,
+      false,
+    );
+
     const keyPath = await cdp.key("down", "ControlLeft", VK.LCTRL);
     await cdp.key("down", "F14", VK.F14);
     await sleep(200);
