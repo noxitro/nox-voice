@@ -131,8 +131,10 @@ jobs:
           rustup default stable
           rustc --version
 
-      - name: Cargo のキャッシュ
-        uses: actions/cache@v5
+      - name: Cargo のキャッシュ (復元)
+        id: cargo-cache
+        # 保存はビルドの直後に自分で行う (下の「Cargo のキャッシュ (保存)」)
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -179,6 +181,19 @@ jobs:
         # なる (docs/handoff.md)。配布物と同じ tauri build を通す。Rust 側と JS 側の
         # Tauri の版ずれ (major.minor) もここで検出される。
         run: npx tauri build --no-bundle
+
+      - name: Cargo のキャッシュ (保存)
+        # actions/cache の自動保存はジョブが成功したときしか走らない。E2E が落ちた
+        # run でもビルドは使い回せるよう、ビルドの直後に保存する。
+        if: steps.build.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            src-tauri/target/
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: 多重起動 (single-instance)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
