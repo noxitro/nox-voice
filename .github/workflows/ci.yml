@@ -127,6 +127,20 @@ jobs:
           Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $setup
           Start-Process -FilePath $setup -ArgumentList '/silent', '/install' -Wait
 
+      - name: 合成入力がフックまで届く環境か (診断)
+        id: probe
+        shell: pwsh
+        run: |
+          # アプリを使わず OS だけで測る (e2e/probe-input.ps1)。届かなければ、hotkey の
+          # E2E はキー送出を要するテストを測らずに走る (NOX_E2E_NO_INJECTION=1)。
+          $r = & ./e2e/probe-input.ps1
+          "結果: $r"
+          $verdict = ($r -split ' ')[0]
+          "injection=$verdict" >> $env:GITHUB_OUTPUT
+          if ($verdict -ne 'reachable') {
+            "::warning title=合成入力がフックに届かない::$r (hotkey の E2E はキー送出を要するテストを SKIP にして走る)"
+          }
+
       - name: リリース構成でビルド (tauri build --no-bundle)
         id: build
         # cargo build --release だけでは frontendDist を同梱しない dev 焼き込みの exe に
@@ -153,6 +167,9 @@ jobs:
           # ランナーには音声デバイスが無い。測れないもの (録音の確定 / T11 / T12) は
           # ハーネスが集計に書く (docs/hotkey-e2e.md の「CI で走らせる」)。
           NOX_E2E_NO_AUDIO: "1"
+          # probe が reachable と言ったときだけキー送出のテストも測る。
+          # (a && '' || b は '' が偽なので常に b になる。条件を反転して書く)
+          NOX_E2E_NO_INJECTION: ${{ steps.probe.outputs.injection != 'reachable' && '1' || '0' }}
         run: node e2e/hotkey.mjs
 
       - name: 失敗したらアプリのログを集める
@@ -162,6 +179,12 @@ jobs:
           $logs = Join-Path $env:LOCALAPPDATA 'com.noxitro.nox-voice\logs'
           New-Item -ItemType Directory -Force e2e-logs | Out-Null
           if (Test-Path $logs) { Copy-Item "$logs\*" e2e-logs -Recurse }
+          # WebView2 / Edge はグループポリシーで挙動が変わる (デバッグポート等)。
+          # ランナーのイメージが何を設定しているかを、落ちたときの材料として残す。
+          foreach ($k in 'HKLM:\SOFTWARE\Policies\Microsoft\Edge', 'HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2') {
+            "--- $k"
+            if (Test-Path $k) { Get-ItemProperty $k | Format-List | Out-String } else { '(無し)' }
+          }
 
       - name: アプリのログを残す
         if: failure()
