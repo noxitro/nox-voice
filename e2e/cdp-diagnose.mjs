@@ -39,6 +39,28 @@ export async function describeCdpFailure(port, lastError) {
     ],
     { encoding: "utf8" },
   );
-  lines.push((ps.stdout || ps.stderr || "(プロセス一覧を取れない)").trim());
+  const browsers = (ps.stdout || ps.stderr || "(プロセス一覧を取れない)").trim();
+  lines.push(browsers);
+  // 管理者権限 (High IL) で動くホストでは、WebView2 は WEBVIEW2_* の環境変数と HKCU の
+  // 上書きを無視し、HKLM のポリシーとコードで渡した引数だけを使う (Microsoft の
+  // "Develop secure WebView2 apps")。GitHub Actions の Windows ランナーがこれに当たる。
+  const elevated = spawnSync(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-Command",
+      "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent())" +
+        ".IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)",
+    ],
+    { encoding: "utf8" },
+  ).stdout?.trim();
+  lines.push(`管理者権限で実行中: ${elevated || "(不明)"}`);
+  if (elevated === "True" && !browsers.includes("--remote-debugging-port")) {
+    lines.push(
+      "→ 昇格したプロセスでは WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS が無視される。" +
+        "HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments に " +
+        `"nox-voice.exe" = "--remote-debugging-port=${port}" を置き、NOX_E2E_CDP_PORT=${port} で走らせること`,
+    );
+  }
   return lines.map((l) => `    ${l}`).join("\n");
 }

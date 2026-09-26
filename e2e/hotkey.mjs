@@ -20,6 +20,9 @@
 //                    CI はリリースビルドを渡す
 // - NOX_E2E_NO_AUDIO 録音デバイスの無い環境 (GitHub Actions の Windows
 //                    ランナー等) で 1 にする。下の NO_AUDIO の doc を参照
+// - NOX_E2E_CDP_PORT WebView2 のデバッグポート (既定は毎回ランダム)。管理者権限で
+//                    走らせるときは環境変数での指定が無視されるので、HKLM の
+//                    ポリシーで同じポートを渡す (docs/hotkey-e2e.md)
 // - NOX_E2E_NO_INJECTION 合成入力がフックまで届かない環境で 1 にする。
 //                    下の NO_INJECTION の doc を参照 (e2e/probe-input.ps1 で判定できる)
 //
@@ -33,7 +36,9 @@ import { describeCdpFailure } from "./cdp-diagnose.mjs";
 
 // 毎回ポートを変える。固定にすると前回の TIME_WAIT / 生き残りブラウザに
 // 引っかかって「デバッグポートが開かない」run が混ざる。
-const CDP_PORT = 9400 + Math.floor(Math.random() * 400);
+// NOX_E2E_CDP_PORT があればそれを使う (管理者権限で走る CI はポートを HKLM の
+// ポリシーで決め打ちで渡すため。docs/hotkey-e2e.md の「CI で走らせる」)。
+const CDP_PORT = Number(process.env.NOX_E2E_CDP_PORT) || 9400 + Math.floor(Math.random() * 400);
 const APP_DIR = path.join(process.env.APPDATA, "com.noxitro.nox-voice");
 const CONFIG = path.join(APP_DIR, "config.json");
 const CONFIG_BACKUP = path.join(APP_DIR, "config.json.e2e-backup");
