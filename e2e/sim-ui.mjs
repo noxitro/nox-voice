@@ -492,6 +492,69 @@ async function main() {
     };
   });
 
+  // --- U2e: アプリ自身の生存確認のダミーキーは、押されたキーとして数えない
+  //
+  // 捕獲の開始時、Rust はフックの生存を確かめるために VK_NONAME を SendInput で
+  // 自分宛てに送る (hotkey::ensure_hook_alive_async)。設定画面が前景だと、その
+  // キーは code が空のままここへ届く。数えると、押してもいないのに
+  // 「このキー (Unidentified) はホットキーに使えません」と出る (2026-09-26、画面が
+  // 必ず前景になる CI の実機 E2E で発覚)。WebView2 に届く形 (keyCode 0xFC・
+  // code 空・key "Unidentified") を DOM イベントで再現する。
+  await check("U2e 生存確認のダミーキー (VK_NONAME) は捕獲に数えず、次のキーで普通に決まる", async () => {
+    const r = await cdp.run(`
+      document.querySelector('.nav-item[data-section="home"]').click();
+      await new Promise((r) => setTimeout(r, 200));
+      document.getElementById("hotkey-capture").click();
+      await new Promise((r) => setTimeout(r, 150));
+      window.__NOX_MOCK__.reset();
+      const label = document.getElementById("hotkey-label");
+      const heartbeat = (type) =>
+        window.dispatchEvent(
+          new KeyboardEvent(type, { key: "Unidentified", keyCode: 0xfc, bubbles: true, cancelable: true }),
+        );
+      heartbeat("keydown");
+      await new Promise((r) => setTimeout(r, 30));
+      heartbeat("keyup");
+      await new Promise((r) => setTimeout(r, 250));
+      const idle = {
+        finishes: window.__NOX_MOCK__.count("finish_hotkey_capture"),
+        progress: window.__NOX_MOCK__.count("describe_hotkey_codes"),
+        capturing: label.dataset.capturing,
+        text: label.textContent,
+      };
+
+      const key = (type, code) =>
+        window.dispatchEvent(new KeyboardEvent(type, { code, bubbles: true, cancelable: true }));
+      key("keydown", "ControlLeft");
+      key("keydown", "F14");
+      await new Promise((r) => setTimeout(r, 60));
+      key("keyup", "F14");
+      key("keyup", "ControlLeft");
+      await new Promise((r) => setTimeout(r, 250));
+      return {
+        // 前提: この環境の KeyboardEvent が keyCode を受け取れること
+        // (受け取れないと 0 になり、ダミーキーを再現できていない)。
+        keyCodeTakes: new KeyboardEvent("keydown", { keyCode: 0xfc }).keyCode,
+        idle,
+        finished: window.__NOX_MOCK__.lastArgs("finish_hotkey_capture"),
+        settled: label.textContent,
+      };
+    `);
+    return {
+      ok:
+        r.keyCodeTakes === 0xfc &&
+        // ダミーキーだけでは確定にも経過表示にも進まない。
+        r.idle.finishes === 0 &&
+        r.idle.progress === 0 &&
+        r.idle.capturing === "true" &&
+        /キーを押してください/.test(r.idle.text) &&
+        // 次の本物のキーに混ざらない。
+        JSON.stringify(r.finished?.codes) === JSON.stringify(["ControlLeft", "F14"]) &&
+        r.settled === "左 Ctrl + F14",
+      detail: JSON.stringify(r),
+    };
+  });
+
   // --- U2c: 修飾キー単独を割り当てると注意が出る (2026-08-29 の不具合の名残)
   //
   // 単独 Alt はフックが握り潰さないので入力先アプリにも流れ、Chrome は

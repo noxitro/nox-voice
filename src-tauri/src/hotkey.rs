@@ -1008,6 +1008,10 @@ const HOOK_HEALTH_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_GRACE: Duration = Duration::from_millis(500);
 /// 生存確認に使う VK。`VK_NONAME` — Microsoft が「ダミーのキーストローク用」と
 /// 明記している、どのアプリにも意味を持たないキー。
+///
+/// 合成キーは前景のウィンドウにも届く。設定画面のキー捕獲は、この VK を
+/// 押されたキーとして数えない (`src/main.ts` の `HEARTBEAT_KEY_CODE`)。
+/// 変えるときは両方を揃えること。
 const HEARTBEAT_VK: u32 = 0xFC;
 /// 生存確認のキーに載せる `dwExtraInfo`。値は ASCII の "NOXH"。
 ///
