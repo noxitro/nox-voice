@@ -1974,7 +1974,18 @@ mod tests {
                 delay: Duration::from_millis(300),
             },
         );
-        let pasted = read_notepad_text(target);
+        // 貼り付けはメモ帳のメッセージループが処理するので、送出が返った時点で
+        // 本文に入っているとは限らない。CI のランナーでは読んだ時点では空で、
+        // その後に届いたために後片付けで保存確認が出た (2026-09-26)。
+        // 届くまで待ってから読む。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pasted = loop {
+            let text = read_notepad_text(target);
+            if text.as_deref().is_some_and(|t| t.contains(payload)) || Instant::now() >= deadline {
+                break text;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
 
         // 後片付けは検証より先に済ませる (assert で落ちてもメモ帳を残さない)。
         close_test_notepad(target, &mut child);
