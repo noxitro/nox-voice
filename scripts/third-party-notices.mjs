@@ -23,6 +23,7 @@
 // (about.toml の accepted)。黙って配布しないため、失敗させたまま止める。
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const REPO = path.resolve(import.meta.dirname, "..");
@@ -38,6 +39,11 @@ const BUNDLED_BUILD_TOOLS = ["vite"];
 const RULE = "=".repeat(80);
 
 function rustSection() {
+  // 結果は標準出力ではなくファイル (-o) で受け取る。Windows の PowerShell の下で
+  // 動くと、cargo-about は標準出力のリダイレクトを拒んで失敗する (文字コードが
+  // 化けるのを避けるため)。リリースのビルドは pwsh の上で走る。
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "nox-voice-notices-"));
+  const file = path.join(tmp, "rust.txt");
   const args = ["about", "generate", "--locked", "--fail"];
   if (flags.includes("--offline")) args.push("--offline");
   args.push(
@@ -45,15 +51,21 @@ function rustSection() {
     path.join("src-tauri", "Cargo.toml"),
     "-c",
     path.join("src-tauri", "about.toml"),
+    "-o",
+    file,
     path.join("src-tauri", "about.hbs"),
   );
-  const r = spawnSync("cargo", args, { cwd: REPO, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
-  if (r.error) throw new Error(`cargo を起動できない: ${r.error.message}`);
-  if (r.status !== 0) {
-    console.error(r.stderr);
-    throw new Error("cargo-about が失敗した (許可していないライセンスか、本文を読めないクレートがある)");
+  try {
+    const r = spawnSync("cargo", args, { cwd: REPO, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+    if (r.error) throw new Error(`cargo を起動できない: ${r.error.message}`);
+    if (r.status !== 0) {
+      console.error(r.stderr);
+      throw new Error("cargo-about が失敗した (上のログを参照。多くは許可していないライセンスか、本文を読めないクレート)");
+    }
+    return fs.readFileSync(file, "utf8").trim();
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
-  return r.stdout.trim();
 }
 
 /** LICENSE.spdx しか無いパッケージ向け (@tauri-apps/plugin-opener など)。 */
