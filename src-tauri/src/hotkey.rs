@@ -1552,16 +1552,23 @@ fn probe_hook_alive() -> HookProbe {
 /// 前景にある間は `SendInput` が UIPI で捨てられ、生きているフックでも
 /// `Silent` になる。ログにその名前が並んでいれば、後から
 /// 「本当に外れていた」のか「偽陽性だった」のかを読み分けられる。
+///
+/// 起動からフックが観測したキーイベントの累計も添える。再設置を繰り返しても
+/// 0 のままなら、途中で外れたのではなく**最初から 1 度も呼ばれていない**
+/// (2026-09-26、CI のランナーで実際にそうなった)。
 fn request_rehook(tid: u32, reason: &str) {
     let foreground = crate::foreground::capture_foreground();
     log::warn!(
         "キーボードフックが応答しません ({reason}: 生存確認のキーを観測できない)。再設置します \
-         [そのときの前景プロセス: {} / 昇格ウィンドウが前景だと生存確認だけが届かないことがある]",
+         [そのときの前景プロセス: {} / 昇格ウィンドウが前景だと生存確認だけが届かないことがある / \
+         起動からフックが観測したキーイベント {} 件・再設置 {} 回]",
         if foreground.process_name.is_empty() {
             "<unknown>"
         } else {
             foreground.process_name.as_str()
-        }
+        },
+        HOOK_EVENTS_SEEN.load(Ordering::SeqCst),
+        HOOK_REINSTALLS.load(Ordering::SeqCst),
     );
     // SAFETY: 引数は数値のみ。宛先スレッドが無ければ Err が返るだけ。
     if let Err(e) = unsafe { PostThreadMessageW(tid, WM_REHOOK, WPARAM(0), LPARAM(0)) } {

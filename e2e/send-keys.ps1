@@ -11,9 +11,14 @@
 # -FocusPid を渡すと、送出前にそのプロセスのウィンドウを前景へ持ってくる。
 # 合成キーはフックだけでなく**前景アプリにも届く**ので、これを省くと
 # ユーザーが作業中のウィンドウへキーが流れ込む (E2E がユーザーの作業を壊す)。
+#
+# -Sink を渡すと、このスクリプト自身が空のウィンドウを出して前景にし、キーは
+# そこへ流す。「nox-voice 以外のアプリが前景のときに押す」(実際の使われ方) を
+# 作るためのもの。終わったらウィンドウは閉じる。
 param(
     [Parameter(Mandatory = $true)][string]$Steps,
-    [int]$FocusPid = 0
+    [int]$FocusPid = 0,
+    [switch]$Sink
 )
 
 $ErrorActionPreference = 'Stop'
@@ -70,7 +75,22 @@ public static class NoxE2EInput {
 }
 '@
 
-if ($FocusPid -gt 0) {
+$sinkForm = $null
+if ($Sink) {
+    Add-Type -AssemblyName System.Windows.Forms
+    $sinkForm = New-Object System.Windows.Forms.Form
+    $sinkForm.Text = 'nox-voice E2E (キーの受け皿)'
+    $sinkForm.ShowInTaskbar = $false
+    $sinkForm.TopMost = $true
+    $sinkForm.StartPosition = 'Manual'
+    $sinkForm.SetBounds(0, 0, 320, 120)
+    $sinkForm.Show()
+    [System.Windows.Forms.Application]::DoEvents()
+    $ok = [NoxE2EInput]::Focus($sinkForm.Handle)
+    [System.Windows.Forms.Application]::DoEvents()
+    Write-Output "focus: sink hwnd=0x$($sinkForm.Handle.ToString('X')) ok=$ok"
+    Start-Sleep -Milliseconds 150
+} elseif ($FocusPid -gt 0) {
     $proc = Get-Process -Id $FocusPid -ErrorAction SilentlyContinue
     if ($proc -and $proc.MainWindowHandle -ne [IntPtr]::Zero) {
         $ok = [NoxE2EInput]::Focus($proc.MainWindowHandle)
@@ -103,5 +123,11 @@ foreach ($step in $Steps.Split(',')) {
         default { throw "未知のステップ: $step" }
     }
     Start-Sleep -Milliseconds 30
+    # 受け皿のウィンドウは応答させておく (応答しないウィンドウは OS に前景から外されうる)。
+    if ($sinkForm) { [System.Windows.Forms.Application]::DoEvents() }
+}
+if ($sinkForm) {
+    $sinkForm.Close()
+    $sinkForm.Dispose()
 }
 Write-Output "done"
