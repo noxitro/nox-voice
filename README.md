@@ -113,7 +113,7 @@ npm run build                                                    # 型検査 + �
 cargo clippy --manifest-path src-tauri/Cargo.toml --lib --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml --lib
 npm run sim                                                      # 疑似 E2E
-npm run version:check                                            # 版が 5 か所で揃っているか
+npm run version:check                                            # 版が 5 ファイル (6 か所) で揃っているか
 ```
 
 実機 E2E(`npm run e2e:hotkey` など)は実行中のアプリを落とし、本物の設定ファイルを書き換えます。走らせる前に [docs/hotkey-e2e.md](docs/hotkey-e2e.md) を読んでください。
@@ -134,7 +134,7 @@ GitHub Actions で次を回しています。
 ### リリースの手順
 
 ```bash
-npm run version:set -- 0.6.0          # 5 か所の版を揃える
+npm run version:set -- 0.6.0          # 5 ファイル (6 か所) の版を揃える
 git commit -am "chore: 0.6.0 へ上げる" && git push
 git tag v0.6.0 && git push origin v0.6.0
 ```

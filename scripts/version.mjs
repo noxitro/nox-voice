@@ -1,13 +1,13 @@
-// アプリの版は 5 か所に書かれている。1 か所でも揃っていないと、
+// アプリの版は 5 ファイル・6 か所に書かれている。1 か所でも揃っていないと、
 // インストーラの表示と実体が食い違う (実際に起きる事故)。
 //
 //   package.json / package-lock.json (2 か所) / src-tauri/Cargo.toml /
 //   src-tauri/Cargo.lock / src-tauri/tauri.conf.json
 //
 // 使い方:
-//   node scripts/version.mjs check              5 か所が揃っているか (CI が毎回走らせる)
+//   node scripts/version.mjs check              6 か所が揃っているか (CI が毎回走らせる)
 //   node scripts/version.mjs check --tag v1.2.3 さらにタグと一致するか (リリースが走らせる)
-//   node scripts/version.mjs set 1.2.3          5 か所をまとめて書き換える
+//   node scripts/version.mjs set 1.2.3          6 か所をまとめて書き換える
 //
 // 書き換えは JSON を読んで書き戻す。この 3 ファイルは 2 スペース字下げ +
 // 末尾改行で、読んで書き戻しても 1 バイトも変わらないことを確かめてある
@@ -73,7 +73,7 @@ function check(tag) {
     );
     process.exit(1);
   }
-  console.log(`\n5 か所とも ${expected}`);
+  console.log(`\n${rows.length} か所 (5 ファイル) とも ${expected}`);
 }
 
 function set(version) {
