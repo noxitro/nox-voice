@@ -30,7 +30,9 @@ import { describeCdpFailure } from "./cdp-diagnose.mjs";
 const REPO = path.resolve(import.meta.dirname, "..");
 const EXE = process.env.NOX_E2E_EXE || path.join(REPO, "src-tauri", "target", "release", "nox-voice.exe");
 const LOG = `${process.env.LOCALAPPDATA}\\com.noxitro.nox-voice\\logs\\nox-voice.log`;
-const PORT = 9333;
+// 管理者権限で走らせる CI は、ポートを HKLM のポリシーで渡して NOX_E2E_CDP_PORT で知らせる
+// (昇格したプロセスでは WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS が無視される)。
+const PORT = Number(process.env.NOX_E2E_CDP_PORT) || 9333;
 const F13 = 124, F14 = 125;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

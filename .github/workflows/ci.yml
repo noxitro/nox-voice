@@ -190,7 +190,13 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           NOX_E2E_EXE: ${{ github.workspace }}\src-tauri\target\release\nox-voice.exe
-        run: node e2e/hotkey-picker-live.mjs
+          NOX_E2E_CDP_PORT: "9555"
+        # ランナーはジョブを管理者権限で走らせるので、デバッグポートは環境変数ではなく
+        # HKLM のポリシーで渡す (e2e/webview2-debug-port.ps1)。ハーネスごとにポートを
+        # 変える (固定すると前の run の TIME_WAIT に引っかかることがある)。
+        run: |
+          ./e2e/webview2-debug-port.ps1 -Port $env:NOX_E2E_CDP_PORT
+          node e2e/hotkey-picker-live.mjs
 
       - name: ホットキー経路 (hotkey、録音デバイス無し)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
@@ -202,7 +208,15 @@ jobs:
           # probe が reachable と言ったときだけキー送出のテストも測る。
           # (a && '' || b は '' が偽なので常に b になる。条件を反転して書く)
           NOX_E2E_NO_INJECTION: ${{ steps.probe.outputs.injection != 'reachable' && '1' || '0' }}
-        run: node e2e/hotkey.mjs
+          NOX_E2E_CDP_PORT: "9556"
+        run: |
+          ./e2e/webview2-debug-port.ps1 -Port $env:NOX_E2E_CDP_PORT
+          node e2e/hotkey.mjs
+
+      - name: デバッグポートのポリシーを片付ける
+        if: always()
+        shell: pwsh
+        run: ./e2e/webview2-debug-port.ps1 -Remove
 
       - name: 失敗したらアプリのログを集める
         if: failure()
