@@ -278,6 +278,10 @@ https://dev.to/wudaming00/windows-silently-stops-delivering-whkeyboardll-hook-ev
 
 **テスト**: Rust の単体テスト (`window_keys_*`)、疑似 E2E の `U2f`、実機 E2E の `T1w`
 (他のフックが無い CI のランナーでは、発火はページからの経路だけで起きる)。
+`send-keys.ps1` は物理キーと同じくスキャンコードも付けて送る (拡張キーは拡張フラグも)。
+Chromium は `KeyboardEvent.code` をスキャンコードから決めるので、付けないとページには
+`code` が空のキーとして届き、ページは捨てる (T1w が落ちた。生存確認のダミーキーが
+"Unidentified" で届いたのも同じ理由)。
 
 ## CI (GitHub Actions) で走らせる (2026-09-25)
 
