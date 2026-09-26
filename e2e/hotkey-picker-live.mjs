@@ -139,7 +139,13 @@ await sleep(1200);
 // 設定ファイルの現在値を控えておき、最後に戻す (この診断は本当に設定を書き換える)。
 // 無いときは null。終了時に、診断で作られた設定ファイルを消す。
 const cfgPath = `${process.env.APPDATA}\\com.noxitro.nox-voice\\config.json`;
-const cfgBackup = fs.existsSync(cfgPath) ? fs.readFileSync(cfgPath, "utf8") : null;
+// 有無は読んでみて決める (確かめてから読むと、その間に変わりうる)。
+let cfgBackup = null;
+try {
+  cfgBackup = fs.readFileSync(cfgPath, "utf8");
+} catch (e) {
+  if (e.code !== "ENOENT") throw e;
+}
 
 const app = spawn(EXE, [], {
   env: { ...process.env, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${PORT}`, NOX_VOICE_LOG: "debug" },

@@ -3,7 +3,7 @@ name: Release
 # タグ vX.Y.Z を push すると、CI と同じ検査を通したうえでインストーラを作り、
 # GitHub Release に公開する。
 #
-#   npm run version:set -- 0.6.0   # 5 か所の版を揃える
+#   npm run version:set -- 0.6.0   # 5 ファイル (6 か所) の版を揃える
 #   git commit -am "chore: 0.6.0 へ上げる" && git push
 #   git tag v0.6.0 && git push origin v0.6.0
 #
@@ -60,8 +60,16 @@ jobs:
         if: github.event_name != 'push'
         run: node scripts/version.mjs check
 
-      # 配布物はキャッシュを使わずに作る。
-      - uses: dtolnay/rust-toolchain@stable
+      # 配布物はキャッシュを使わずに作る。このジョブは来歴の証明に書き込み権限を
+      # 持つので、サードパーティのアクションは入れない。
+      - name: Rust (stable)
+        # サードパーティのアクションは使わない (CodeQL: 参照がコミットで固定されていない)。
+        # ランナーには rustup が入っているので直接呼ぶ。bash は失敗した行で止まる。
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
 
       - name: cargo-about を入れる
         # 版は CI (policy ジョブ) と揃える。about.toml はこの版で検証してある。

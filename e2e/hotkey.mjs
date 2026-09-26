@@ -166,13 +166,17 @@ async function settleRecording() {
 }
 
 function restoreConfig() {
-  if (fs.existsSync(CONFIG_BACKUP)) {
-    fs.copyFileSync(CONFIG_BACKUP, CONFIG);
-    fs.rmSync(CONFIG_BACKUP);
+  // 有無を確かめてから写すと、その間に変わりうる (CodeQL: file system race)。
+  // 退避を元の名前へ移して置き換え、無ければ ENOENT で分かる。
+  try {
+    fs.renameSync(CONFIG_BACKUP, CONFIG);
     console.log("\n設定ファイルを元に戻しました");
-  } else if (!hadConfig) {
-    fs.rmSync(CONFIG, { force: true });
-    console.log("\n開始前は設定ファイルが無かったので、テストで作ったものを消しました");
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+    if (!hadConfig) {
+      fs.rmSync(CONFIG, { force: true });
+      console.log("\n開始前は設定ファイルが無かったので、テストで作ったものを消しました");
+    }
   }
 }
 
@@ -431,9 +435,15 @@ async function main() {
   // 合成キーで始まった録音の結果がユーザーの作業中ウィンドウへ貼られないため。
   // 新しいマシン (CI のランナーなど) では設定ファイルがまだ無い。アプリは
   // 欠けた項目を既定値で補う (#[serde(default)]) ので、空から組み立てて良い。
-  hadConfig = fs.existsSync(CONFIG);
-  if (hadConfig) fs.copyFileSync(CONFIG, CONFIG_BACKUP);
-  const base = hadConfig ? readConfig() : {};
+  // 有無は写してみて決める (確かめてから写すと、その間に変わりうる)。
+  try {
+    fs.copyFileSync(CONFIG, CONFIG_BACKUP);
+    hadConfig = true;
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+    hadConfig = false;
+  }
+  const base = hadConfig ? JSON.parse(fs.readFileSync(CONFIG_BACKUP, "utf8")) : {};
   fs.mkdirSync(APP_DIR, { recursive: true });
   const testCfg = {
     ...base,
