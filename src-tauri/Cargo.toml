@@ -41,7 +41,7 @@ windows-core = "0.62"
 # `RecognizeAsync` を**時間を切って**待つのに要る (screen/win32.rs)。
 # `windows` 0.62 はこれを再エクスポートしていないので、`windows-core` と
 # 同じ理由で直接の依存を持つ。バージョンは lock で共有される 0.3.x。
-windows-future = "0.3"
+windows-future = "0.100"
 # 本アプリは Windows 11 専用(WH_KEYBOARD_LL / 前景 HWND 取得に依存)。
 windows = { version = "0.62", features = [
     "Win32_Foundation",
