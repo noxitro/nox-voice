@@ -46,15 +46,26 @@ public static class NoxE2EInput {
     [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint uCode, uint uMapType);
 
     public const uint INPUT_KEYBOARD = 1;
+    public const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
     public const uint KEYEVENTF_KEYUP = 0x0002;
+    public const uint MAPVK_VK_TO_VSC_EX = 4;
 
+    // スキャンコードも付けて送る (物理キーと同じ形)。付けないと WebView2 の
+    // ページには KeyboardEvent.code が空のキーとして届く (Chromium は code を
+    // スキャンコードから決める)。拡張キー (右 Alt など) は拡張フラグも立てる。
     public static uint Send(ushort vk, bool up) {
+        uint sc = MapVirtualKey(vk, MAPVK_VK_TO_VSC_EX);
+        uint flags = up ? KEYEVENTF_KEYUP : 0;
+        uint prefix = sc & 0xFF00;
+        if (prefix == 0xE000 || prefix == 0xE100) flags |= KEYEVENTF_EXTENDEDKEY;
         INPUT[] inputs = new INPUT[1];
         inputs[0].type = INPUT_KEYBOARD;
         inputs[0].ki.wVk = vk;
-        inputs[0].ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
+        inputs[0].ki.wScan = (ushort)(sc & 0xFF);
+        inputs[0].ki.dwFlags = flags;
         inputs[0].ki.dwExtraInfo = IntPtr.Zero;   // 自プロセス印は載せない = 実キー相当
         return SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
     }
