@@ -224,6 +224,9 @@ jobs:
           # (a && '' || b は '' が偽なので常に b になる。条件を反転して書く)
           NOX_E2E_NO_INJECTION: ${{ steps.probe.outputs.injection != 'reachable' && '1' || '0' }}
           NOX_E2E_CDP_PORT: "9556"
+          # Edge を前景にして PTT を押す参考の計測 (docs/hotkey-e2e.md の
+          # 「Chromium 系のウィンドウが前景だとフックが呼ばれない」)
+          NOX_E2E_EDGE: "1"
         run: |
           ./e2e/webview2-debug-port.ps1 -Port $env:NOX_E2E_CDP_PORT
           node e2e/hotkey.mjs
