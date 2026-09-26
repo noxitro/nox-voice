@@ -78,6 +78,13 @@ jobs:
       - name: 第三者ライセンス表示を作る
         run: npm run notices
 
+      - name: 本体のライセンスを同梱用に置く
+        # MSI (tauri-bundler) は、リソースに付けた別名のうちファイル名を使わず元の名前で
+        # 入れる (../LICENSE → LICENSE)。NSIS は別名どおり LICENSE.txt で入れるので、
+        # 元から LICENSE.txt の名前で置き、どちらでも同じ名前にする
+        # (src-tauri/tauri.release.conf.json)。
+        run: Copy-Item LICENSE src-tauri/target/release-extras/LICENSE.txt
+
       - name: インストーラをビルドする
         shell: pwsh
         run: |
