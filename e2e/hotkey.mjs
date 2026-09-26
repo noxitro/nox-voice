@@ -188,10 +188,13 @@ function restoreConfig() {
 
 // --- キー送出 ----------------------------------------------------------------
 
-function sendKeys(steps, focusPid) {
+/** @param {number | "sink"} focus 前景にするもの。pid ならそのプロセスのウィンドウ、
+ * "sink" なら send-keys.ps1 が出す空のウィンドウ (nox-voice 以外が前景の状態)。 */
+function sendKeys(steps, focus) {
   if (NO_INJECTION) return "";
   const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SEND_KEYS, "-Steps", steps];
-  if (focusPid) args.push("-FocusPid", String(focusPid));
+  if (focus === "sink") args.push("-Sink");
+  else if (focus) args.push("-FocusPid", String(focus));
   const r = spawnSync("powershell.exe", args, { encoding: "utf8" });
   if (r.status !== 0) throw new Error(`send-keys 失敗: ${r.stderr || r.stdout}`);
   const out = r.stdout.trim();
@@ -207,7 +210,7 @@ function sendKeys(steps, focusPid) {
 function probeInput() {
   const r = spawnSync(
     "powershell.exe",
-    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", PROBE_INPUT],
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", PROBE_INPUT, "-App", "nox-voice"],
     { encoding: "utf8" },
   );
   return (r.stdout || r.stderr || `(出力なし: exit ${r.status})`).trim();
@@ -502,6 +505,17 @@ async function main() {
     const noDevice = !started && readNewLog().includes(NO_DEVICE);
     // 届かなかったのが環境かアプリか、その場で切り分ける材料を残す (probeInput の doc)。
     const probe = !started && !noDevice && !NO_INJECTION ? probeInput() : "";
+    // 前景を nox-voice 以外 (send-keys.ps1 の空ウィンドウ) にして同じキーを送る。
+    // 発火するなら、届かないのは「nox-voice 自身が前景のとき」に限られる
+    // (実際の使われ方は、他のアプリが前景のときに押す)。判定には使わない。
+    let sink = "";
+    if (probe) {
+      markLog();
+      const focusLine = sendKeys(`down:A2,down:20,sleep:800,up:20,up:A2`, "sink").split(/\r?\n/)[0];
+      const sinkFired = await waitForFired(5000);
+      await settleRecording();
+      sink = `前景を E2E の空ウィンドウにして同じキーを送ると: ${sinkFired ? `発火した (${sinkFired.trim()})` : "発火しない"} [${focusLine}]`;
+    }
     record(
       "T1 既定 左Ctrl+Space の長押し PTT",
       Boolean(started && (NO_AUDIO || finalized)),
@@ -512,7 +526,8 @@ async function main() {
             "フック経路だけを測るなら NOX_E2E_NO_AUDIO=1 で走らせること"
           : "「録音開始」がログに出ない — 合成入力がフックへ届いていない可能性が高い。" +
             "物理キーボードで同じ操作を試して切り分けること" +
-            (probe ? `\n        アプリ起動中に測り直した probe-input.ps1: ${probe}` : ""),
+            (probe ? `\n        アプリ起動中に測り直した probe-input.ps1: ${probe}` : "") +
+            (sink ? `\n        ${sink}` : ""),
       NO_INJECTION,
     );
     if (!injectionReachesHook) {

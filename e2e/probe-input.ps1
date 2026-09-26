@@ -24,15 +24,21 @@
 #   llhook-timeout=        … HKCU\Control Panel\Desktop\LowLevelHooksTimeout (無ければ unset)
 # SendInput の所要時間は、フックの応答待ちで止まった分を含む。打ち切りまで
 # 待たされていればその値 (ms) になり、フックが呼ばれずに素通りしていれば 0 に近い。
+# 判定材料として、前景のウィンドウとキーボードフォーカスを持つウィンドウ、この
+# プロセス自身、-App で渡したプロセスについて、トークン (整合性レベルの RID・昇格・
+# UIAccess) も並べる。UIPI は整合性レベルの高いプロセスへの入力を低い側から
+# 見えなくするので、フックに届かない理由がそこにあるかを読めるようにする。
 # 終了コードは常に 0 (判定は出力で渡す)。
 #
-# 使い方: pwsh -NoProfile -File e2e/probe-input.ps1
+# 使い方: pwsh -NoProfile -File e2e/probe-input.ps1 [-App nox-voice]
+param([string]$App = '')
 $ErrorActionPreference = 'Stop'
 
 Add-Type @'
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 
 public static class NoxInputProbe {
@@ -173,6 +179,117 @@ public static class NoxInputProbe {
         }
     }
 
+    [DllImport("user32.dll")]
+    static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")]
+    static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [StructLayout(LayoutKind.Sequential)]
+    struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct GUITHREADINFO {
+        public int cbSize; public uint flags;
+        public IntPtr hwndActive; public IntPtr hwndFocus; public IntPtr hwndCapture;
+        public IntPtr hwndMenuOwner; public IntPtr hwndMoveSize; public IntPtr hwndCaret;
+        public RECT rcCaret;
+    }
+    [DllImport("user32.dll")]
+    static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO lpgui);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr hObject);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool GetTokenInformation(IntPtr tokenHandle, int tokenInformationClass, IntPtr tokenInformation, int tokenInformationLength, out int returnLength);
+    [DllImport("advapi32.dll")]
+    static extern IntPtr GetSidSubAuthorityCount(IntPtr pSid);
+    [DllImport("advapi32.dll")]
+    static extern IntPtr GetSidSubAuthority(IntPtr pSid, uint nSubAuthority);
+
+    const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+    const uint TOKEN_QUERY = 0x0008;
+    const int TokenElevation = 20;
+    const int TokenIntegrityLevel = 25;
+    const int TokenUIAccess = 26;
+
+    // プロセスのトークン: 整合性レベルの RID (0x2000 = Medium, 0x3000 = High,
+    // 0x4000 = System)・昇格・UIAccess。
+    public static string TokenOf(uint pid) {
+        IntPtr process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if (process == IntPtr.Zero) return "token=?(open err " + Marshal.GetLastWin32Error() + ")";
+        try {
+            IntPtr token;
+            if (!OpenProcessToken(process, TOKEN_QUERY, out token)) {
+                return "token=?(err " + Marshal.GetLastWin32Error() + ")";
+            }
+            try {
+                return "il=" + IntegrityOf(token)
+                    + " elevated=" + DwordOf(token, TokenElevation)
+                    + " uiaccess=" + DwordOf(token, TokenUIAccess);
+            } finally {
+                CloseHandle(token);
+            }
+        } finally {
+            CloseHandle(process);
+        }
+    }
+
+    static string DwordOf(IntPtr token, int cls) {
+        IntPtr buf = Marshal.AllocHGlobal(4);
+        try {
+            int len;
+            return GetTokenInformation(token, cls, buf, 4, out len) ? Marshal.ReadInt32(buf).ToString() : "?";
+        } finally {
+            Marshal.FreeHGlobal(buf);
+        }
+    }
+
+    static string IntegrityOf(IntPtr token) {
+        int len;
+        GetTokenInformation(token, TokenIntegrityLevel, IntPtr.Zero, 0, out len);
+        if (len <= 0) return "?";
+        IntPtr buf = Marshal.AllocHGlobal(len);
+        try {
+            if (!GetTokenInformation(token, TokenIntegrityLevel, buf, len, out len)) return "?";
+            // TOKEN_MANDATORY_LABEL の先頭は SID_AND_ATTRIBUTES.Sid
+            IntPtr sid = Marshal.ReadIntPtr(buf);
+            int count = Marshal.ReadByte(GetSidSubAuthorityCount(sid));
+            int rid = Marshal.ReadInt32(GetSidSubAuthority(sid, (uint)(count - 1)));
+            return "0x" + rid.ToString("X4");
+        } finally {
+            Marshal.FreeHGlobal(buf);
+        }
+    }
+
+    static string WindowOf(IntPtr hwnd) {
+        if (hwnd == IntPtr.Zero) return "(なし)";
+        uint pid;
+        GetWindowThreadProcessId(hwnd, out pid);
+        var cls = new StringBuilder(128);
+        GetClassName(hwnd, cls, cls.Capacity);
+        string name;
+        try { name = Process.GetProcessById((int)pid).ProcessName; } catch (Exception) { name = "?"; }
+        return name + "(" + pid + ") class=" + cls + " " + TokenOf(pid);
+    }
+
+    // 前景のウィンドウと、そのスレッドでキーボードフォーカスを持つウィンドウ。
+    // WebView2 ではフォーカスは子ウィンドウ (msedgewebview2.exe 側) にある。
+    public static string Foreground() {
+        IntPtr fg = GetForegroundWindow();
+        string result = "foreground=[" + WindowOf(fg) + "]";
+        if (fg != IntPtr.Zero) {
+            uint pid;
+            uint tid = GetWindowThreadProcessId(fg, out pid);
+            var info = new GUITHREADINFO();
+            info.cbSize = Marshal.SizeOf(typeof(GUITHREADINFO));
+            if (GetGUIThreadInfo(tid, ref info)) result += " focus=[" + WindowOf(info.hwndFocus) + "]";
+        }
+        return result;
+    }
+
     public static string Run() {
         string context = "session=" + Process.GetCurrentProcess().SessionId
             + " console-session=" + WTSGetActiveConsoleSessionId();
@@ -199,4 +316,11 @@ public static class NoxInputProbe {
 '@
 
 $timeout = (Get-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name LowLevelHooksTimeout -ErrorAction SilentlyContinue).LowLevelHooksTimeout
-"$([NoxInputProbe]::Run()) llhook-timeout=$(if ($null -eq $timeout) { 'unset' } else { $timeout })"
+$line = "$([NoxInputProbe]::Run()) llhook-timeout=$(if ($null -eq $timeout) { 'unset' } else { $timeout })"
+$line += " self=[$([NoxInputProbe]::TokenOf([uint32]$PID))] $([NoxInputProbe]::Foreground())"
+if ($App) {
+    foreach ($p in @(Get-Process -Name $App -ErrorAction SilentlyContinue)) {
+        $line += " app=[$($p.ProcessName)($($p.Id)) $([NoxInputProbe]::TokenOf([uint32]$p.Id))]"
+    }
+}
+$line
