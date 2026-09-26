@@ -20,11 +20,15 @@
 //                    CI はリリースビルドを渡す
 // - NOX_E2E_NO_AUDIO 録音デバイスの無い環境 (GitHub Actions の Windows
 //                    ランナー等) で 1 にする。下の NO_AUDIO の doc を参照
+// - NOX_E2E_NO_INJECTION 合成入力がフックまで届かない環境で 1 にする。
+//                    下の NO_INJECTION の doc を参照 (e2e/probe-input.ps1 で判定できる)
 //
 // 使い方: node e2e/hotkey.mjs
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+
+import { describeCdpFailure } from "./cdp-diagnose.mjs";
 
 
 // 毎回ポートを変える。固定にすると前回の TIME_WAIT / 生き残りブラウザに
@@ -59,6 +63,19 @@ const NO_DEVICE = "録音を開始できません: 録音デバイスが見つ�
  * 理由としてこの変数を案内する (フックの故障と取り違えないため)。 */
 const NO_AUDIO = process.env.NOX_E2E_NO_AUDIO === "1";
 
+/** 合成入力 (SendInput) がフックまで届かない環境で走らせる (`NOX_E2E_NO_INJECTION=1`)。
+ *
+ * GitHub Actions の Windows ランナーがそう: アプリの番犬が、自分で送った生存確認の
+ * キーすら観測できない (2026-09-26 のログ)。OS だけで同じことを確かめるのが
+ * e2e/probe-input.ps1 で、CI はその結果でこのモードを決める。
+ *
+ * このモードではキーを送らない。キー送出を要するテストは、結果を見ずに SKIP と書く
+ * (陰性側のテストも「何も起きなかった」を合格と読まない — 送っていないのだから)。
+ * 測るのは CDP から DOM へキーを入れる捕獲系 (T3 / T7 / T10)、再起動後の設定の
+ * 読み込み (T6b)、多重起動 (T8)。SKIP は集計に出すが、モードを指定した時点で
+ * 測らないと決めてあるので、それだけでは終了コードを落とさない。 */
+const NO_INJECTION = process.env.NOX_E2E_NO_INJECTION === "1";
+
 const VK = {
   LCTRL: 0xa2,
   LSHIFT: 0xa0,
@@ -73,7 +90,7 @@ const VK = {
 
 const results = [];
 /** 合成入力がフックまで届く環境か。届かない run は「失敗」ではなく「欠測」。 */
-let injectionReachesHook = true;
+let injectionReachesHook = !NO_INJECTION;
 /** 開始時に設定ファイルがあったか。無かったなら終了時に「無い」へ戻す。
  * 確かめる前に落ちたときに本物の設定を消さないよう、既定は true。 */
 let hadConfig = true;
@@ -87,7 +104,9 @@ function record(name, ok, detail, needsInjectedKeys = true) {
   // 合成入力がフックに届かない環境では、キーを要するテストは判定できない。
   // ここを FAIL にすると「アプリが壊れている」と読めてしまうので SKIP と書く
   // (環境要因の不成立は失敗ではなく欠測)。
-  const verdict = ok ? "PASS" : needsInjectedKeys && !injectionReachesHook ? "SKIP" : "FAIL";
+  const notMeasured = needsInjectedKeys && NO_INJECTION;
+  const verdict = notMeasured ? "SKIP" : ok ? "PASS" : needsInjectedKeys && !injectionReachesHook ? "SKIP" : "FAIL";
+  if (notMeasured) detail = "合成キー無しモードでは測らない (キーを送っていない)";
   results.push({ name, verdict, detail });
   console.log(`${verdict}  ${name}${detail ? `\n        ${detail}` : ""}`);
   if (verdict === "FAIL") {
@@ -124,6 +143,7 @@ async function waitForLog(needle, timeoutMs = 5000) {
  * 通常は録音が本当に始まった行だけを数える。録音デバイスの無いモード
  * (NO_AUDIO) では、同じ押下で出る開始失敗の行も数える。 */
 async function waitForFired(timeoutMs) {
+  if (NO_INJECTION) return null; // キーを送っていないので待っても来ない
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const hit = readNewLog()
@@ -137,6 +157,7 @@ async function waitForFired(timeoutMs) {
 /** 発火のあと、録音が確定するまで待つ (次のテストへ録音を持ち越さないため)。
  * 録音デバイスの無いモードでは確定するものが無いので、落ち着くのだけ待つ。 */
 async function settleRecording() {
+  if (NO_INJECTION) return null;
   if (NO_AUDIO) {
     await sleep(800);
     return null;
@@ -158,6 +179,7 @@ function restoreConfig() {
 // --- キー送出 ----------------------------------------------------------------
 
 function sendKeys(steps, focusPid) {
+  if (NO_INJECTION) return "";
   const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SEND_KEYS, "-Steps", steps];
   if (focusPid) args.push("-FocusPid", String(focusPid));
   const r = spawnSync("powershell.exe", args, { encoding: "utf8" });
@@ -175,6 +197,7 @@ function sendKeys(steps, focusPid) {
  * URL だけでは取り違える。「操作したい要素があるページ」を実際に評価して選ぶ。 */
 async function connectSettingsPage() {
   const deadline = Date.now() + 30000;
+  let lastError = null;
   for (;;) {
     try {
       const res = await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`);
@@ -186,11 +209,14 @@ async function connectSettingsPage() {
         if (found) return cdp;
         cdp.ws.close();
       }
-    } catch {
-      /* まだ上がっていない */
+    } catch (e) {
+      // まだ上がっていないことが多い。繋がらずに終わったときの材料として控える。
+      lastError = e;
     }
     if (Date.now() > deadline) {
-      throw new Error("設定画面の webview に CDP 接続できない (デバッグポートが開いていない)");
+      throw new Error(
+        `設定画面の webview に CDP 接続できない\n${await describeCdpFailure(CDP_PORT, lastError)}`,
+      );
     }
     await sleep(500);
   }
@@ -429,7 +455,7 @@ async function main() {
     // どの経路でキーを入れるかを**実測してから**始める (Cdp#detectKeyTransport)。
     // 捕獲が始まる前にやること — プローブのキーが捕獲へ混ざらないように。
     const transport = await cdp.detectKeyTransport();
-    record("T0 設定画面へ CDP 接続", true, `捕獲系のキー経路: ${transport.label}`);
+    record("T0 設定画面へ CDP 接続", true, `捕獲系のキー経路: ${transport.label}`, false);
 
     // --- T1: 既定の組み合わせ (左Ctrl+Space) の長押しで録音が始まり、離すと確定する
     //   (録音デバイスの無いモードでは「発火した」までを見る)
@@ -454,15 +480,17 @@ async function main() {
             "フック経路だけを測るなら NOX_E2E_NO_AUDIO=1 で走らせること"
           : "「録音開始」がログに出ない — 合成入力がフックへ届いていない可能性が高い。" +
             "物理キーボードで同じ操作を試して切り分けること",
-      false,
+      NO_INJECTION,
     );
     if (!injectionReachesHook) {
       console.log(
         [
           "",
-          noDevice
-            ? "  ※ この環境には録音デバイスがありません (NOX_E2E_NO_AUDIO=1 で測れます)。"
-            : "  ※ この環境では合成入力がフックに届きません。",
+          NO_INJECTION
+            ? "  ※ 合成キー無しモード (NOX_E2E_NO_INJECTION=1): キーは送りません。"
+            : noDevice
+              ? "  ※ この環境には録音デバイスがありません (NOX_E2E_NO_AUDIO=1 で測れます)。"
+              : "  ※ この環境では合成入力がフックに届きません。",
           "  以降のキー依存テストは SKIP 扱いにします。",
           "",
         ].join("\n"),
@@ -528,10 +556,19 @@ async function main() {
     // --- T6: 再起動しても設定が残る
     killApp();
     await sleep(1000);
-    await startApp();
+    const restartHookLine = await startApp();
     cdp = await connectSettingsPage();
     await cdp.detectKeyTransport();
     const persisted = readConfig();
+    // --- T6b: 再起動後、保存された組み合わせでフックが張られる (キー送出に依らない)
+    //   「効く」(T6) は合成キーが要るが、Rust が保存値を読んでフックを張ったことは
+    //   起動ログのホットキー表示で分かる。
+    record(
+      "T6b 再起動後、保存された 左Ctrl+F14 でフックが設置される",
+      persisted.hotkey_vk === VK.F14 && restartHookLine.includes("左 Ctrl + F14"),
+      `config: vk=0x${persisted.hotkey_vk.toString(16)} / 起動ログ: ${restartHookLine.trim()}`,
+      false,
+    );
     markLog();
     sendKeys(`down:A2,down:7D,sleep:800,up:7D,up:A2`, app.pid);
     const afterRestart = await waitForFired(6000);
@@ -603,7 +640,7 @@ async function main() {
     // 15 秒ごとに生存確認して再設置するので、しばらく置いてから押せば効くはず。
     // ここは「押した直後に効く」ではなく「放置したあとでも効く」を見る。
     markLog();
-    await sleep(20000);
+    if (!NO_INJECTION) await sleep(20000);
     sendKeys(`down:A2,down:7D,sleep:800,up:7D,up:A2`, app.pid);
     const afterIdle = await waitForFired(6000);
     const reinstalled = readNewLog().includes("再設置");
@@ -625,14 +662,15 @@ async function main() {
       "T8 二重起動しても常駐は 1 プロセスだけ",
       alive === "1",
       `起動中の nox-voice.exe = ${alive} 個 (2 個目の exitCode=${second.exitCode})`,
+      false,
     );
 
     // T11 / T12 は録音の確定 (停止側のログ) と小窓の表示区間を要する。
     // 録音デバイスの無いモードでは測れないので実行しない。**測っていないことは
     // 最後の集計に書く** (SKIP の行を積むと run 全体が落ちるが、ここは
     // モードを指定した時点で測らないと決めてある)。
-    if (NO_AUDIO) {
-      console.log("--    T11 / T12 は録音デバイス無しモードでは実行しない");
+    if (NO_AUDIO || NO_INJECTION) {
+      console.log("--    T11 / T12 は録音と合成キーを要するので、このモードでは実行しない");
     } else {
       // --- T11 / T12: 単独 Alt のホットキーとフォーカス診断 (2026-08-29 の回帰)
       //
@@ -732,10 +770,15 @@ async function main() {
       "録音デバイス無しモード: 録音の確定 (T1 の後半) と T11 / T12 は測っていない。実機で測り直すこと。",
     );
   }
-  if (skipped.length) {
+  if (NO_INJECTION) {
+    console.log(
+      "合成キー無しモード: キー送出を要するテスト (SKIP の行) は測っていない。合成入力がフックへ届く環境か実機で測り直すこと。",
+    );
+  } else if (skipped.length) {
     console.log("SKIP は合格ではない。合成入力がフックへ届く環境で測り直すこと。");
   }
-  process.exit(failed.length === 0 && skipped.length === 0 ? 0 : 1);
+  // 合成キー無しモードの SKIP は、モードを指定した時点で測らないと決めたもの。
+  process.exit(failed.length === 0 && (skipped.length === 0 || NO_INJECTION) ? 0 : 1);
 }
 
 main().catch((e) => {

@@ -25,6 +25,8 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
+import { describeCdpFailure } from "./cdp-diagnose.mjs";
+
 const REPO = path.resolve(import.meta.dirname, "..");
 const EXE = process.env.NOX_E2E_EXE || path.join(REPO, "src-tauri", "target", "release", "nox-voice.exe");
 const LOG = `${process.env.LOCALAPPDATA}\\com.noxitro.nox-voice\\logs\\nox-voice.log`;
@@ -72,6 +74,7 @@ class Cdp {
 
 async function connect() {
   const deadline = Date.now() + 30000;
+  let lastError = null;
   for (;;) {
     try {
       const list = await (await fetch(`http://127.0.0.1:${PORT}/json/list`)).json();
@@ -83,8 +86,8 @@ async function connect() {
         if (await cdp.eval(`Boolean(document.getElementById("settings-form"))`)) return cdp;
         ws.close();
       }
-    } catch {}
-    if (Date.now() > deadline) throw new Error("設定画面へ接続できない");
+    } catch (e) { lastError = e; }
+    if (Date.now() > deadline) throw new Error(`設定画面へ接続できない\n${await describeCdpFailure(PORT, lastError)}`);
     await sleep(400);
   }
 }
