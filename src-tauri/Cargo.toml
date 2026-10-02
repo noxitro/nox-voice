@@ -1,6 +1,6 @@
 [package]
 name = "nox-voice"
-version = "0.5.1"
+version = "0.6.0"
 description = "Windows 11 向け AI 音声入力常駐アプリ"
 authors = ["noxitro"]
 license = "MIT"
