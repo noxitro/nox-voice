@@ -220,6 +220,38 @@ interface ConfigView {
   /** 主が落ちたとき控え (Groq) で整形し直すか。 */
   format_fallback_enabled: boolean;
   groq_format_model: string;
+  /** 保存されている整形の共通ルール。**空なら同梱の既定を使っている**。 */
+  format_rules: string;
+  /**
+   * 同梱の既定ルール (Rust の `format::DEFAULT_FORMAT_RULES`)。
+   * 「既定に戻す」と、保存値が空のときの表示に使う。**ここに写しを書かない**。
+   */
+  default_format_rules: string;
+  /** 共通ルールの上限 (文字数)。超えると Rust が保存を断る。 */
+  format_rules_max_chars: number;
+  default_format_model: string;
+  default_groq_format_model: string;
+  /** 候補リスト (Rust の `config::GEMINI_FORMAT_MODEL_CANDIDATES` 等)。 */
+  format_model_candidates: ModelCandidate[];
+  groq_format_model_candidates: ModelCandidate[];
+}
+
+/** Rust 側 `config::ModelCandidate` と対応。 */
+interface ModelCandidate {
+  name: string;
+  note: string;
+}
+
+/** Rust 側 `config::FormatProvider` と対応。 */
+type FormatProvider = "gemini" | "groq";
+
+/** Rust 側 `lib::FormatModelTest` と対応。失敗も `ok: false` の正常な答えで返る。 */
+interface FormatModelTest {
+  ok: boolean;
+  model: string;
+  elapsed_ms: number;
+  output: string | null;
+  reason: string | null;
 }
 
 /**
@@ -675,6 +707,169 @@ function syncScreenAskEnabled() {
   block.hidden = message === null;
 }
 
+/**
+ * 整形モデルの候補を datalist へ流し込む。候補は Rust が持つ
+ * (実測で良好だったものだけ)。ここに写しを書くと、表と画面がずれる。
+ */
+function renderModelCandidates(id: string, candidates: ModelCandidate[]) {
+  const list = el<HTMLDataListElement>(id);
+  if (!list) return;
+  list.replaceChildren(
+    ...candidates.map((c) => {
+      const option = document.createElement("option");
+      option.value = c.name;
+      // WebView2 (Chromium) は候補の横に label を添えて出す。
+      option.label = c.note;
+      return option;
+    }),
+  );
+}
+
+/**
+ * 同梱の既定ルール。**`get_config` が返すまでは null** — 返る前に保存されたとき、
+ * 空の入力欄を「既定に戻した」と取り違えて送らないための目印にもなる。
+ */
+let defaultFormatRules: string | null = null;
+let formatRulesMaxChars = 0;
+
+/** 改行と前後の空白をそろえる。「既定から変更あり」の表示にだけ使う
+ * (保存時の判定は Rust の `canonical_format_rules` が持つ)。 */
+function normalizeRules(text: string): string {
+  return text.replace(/\r\n?/g, "\n").trim();
+}
+
+function renderFormatRules(view: ConfigView) {
+  defaultFormatRules = view.default_format_rules;
+  formatRulesMaxChars = view.format_rules_max_chars;
+  const rules = el<HTMLTextAreaElement>("format-rules");
+  if (rules) {
+    rules.maxLength = view.format_rules_max_chars;
+    // 保存値が空 = 既定を使っている。空欄ではなく既定の文を見せる
+    // (何が効いているかが見えないと、書き換えようがない)。
+    rules.value = view.format_rules !== "" ? view.format_rules : view.default_format_rules;
+  }
+  syncFormatRulesState();
+}
+
+/** 「既定から変更あり」と文字数を、入力欄の今の値に合わせる。 */
+function syncFormatRulesState() {
+  const rules = el<HTMLTextAreaElement>("format-rules");
+  if (!rules) return;
+  const modified =
+    defaultFormatRules !== null &&
+    normalizeRules(rules.value) !== normalizeRules(defaultFormatRules);
+  const badge = el("format-rules-modified");
+  if (badge) badge.hidden = !modified;
+  const count = el("format-rules-count");
+  if (count && formatRulesMaxChars > 0) {
+    const n = [...normalizeRules(rules.value)].length;
+    count.textContent = `${n.toLocaleString("ja-JP")} / ${formatRulesMaxChars.toLocaleString("ja-JP")} 文字`;
+    count.toggleAttribute("data-over", n > formatRulesMaxChars);
+  }
+}
+
+/** 共通ルールの入力欄を既定の文へ戻す。**保存はしない** (他の項目と同じく保存ボタンで確定)。 */
+function resetFormatRules() {
+  const rules = el<HTMLTextAreaElement>("format-rules");
+  if (!rules || defaultFormatRules === null) return;
+  // 書き換えた文を黙って消さない。既定のままなら聞くまでもない。
+  if (
+    normalizeRules(rules.value) !== normalizeRules(defaultFormatRules) &&
+    !window.confirm(
+      "共通ルールの入力欄を既定の文に戻しますか? 今の内容は置き換わります(保存するまで設定は変わりません)。",
+    )
+  ) {
+    return;
+  }
+  rules.value = defaultFormatRules;
+  syncFormatRulesState();
+  rules.focus();
+}
+
+/** 「試す」ボタン。1 本ずつしか走らせない (同時に投げると無料枠を食い合う)。 */
+const MODEL_TEST_BUTTONS = ["format-model-test", "groq-format-model-test", "format-rules-test"];
+let modelTestRunning = false;
+
+function renderModelTest(
+  box: HTMLElement,
+  state: "busy" | "ok" | "fail",
+  head: string,
+  body: string | null,
+  output: string | null = null,
+) {
+  const parts: HTMLElement[] = [];
+  const headEl = document.createElement("span");
+  headEl.className = "model-test-head";
+  headEl.textContent = head;
+  parts.push(headEl);
+  if (body) {
+    const bodyEl = document.createElement("span");
+    bodyEl.className = "model-test-body";
+    bodyEl.textContent = body;
+    parts.push(bodyEl);
+  }
+  if (output !== null) {
+    const outEl = document.createElement("span");
+    outEl.className = "model-test-output";
+    outEl.textContent = output;
+    parts.push(outEl);
+  }
+  box.replaceChildren(...parts);
+  box.dataset.state = state;
+  box.hidden = false;
+}
+
+/**
+ * 入力中の (保存していない) モデル名と共通ルールで、例文を 1 回整形してみる。
+ * キーとエンドポイントは保存済みのものを使う (Rust の `test_format_model`)。
+ */
+async function runModelTest(provider: FormatProvider, modelInputId: string, resultId: string) {
+  if (modelTestRunning) return;
+  const box = el(resultId);
+  if (!box) return;
+  const model = el<HTMLInputElement>(modelInputId)?.value ?? "";
+  const rulesInput = el<HTMLTextAreaElement>("format-rules");
+  // 既定文を読み込めていない入力欄 (空) を送ると「既定で試した」ことになり、
+  // 結果が画面の内容と食い違う。読めていないなら保存済みの側 (null = 既定) に任せる。
+  const rules = rulesInput && defaultFormatRules !== null ? rulesInput.value : null;
+
+  modelTestRunning = true;
+  for (const id of MODEL_TEST_BUTTONS) {
+    const button = el<HTMLButtonElement>(id);
+    if (button) button.disabled = true;
+  }
+  const shown = model.trim() || "既定のモデル";
+  renderModelTest(box, "busy", "処理中…", `${shown} で例文を整形しています`);
+  try {
+    const r = await invoke<FormatModelTest>("test_format_model", { provider, model, rules });
+    if (r.ok) {
+      renderModelTest(
+        box,
+        "ok",
+        `成功: 所要 ${r.elapsed_ms.toLocaleString("ja-JP")} ms(${r.model})`,
+        null,
+        r.output ?? "",
+      );
+    } else {
+      const took = r.elapsed_ms > 0 ? `: 所要 ${r.elapsed_ms.toLocaleString("ja-JP")} ms` : "";
+      renderModelTest(
+        box,
+        "fail",
+        `失敗${took}(${r.model})`,
+        r.reason ?? "理由が返ってきませんでした",
+      );
+    }
+  } catch (e) {
+    renderModelTest(box, "fail", "失敗", `試せませんでした: ${e}`);
+  } finally {
+    modelTestRunning = false;
+    for (const id of MODEL_TEST_BUTTONS) {
+      const button = el<HTMLButtonElement>(id);
+      if (button) button.disabled = false;
+    }
+  }
+}
+
 function renderConfig(view: ConfigView) {
   const language = el<HTMLInputElement>("language");
   if (language) language.value = view.language;
@@ -683,7 +878,24 @@ function renderConfig(view: ConfigView) {
   const formatFallback = el<HTMLInputElement>("format-fallback-enabled");
   if (formatFallback) formatFallback.checked = view.format_fallback_enabled;
   const groqFormatModel = el<HTMLInputElement>("groq-format-model");
-  if (groqFormatModel) groqFormatModel.value = view.groq_format_model;
+  if (groqFormatModel) {
+    groqFormatModel.value = view.groq_format_model;
+    groqFormatModel.placeholder = view.default_groq_format_model;
+  }
+  const formatModel = el<HTMLInputElement>("format-model");
+  if (formatModel) {
+    formatModel.value = view.format_model;
+    formatModel.placeholder = view.default_format_model;
+  }
+  renderModelCandidates("format-model-candidates", view.format_model_candidates);
+  renderModelCandidates("groq-format-model-candidates", view.groq_format_model_candidates);
+  for (const code of document.querySelectorAll<HTMLElement>("[data-default-model]")) {
+    code.textContent =
+      code.dataset.defaultModel === "groq"
+        ? view.default_groq_format_model
+        : view.default_format_model;
+  }
+  renderFormatRules(view);
   const injection = el<HTMLInputElement>("injection-enabled");
   if (injection) injection.checked = view.injection_enabled;
   const restoreDelay = el<HTMLInputElement>("restore-delay");
@@ -1285,6 +1497,11 @@ async function saveSettings(event: Event) {
   const autoLearn = el<HTMLInputElement>("auto-learn");
   const formatFallback = el<HTMLInputElement>("format-fallback-enabled");
   const groqFormatModel = el<HTMLInputElement>("groq-format-model");
+  const formatModel = el<HTMLInputElement>("format-model");
+  const formatRules = el<HTMLTextAreaElement>("format-rules");
+  // 既定文を読めているか。保存の応答で renderConfig が走ると変わるので、
+  // 送る前に一度だけ確定させる (保存メモの判定もこの値で行う)。
+  const formatRulesLoaded = defaultFormatRules !== null;
   const screenAsk = el<HTMLInputElement>("screen-ask-enabled");
   const overlayEnabled = el<HTMLInputElement>("overlay-enabled");
   const startHidden = el<HTMLInputElement>("start-hidden");
@@ -1315,6 +1532,11 @@ async function saveSettings(event: Event) {
     // 空文字は Rust 側 (`non_empty_or`) が既定へ倒す。入力欄が無いときだけ
     // 未指定にして、現在値を据え置く。
     ...(groqFormatModel ? { groq_format_model: groqFormatModel.value } : {}),
+    ...(formatModel ? { format_model: formatModel.value } : {}),
+    // 既定と同じ文なら Rust 側が空 (= 既定) で保存する。既定文をまだ読めて
+    // いない (get_config 前) なら送らない — 空の入力欄を送ると、利用者の
+    // ルールを既定へ黙って戻してしまう (欠測を既定値で埋めない)。
+    ...(formatRules && formatRulesLoaded ? { format_rules: formatRules.value } : {}),
     injection_enabled: injection?.checked ?? true,
     history_enabled: historyEnabled?.checked ?? true,
     deep_context: deepContext?.checked ?? false,
@@ -1389,6 +1611,9 @@ async function saveSettings(event: Event) {
       if (!soundPresetsLoaded) {
         skipped.push("音の一覧を取得できていないため、開始音・取り消し音は変更していません");
       }
+      if (formatRules && !formatRulesLoaded) {
+        skipped.push("整形の共通ルールは読み込めていないため変更していません");
+      }
       note.textContent =
         skipped.length > 0 ? `保存しました(${skipped.join(" / ")})` : "保存しました";
     }
@@ -1400,7 +1625,12 @@ async function saveSettings(event: Event) {
     () => {
       if (note) note.textContent = "";
     },
-    ignoredStyleLines > 0 || ignoredDictLines > 0 || !soundPresetsLoaded ? 8000 : 2500,
+    ignoredStyleLines > 0 ||
+      ignoredDictLines > 0 ||
+      !soundPresetsLoaded ||
+      (formatRules !== null && !formatRulesLoaded)
+      ? 8000
+      : 2500,
   );
 }
 
@@ -2680,6 +2910,22 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (document.hidden && capturingMode) void cancelHotkeyCapture();
   });
   el("style-add")?.addEventListener("click", () => addStyleRow());
+  el("format-model-test")?.addEventListener(
+    "click",
+    () => void runModelTest("gemini", "format-model", "format-model-result"),
+  );
+  el("groq-format-model-test")?.addEventListener(
+    "click",
+    () => void runModelTest("groq", "groq-format-model", "groq-format-model-result"),
+  );
+  // 共通ルールを試すときは主 (Gemini) の入力中のモデルで試す。結果は
+  // ルールの欄の下に出す (押した場所の近くで答える)。
+  el("format-rules-test")?.addEventListener(
+    "click",
+    () => void runModelTest("gemini", "format-model", "format-rules-result"),
+  );
+  el("format-rules-reset")?.addEventListener("click", () => resetFormatRules());
+  el("format-rules")?.addEventListener("input", () => syncFormatRulesState());
   el("dict-add")?.addEventListener("click", () => addDictRow());
   el("dict-filter")?.addEventListener("change", () => applyDictFilter());
   // 表記を打った / ★ を付けた瞬間に枠の見え方が変わる。保存を待たせない

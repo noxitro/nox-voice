@@ -61,6 +61,10 @@ jobs:
       - name: 版が 5 ファイル (6 か所) で揃っているか
         run: npm run version:check
 
+      - name: latest.json の生成と署名検証 (自己テスト)
+        # リリースのときにしか走らない部分なので、壊れていないかを毎回ここで見る
+        run: node scripts/updater-manifest.mjs --self-test
+
       - name: フロントエンド型検査 + ビルド
         run: npm run build
 

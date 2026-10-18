@@ -76,6 +76,196 @@ pub const DEFAULT_GROQ_FORMAT_MODEL: &str = "openai/gpt-oss-20b";
 pub const DEFAULT_FORMAT_MODEL: &str = "gemini-flash-lite-latest";
 pub const DEFAULT_LANGUAGE: &str = "ja";
 
+/// 設定画面の候補リストに出す整形モデル 1 件。
+///
+/// 候補は**実測で良好だったものだけ**を載せる (上の 2 つの表)。遅い・
+/// 文を書き換えた・呼べなかったモデルを並べると、選べること自体が罠になる。
+/// 候補に無い名前も入力欄へ直接打てば使える (候補は入力の補助にすぎない)。
+///
+/// **候補を足すときはここに 1 行足す。** 画面は [`ConfigView`] 経由で
+/// これを受け取るだけで、フロントに写しは無い (写しを置くと片方だけ
+/// 直されて、画面の候補と実測の表がずれる)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ModelCandidate {
+    pub name: &'static str,
+    /// 候補リストに添える短い説明 (実測の要約)。
+    pub note: &'static str,
+}
+
+/// 主 (Gemini) の整形モデルの候補。先頭が既定 ([`DEFAULT_FORMAT_MODEL`])。
+pub const GEMINI_FORMAT_MODEL_CANDIDATES: &[ModelCandidate] = &[
+    ModelCandidate {
+        name: DEFAULT_FORMAT_MODEL,
+        note: "既定・最速 (実測 0.8 秒)",
+    },
+    ModelCandidate {
+        name: "gemini-3.5-flash-lite",
+        note: "良好 (実測 0.9 秒)",
+    },
+    ModelCandidate {
+        name: "gemini-flash-latest",
+        note: "良好だが遅い (実測 2.9 秒)",
+    },
+];
+
+/// 控え (Groq) の整形モデルの候補。先頭が既定 ([`DEFAULT_GROQ_FORMAT_MODEL`])。
+pub const GROQ_FORMAT_MODEL_CANDIDATES: &[ModelCandidate] = &[
+    ModelCandidate {
+        name: DEFAULT_GROQ_FORMAT_MODEL,
+        note: "既定・原文に最も忠実 (実測 0.4〜0.6 秒)",
+    },
+    ModelCandidate {
+        name: "openai/gpt-oss-120b",
+        note: "良好 (実測 0.6〜1.3 秒)",
+    },
+    ModelCandidate {
+        name: "qwen/qwen3.8-27b",
+        note: "最速 (実測 0.2〜0.3 秒)",
+    },
+];
+
+/// 整形の共通ルールの上限 (文字数)。
+///
+/// 既定の文は 400 字弱。上限は「指示を書き足す」には十分広く、
+/// 「誤って長文を貼り付けた」ときに毎回の整形へ数千トークンを載せ続ける
+/// 事故は止める幅にしてある。**超えたら切り詰めずに保存を断る** —
+/// 指示の後半を黙って落とすと、利用者は効かない理由を追えない。
+pub const MAX_FORMAT_RULES_CHARS: usize = 8_000;
+
+/// 整形モデルの提供元。モデル名の検査規則が提供元ごとに違う
+/// ([`validate_model_name`])。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FormatProvider {
+    /// 主。モデル名は URL のパスへ入る。
+    Gemini,
+    /// 控え。モデル名は JSON 本文へ入る。
+    Groq,
+}
+
+impl FormatProvider {
+    /// 利用者向けの項目名 (エラー文に使う)。
+    pub fn field_label(self) -> &'static str {
+        match self {
+            FormatProvider::Gemini => "主の整形モデル",
+            FormatProvider::Groq => "控えの整形モデル",
+        }
+    }
+
+    /// 空欄のときに使う既定のモデル。
+    pub fn default_model(self) -> &'static str {
+        match self {
+            FormatProvider::Gemini => DEFAULT_FORMAT_MODEL,
+            FormatProvider::Groq => DEFAULT_GROQ_FORMAT_MODEL,
+        }
+    }
+}
+
+/// モデル名の表記を揃える (検査はしない)。
+///
+/// Gemini は ListModels が `models/gemini-...` の形で返すので、そこから
+/// 貼り付けた名前の先頭の `models/` を落とす。落とさないと
+/// `.../models/models/gemini-...:generateContent` になって 404 が返り、
+/// 利用者からは「名前は合っているのに動かない」としか見えない。
+pub fn canonical_model_name(provider: FormatProvider, raw: &str) -> String {
+    let trimmed = raw.trim();
+    match provider {
+        FormatProvider::Gemini => trimmed
+            .strip_prefix("models/")
+            .unwrap_or(trimmed)
+            .trim()
+            .to_string(),
+        FormatProvider::Groq => trimmed.to_string(),
+    }
+}
+
+/// モデル名を検査し、揃えた名前を返す (空なら空のまま返す = 既定を使う)。
+///
+/// # 提供元ごとに規則が違う理由
+///
+/// - **Gemini**: 名前は `{endpoint}/{model}:generateContent` の**URL のパス**へ
+///   そのまま入る ([`Config::gemini_url_for`])。`/` `?` `#` `%` や空白が入ると
+///   別のパスやクエリになり、黙って別物を叩く。実在するモデル名は英数字と
+///   `.` `_` `-` だけでできているので、**それ以外を全部断る** (許可リスト)
+/// - **Groq**: 名前は JSON 本文の `model` に入るだけで、`openai/gpt-oss-20b`
+///   のように `/` を正当に含む。断るのは空白と制御文字だけ
+///
+/// 保存 ([`ConfigPatch::validate`]) と「試す」(`test_format_model`) が
+/// **同じこの関数**を通る。別々に書くと、試せたのに保存できない
+/// (またはその逆の) 名前ができる。
+pub fn validate_model_name(provider: FormatProvider, raw: &str) -> Result<String, String> {
+    let name = canonical_model_name(provider, raw);
+    let label = provider.field_label();
+    match provider {
+        FormatProvider::Gemini => {
+            if let Some(c) = name
+                .chars()
+                .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+            {
+                return Err(format!(
+                    "{label}「{name}」に使えない文字「{}」が含まれています。\
+                     Gemini のモデル名は英数字と . _ - だけでできています (例: {DEFAULT_FORMAT_MODEL})",
+                    describe_char(c)
+                ));
+            }
+        }
+        FormatProvider::Groq => {
+            if let Some(c) = name.chars().find(|c| c.is_whitespace() || c.is_control()) {
+                return Err(format!(
+                    "{label}「{name}」に使えない文字「{}」が含まれています。\
+                     モデル名に空白や制御文字は入りません (例: {DEFAULT_GROQ_FORMAT_MODEL})",
+                    describe_char(c)
+                ));
+            }
+        }
+    }
+    Ok(name)
+}
+
+/// エラー文に出す 1 文字。空白や制御文字はそのまま出すと見えない。
+fn describe_char(c: char) -> String {
+    if c == ' ' || c == '\u{3000}' {
+        "空白".to_string()
+    } else if c.is_whitespace() || c.is_control() {
+        format!("U+{:04X}", c as u32)
+    } else {
+        c.to_string()
+    }
+}
+
+/// 整形の共通ルールを保存する形へ揃える (検査はしない)。
+///
+/// 改行を `\n` に揃えて前後の空白を落とし、**同梱の既定と同じなら空にする**。
+/// 空 = 既定 ([`crate::format::DEFAULT_FORMAT_RULES`]) という約束で、
+/// 既定の全文を設定ファイルへ焼き込まない。焼き込むと、アプリ更新で既定を
+/// 直しても既存ユーザーに届かない ([`crate::style`] のモジュール doc にある
+/// 既定プロファイルの教訓)。画面は空のとき既定文を表示するので、
+/// 「既定に戻す」→ 保存 で空に戻る。
+pub fn canonical_format_rules(raw: &str) -> String {
+    let unified = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let trimmed = unified.trim();
+    if trimmed == crate::format::DEFAULT_FORMAT_RULES.trim() {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// 整形の共通ルールを検査し、保存する形にして返す。
+///
+/// 上限 ([`MAX_FORMAT_RULES_CHARS`]) を超えたら**切り詰めずに断る**。
+pub fn validate_format_rules(raw: &str) -> Result<String, String> {
+    let rules = canonical_format_rules(raw);
+    let count = rules.chars().count();
+    if count > MAX_FORMAT_RULES_CHARS {
+        return Err(format!(
+            "整形の共通ルールが長すぎます ({count} 文字 / 上限 {MAX_FORMAT_RULES_CHARS} 文字)。\
+             短くしてから保存してください"
+        ));
+    }
+    Ok(rules)
+}
+
 /// 履歴の既定保持日数。
 pub const DEFAULT_HISTORY_RETENTION_DAYS: u32 = 30;
 /// 保持日数の上限 (約 10 年)。0 は「無制限」を意味するので別扱い。
@@ -369,6 +559,18 @@ pub struct Config {
     /// 控えの chat/completions エンドポイント (**完全な URL**)。
     #[serde(default = "default_groq_chat_endpoint")]
     pub groq_chat_endpoint: String,
+    /// 整形の共通ルール (設定画面で編集できる部分)。**空 = 同梱の既定**
+    /// ([`crate::format::DEFAULT_FORMAT_RULES`])。
+    ///
+    /// 既定と同じ文は空で保存する ([`canonical_format_rules`])。既定の全文を
+    /// ここへ焼き込むと、アプリ更新で既定を直しても届かなくなる。
+    /// 注入への防御と出力形式の決まりはここに含まれず、整形のたびに
+    /// [`crate::format::system_prompt`] が必ず付け足す (消せない)。
+    ///
+    /// フィールド単位の `#[serde(default)]` は他と同じ理由 — 旧い設定ファイルに
+    /// この項目が無いとき、コンテナ側の default ではなく「空 = 既定」に倒すため。
+    #[serde(default)]
+    pub format_rules: String,
 }
 
 impl Default for Config {
@@ -427,6 +629,8 @@ impl Default for Config {
             format_fallback_enabled: true,
             groq_format_model: DEFAULT_GROQ_FORMAT_MODEL.to_string(),
             groq_chat_endpoint: DEFAULT_GROQ_CHAT_ENDPOINT.to_string(),
+            // 空 = 同梱の既定 (フィールドの doc)。
+            format_rules: String::new(),
         }
     }
 }
@@ -505,11 +709,27 @@ impl Config {
 
     /// `{gemini_endpoint}/{model}:generateContent` を組み立てる。
     pub fn gemini_url(&self) -> String {
+        self.gemini_url_for(&self.format_model)
+    }
+
+    /// 任意のモデル名で URL を組み立てる (設定画面の「試す」用)。
+    ///
+    /// [`Self::gemini_url`] もこれを通す。URL の組み立てを 2 か所に書くと、
+    /// 「試すと通るのに保存すると通らない」が生まれる。`model` は
+    /// [`validate_model_name`] を通したものを渡すこと。
+    pub fn gemini_url_for(&self, model: &str) -> String {
         format!(
             "{}/{}:generateContent",
             self.gemini_endpoint.trim_end_matches('/'),
-            self.format_model
+            model
         )
+    }
+
+    /// 整形プロンプトへ渡す共通ルール。空なら `None` (= 同梱の既定)。
+    ///
+    /// 整形器を組み立てる経路 (新規録音・再転写) はすべてこれを通す。
+    pub fn format_rules_for_prompt(&self) -> Option<&str> {
+        Some(self.format_rules.trim()).filter(|r| !r.is_empty())
     }
 
     /// ホットキーの組み合わせを返す。
@@ -702,6 +922,19 @@ pub struct ConfigView {
     /// 主が落ちたときに控え (Groq) で整形し直すか。
     pub format_fallback_enabled: bool,
     pub groq_format_model: String,
+    /// 保存されている共通ルール。**空なら既定を使っている**。
+    pub format_rules: String,
+    /// 同梱の既定ルール。画面の「既定に戻す」と、空のときの表示に使う。
+    /// フロントに写しを置かない (写しは更新から取り残される)。
+    pub default_format_rules: &'static str,
+    /// 共通ルールの上限 (文字数)。入力欄の `maxlength` に使う。
+    pub format_rules_max_chars: usize,
+    /// 主 / 控えの既定モデル (入力欄の placeholder と説明に使う)。
+    pub default_format_model: &'static str,
+    pub default_groq_format_model: &'static str,
+    /// 候補リスト (実測で良好だったもの)。
+    pub format_model_candidates: &'static [ModelCandidate],
+    pub groq_format_model_candidates: &'static [ModelCandidate],
 }
 
 impl ConfigView {
@@ -777,6 +1010,13 @@ impl ConfigView {
             format_model: c.format_model.clone(),
             format_fallback_enabled: c.format_fallback_enabled,
             groq_format_model: c.groq_format_model.clone(),
+            format_rules: c.format_rules.clone(),
+            default_format_rules: crate::format::DEFAULT_FORMAT_RULES,
+            format_rules_max_chars: MAX_FORMAT_RULES_CHARS,
+            default_format_model: DEFAULT_FORMAT_MODEL,
+            default_groq_format_model: DEFAULT_GROQ_FORMAT_MODEL,
+            format_model_candidates: GEMINI_FORMAT_MODEL_CANDIDATES,
+            groq_format_model_candidates: GROQ_FORMAT_MODEL_CANDIDATES,
         }
     }
 }
@@ -840,6 +1080,8 @@ pub struct ConfigPatch {
     pub format_fallback_enabled: Option<bool>,
     pub groq_format_model: Option<String>,
     pub groq_chat_endpoint: Option<String>,
+    /// 整形の共通ルール。空文字・既定と同じ文は「既定を使う」(空) として保存する。
+    pub format_rules: Option<String>,
 }
 
 impl fmt::Debug for ConfigPatch {
@@ -911,7 +1153,35 @@ impl fmt::Debug for ConfigPatch {
             .field("format_fallback_enabled", &self.format_fallback_enabled)
             .field("groq_format_model", &self.groq_format_model)
             .field("groq_chat_endpoint", &self.groq_chat_endpoint)
+            // 本文は長くなりうるので文字数だけ。
+            .field(
+                "format_rules",
+                &self.format_rules.as_ref().map(|r| r.chars().count()),
+            )
             .finish()
+    }
+}
+
+impl ConfigPatch {
+    /// 保存してよい値か検査する。**1 つでも駄目なら何も変更しない**。
+    ///
+    /// [`Config::apply`] は失敗しない作りなので (読み込み時の [`Config::normalize`]
+    /// と共有している)、断る判断はここで先に済ませる。[`ConfigStore::update`] は
+    /// これを通ってから適用するので、断られた保存は設定を半端に書き換えない。
+    ///
+    /// 断るとき、エラー文は**どの項目の何が駄目か**を名指しする。保存は
+    /// 全項目まとめて断られるので、名指しが無いと何を直せばよいか分からない。
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(model) = &self.format_model {
+            validate_model_name(FormatProvider::Gemini, model)?;
+        }
+        if let Some(model) = &self.groq_format_model {
+            validate_model_name(FormatProvider::Groq, model)?;
+        }
+        if let Some(rules) = &self.format_rules {
+            validate_format_rules(rules)?;
+        }
+        Ok(())
     }
 }
 
@@ -1076,6 +1346,18 @@ impl Config {
                 MAX_TYPING_SPEED_CHARS_PER_MIN,
             );
         }
+        // 整形モデル。保存の経路は ConfigPatch::validate で断っているので、
+        // ここへ不正な名前が来るのは設定ファイルを手で書いたときだけ。
+        // ホットキーと同じく、警告を残して既定へ戻す (URL を壊す名前のまま
+        // 走らせると、毎回の整形が理由の読みにくい 404 で落ち続ける)。
+        self.format_model = normalized_model(FormatProvider::Gemini, &self.format_model);
+        self.groq_format_model =
+            normalized_model(FormatProvider::Groq, &self.groq_format_model);
+        // 共通ルール。改行の統一と「既定と同じなら空」はここで揃える。
+        // **上限超えは読み込み時には断らない** — 手で書いた長文を黙って
+        // 捨てる (または切り詰める) より、そのまま使い、画面から保存する
+        // ときに理由つきで断る方が利用者に見える。
+        self.format_rules = canonical_format_rules(&self.format_rules);
     }
 
     /// 辞書の不変条件を整える。
@@ -1351,7 +1633,24 @@ impl Config {
         if let Some(v) = patch.typing_speed_chars_per_min {
             self.typing_speed_chars_per_min = v;
         }
+        if let Some(v) = patch.format_rules {
+            // 改行の統一・trim・「既定と同じなら空」は normalize に集める
+            // (設定ファイルから読んだ値も同じ形にするため)。
+            self.format_rules = v;
+        }
         self.normalize();
+    }
+}
+
+/// 読み込み・適用後のモデル名を揃える。空や不正なら既定へ倒す (警告つき)。
+fn normalized_model(provider: FormatProvider, raw: &str) -> String {
+    match validate_model_name(provider, raw) {
+        Ok(name) if name.is_empty() => provider.default_model().to_string(),
+        Ok(name) => name,
+        Err(e) => {
+            log::warn!("{e} — 既定の {} へ戻します", provider.default_model());
+            provider.default_model().to_string()
+        }
     }
 }
 
@@ -1493,6 +1792,8 @@ impl ConfigStore {
 
     /// パッチを適用して保存する。
     pub fn update(&self, patch: ConfigPatch) -> Result<Config, String> {
+        // 断るなら、ロックを取る前・何も書き換えないうちに断る。
+        patch.validate()?;
         let updated = {
             let mut guard = self
                 .config
@@ -2177,6 +2478,251 @@ mod tests {
         assert!(!cfg.format_fallback_enabled);
         assert_eq!(cfg.groq_format_model, DEFAULT_GROQ_FORMAT_MODEL);
         assert_eq!(cfg.groq_chat_endpoint, DEFAULT_GROQ_CHAT_ENDPOINT);
+    }
+
+    // --- 整形の共通ルール (2026-10-10) ---
+
+    #[test]
+    fn an_older_config_file_uses_the_default_format_rules() {
+        // 項目が無い設定ファイル (この機能より前に書かれたもの) は空 = 既定。
+        // 既定の全文で埋めてしまうと、アプリ更新で既定を直しても届かない。
+        let cfg: Config = serde_json::from_str(r#"{"language":"ja"}"#).expect("読める");
+        assert_eq!(cfg.format_rules, "");
+        assert_eq!(cfg.format_rules_for_prompt(), None);
+        assert_eq!(Config::default().format_rules, "");
+    }
+
+    #[test]
+    fn saving_the_default_rules_stores_empty() {
+        let mut cfg = Config::default();
+        cfg.apply(ConfigPatch {
+            format_rules: Some(crate::format::DEFAULT_FORMAT_RULES.to_string()),
+            ..ConfigPatch::default()
+        });
+        assert_eq!(cfg.format_rules, "", "既定の全文が焼き込まれた");
+        // 前後の空白が付いていても既定と同じ。
+        cfg.apply(ConfigPatch {
+            format_rules: Some(format!("\n  {}  \n\n", crate::format::DEFAULT_FORMAT_RULES)),
+            ..ConfigPatch::default()
+        });
+        assert_eq!(cfg.format_rules, "");
+    }
+
+    #[test]
+    fn a_crlf_copy_of_the_default_rules_stores_empty() {
+        // textarea の値やエディタ経由の貼り付けは CRLF になりうる。
+        let crlf = crate::format::DEFAULT_FORMAT_RULES.replace('\n', "\r\n");
+        assert_ne!(crlf, crate::format::DEFAULT_FORMAT_RULES);
+        let mut cfg = Config::default();
+        cfg.apply(ConfigPatch {
+            format_rules: Some(crlf),
+            ..ConfigPatch::default()
+        });
+        assert_eq!(cfg.format_rules, "");
+    }
+
+    #[test]
+    fn whitespace_only_rules_store_empty() {
+        let mut cfg = Config {
+            format_rules: "自作のルール".to_string(),
+            ..Config::default()
+        };
+        cfg.apply(ConfigPatch {
+            format_rules: Some(" \r\n\t ".to_string()),
+            ..ConfigPatch::default()
+        });
+        assert_eq!(cfg.format_rules, "");
+    }
+
+    #[test]
+    fn custom_rules_survive_a_round_trip_through_the_file() {
+        let dir = std::env::temp_dir().join(format!("nox-format-rules-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        let store = ConfigStore::load(path.clone());
+        store
+            .update(ConfigPatch {
+                format_rules: Some("  句読点だけ打つ。\r\n言い換えない。\r\n".to_string()),
+                ..Default::default()
+            })
+            .expect("保存できる");
+
+        let reloaded = ConfigStore::load(path).snapshot();
+        // 改行は \n に揃い、前後の空白は落ちる。中身はそのまま。
+        assert_eq!(reloaded.format_rules, "句読点だけ打つ。\n言い換えない。");
+        assert_eq!(
+            reloaded.format_rules_for_prompt(),
+            Some("句読点だけ打つ。\n言い換えない。")
+        );
+        let view = ConfigView::build(
+            &reloaded,
+            resolve_key(None, &reloaded.groq_api_key),
+            resolve_key(None, &reloaded.gemini_api_key),
+        );
+        assert_eq!(view.format_rules, "句読点だけ打つ。\n言い換えない。");
+        assert_eq!(view.default_format_rules, crate::format::DEFAULT_FORMAT_RULES);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overlong_rules_are_rejected_without_touching_the_config() {
+        let dir = std::env::temp_dir().join(format!("nox-format-rules-long-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        let store = ConfigStore::load(path.clone());
+        let long = "あ".repeat(MAX_FORMAT_RULES_CHARS + 1);
+        let err = store
+            .update(ConfigPatch {
+                format_rules: Some(long),
+                // 同じパッチの他の項目も書き換わらないこと (半端な保存をしない)。
+                language: Some("en".to_string()),
+                ..Default::default()
+            })
+            .expect_err("上限超えは断る");
+        assert!(err.contains("整形の共通ルール"), "項目を名指ししていない: {err}");
+        assert!(err.contains(&MAX_FORMAT_RULES_CHARS.to_string()), "{err}");
+        assert_eq!(store.snapshot().language, DEFAULT_LANGUAGE);
+        assert_eq!(store.snapshot().format_rules, "");
+        // ちょうど上限は通る。
+        assert!(store
+            .update(ConfigPatch {
+                format_rules: Some("い".repeat(MAX_FORMAT_RULES_CHARS)),
+                ..Default::default()
+            })
+            .is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- 整形モデルの名前 (2026-10-10) ---
+
+    #[test]
+    fn a_pasted_models_prefix_is_stripped_from_the_gemini_model() {
+        // ListModels は `models/gemini-...` で返す。そのまま貼られても通す。
+        let mut cfg = Config::default();
+        cfg.apply(ConfigPatch {
+            format_model: Some("  models/gemini-3.5-flash-lite ".to_string()),
+            ..ConfigPatch::default()
+        });
+        assert_eq!(cfg.format_model, "gemini-3.5-flash-lite");
+        // `models/` だけなら空欄と同じ = 既定。
+        cfg.apply(ConfigPatch {
+            format_model: Some("models/".to_string()),
+            ..ConfigPatch::default()
+        });
+        assert_eq!(cfg.format_model, DEFAULT_FORMAT_MODEL);
+    }
+
+    #[test]
+    fn url_breaking_gemini_model_names_are_rejected() {
+        for bad in [
+            "gemini/../evil",
+            "gemini?key=x",
+            "gemini#frag",
+            "gemini%2Fx",
+            "gemini flash",
+            "gemini\tflash",
+            "gemini-フラッシュ",
+            "gemini:streamGenerateContent",
+        ] {
+            let err = validate_model_name(FormatProvider::Gemini, bad)
+                .expect_err(&format!("{bad:?} を通した"));
+            assert!(err.contains("主の整形モデル"), "項目を名指ししていない: {err}");
+        }
+        for good in [
+            "gemini-flash-lite-latest",
+            "gemini-3.5-flash-lite",
+            "gemini-1.5-pro_002",
+            "",
+        ] {
+            assert!(validate_model_name(FormatProvider::Gemini, good).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
+    fn groq_model_names_may_contain_slashes_but_not_whitespace() {
+        for good in ["openai/gpt-oss-20b", "qwen/qwen3.8-27b", "meta-llama/llama-4:free"] {
+            assert_eq!(
+                validate_model_name(FormatProvider::Groq, good).as_deref(),
+                Ok(good)
+            );
+        }
+        // Groq では `models/` を剥がさない (Gemini 固有の書式なので)。
+        assert_eq!(
+            validate_model_name(FormatProvider::Groq, "models/x").as_deref(),
+            Ok("models/x")
+        );
+        for bad in ["openai/gpt oss", "openai/gpt-oss\n20b", "a\u{7}b"] {
+            let err = validate_model_name(FormatProvider::Groq, bad)
+                .expect_err(&format!("{bad:?} を通した"));
+            assert!(err.contains("控えの整形モデル"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_bad_model_name_is_rejected_on_save_without_touching_the_config() {
+        let dir = std::env::temp_dir().join(format!("nox-format-model-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        let store = ConfigStore::load(path.clone());
+        let err = store
+            .update(ConfigPatch {
+                format_model: Some("gemini?x=1".to_string()),
+                groq_format_model: Some("qwen/qwen3.8-27b".to_string()),
+                ..Default::default()
+            })
+            .expect_err("URL を壊す名前は断る");
+        assert!(err.contains("「?」"), "どの文字が駄目か書いていない: {err}");
+        assert_eq!(store.snapshot().format_model, DEFAULT_FORMAT_MODEL);
+        assert_eq!(store.snapshot().groq_format_model, DEFAULT_GROQ_FORMAT_MODEL);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hand_edited_bad_model_name_falls_back_to_the_default_on_load() {
+        // 保存の経路は断るので、ここへ来るのは設定ファイルを手で書いたときだけ。
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"format_model":"gemini/../x?y","groq_format_model":"a b"}"#,
+        )
+        .expect("読める");
+        cfg.normalize();
+        assert_eq!(cfg.format_model, DEFAULT_FORMAT_MODEL);
+        assert_eq!(cfg.groq_format_model, DEFAULT_GROQ_FORMAT_MODEL);
+    }
+
+    #[test]
+    fn the_candidates_lead_with_the_defaults_and_pass_validation() {
+        // 画面の候補は実測の表から選んだもの。先頭は既定で、
+        // どれも保存で断られない名前であること (断られる候補は罠になる)。
+        assert_eq!(GEMINI_FORMAT_MODEL_CANDIDATES[0].name, DEFAULT_FORMAT_MODEL);
+        assert_eq!(GROQ_FORMAT_MODEL_CANDIDATES[0].name, DEFAULT_GROQ_FORMAT_MODEL);
+        for (provider, list) in [
+            (FormatProvider::Gemini, GEMINI_FORMAT_MODEL_CANDIDATES),
+            (FormatProvider::Groq, GROQ_FORMAT_MODEL_CANDIDATES),
+        ] {
+            for c in list {
+                assert_eq!(
+                    validate_model_name(provider, c.name).as_deref(),
+                    Ok(c.name),
+                    "{provider:?}"
+                );
+                assert!(!c.note.is_empty());
+            }
+        }
+        let cfg = Config::default();
+        let view = ConfigView::build(
+            &cfg,
+            resolve_key(None, &cfg.groq_api_key),
+            resolve_key(None, &cfg.gemini_api_key),
+        );
+        assert_eq!(view.format_model_candidates.len(), 3);
+        assert_eq!(view.groq_format_model_candidates.len(), 3);
+        let json = serde_json::to_value(&view).expect("JSON にできる");
+        assert_eq!(
+            json["format_model_candidates"][0]["name"],
+            DEFAULT_FORMAT_MODEL
+        );
+        assert!(json["format_model_candidates"][0]["note"].is_string());
+        assert_eq!(json["format_rules_max_chars"], MAX_FORMAT_RULES_CHARS);
     }
 
     #[test]
@@ -2975,6 +3521,34 @@ mod tests {
         );
         // キーが URL に混ざらないこと (x-goog-api-key ヘッダで渡す方針)。
         assert!(!cfg.gemini_url().contains("key="));
+        // 「試す」用の組み立ては同じ関数を通る (保存済みの名前で同じ URL になる)。
+        assert_eq!(cfg.gemini_url_for(&cfg.format_model), cfg.gemini_url());
+        assert_eq!(
+            cfg.gemini_url_for("gemini-3.5-flash-lite"),
+            "https://example.test/v1beta/models/gemini-3.5-flash-lite:generateContent"
+        );
+    }
+
+    #[test]
+    fn a_saved_gemini_model_always_builds_a_single_path_segment() {
+        // 保存で通った名前は、URL のパスを 1 段だけ足す形にしかならない。
+        let mut cfg = Config {
+            gemini_endpoint: "https://example.test/v1beta/models".to_string(),
+            ..Config::default()
+        };
+        cfg.apply(ConfigPatch {
+            format_model: Some("models/gemini-flash-latest".to_string()),
+            ..ConfigPatch::default()
+        });
+        let url = cfg.gemini_url();
+        assert_eq!(
+            url,
+            "https://example.test/v1beta/models/gemini-flash-latest:generateContent"
+        );
+        let tail = url
+            .strip_prefix("https://example.test/v1beta/models/")
+            .expect("エンドポイントの下");
+        assert!(!tail.contains('/') && !tail.contains('?') && !tail.contains('#'));
     }
 
     #[test]

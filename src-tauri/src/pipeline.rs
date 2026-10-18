@@ -83,6 +83,9 @@ pub struct PipelineInput<'a> {
     pub app: Option<&'a str>,
     /// 画面から読んだ文脈 (deep context)。
     pub context: Option<&'a str>,
+    /// 整形の共通ルール ([`crate::config::Config::format_rules_for_prompt`])。
+    /// `None` なら同梱の既定 ([`crate::format::DEFAULT_FORMAT_RULES`])。
+    pub rules: Option<&'a str>,
 }
 
 impl<'a> PipelineInput<'a> {
@@ -136,6 +139,7 @@ pub fn run(
         style: input.style,
         app: input.app,
         context: input.context,
+        rules: input.rules,
     };
     let (text, outcome) = format_with_fallback(formatter, fallback, &request, &raw_text);
     let format_ms = format_started.elapsed().as_millis() as u64;
@@ -680,6 +684,7 @@ mod tests {
                 style: Some("チャットの発言。簡潔な口語にし、体言止めを避ける"),
                 app: Some("slack.exe"),
                 context: Some("プロジェクトの進行管理チャンネル。来週のリリース準備について話している。"),
+                rules: None,
             },
             &stt,
             Some(&formatter),

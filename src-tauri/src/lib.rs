@@ -48,6 +48,7 @@ mod sound;
 mod stt;
 mod style;
 mod tray;
+mod updater;
 
 #[cfg(test)]
 mod http_test_server;
@@ -1294,7 +1295,8 @@ pub fn run() {
             download_local_model,
             show_window,
             get_autostart,
-            set_autostart
+            set_autostart,
+            test_format_model
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -1310,15 +1312,27 @@ pub fn run() {
             app.manage(AppState::new(config_path, failed_dir, db_path, models_dir));
             initialize_history(&handle);
 
-            match tray::build(&handle) {
-                Ok(item) => {
+            // 自動更新。公式の手順どおり setup で入れる (設定は tauri.conf.json の
+            // plugins.updater)。入れるのは機構だけで、確認は下の start_schedule から。
+            handle.plugin(tauri_plugin_updater::Builder::new().build())?;
+
+            let updater_state = match tray::build(&handle) {
+                Ok(items) => {
                     if let Ok(mut slot) = handle.state::<AppState>().tray_status_item.lock() {
-                        *slot = Some(item);
+                        *slot = Some(items.status);
                     }
+                    updater::UpdaterState::new(
+                        Some(items.update_check),
+                        Some(items.update_install),
+                    )
                 }
                 // トレイが出せなくても録音機能自体は使えるので継続する。
-                Err(e) => log::error!("トレイの構築に失敗: {e}"),
-            }
+                Err(e) => {
+                    log::error!("トレイの構築に失敗: {e}");
+                    updater::UpdaterState::new(None, None)
+                }
+            };
+            app.manage(updater_state);
 
             // 設定のホットキーを反映してからフックを設置する。
             let cfg = handle.state::<AppState>().config.snapshot();
@@ -1335,6 +1349,7 @@ pub fn run() {
             start_finalize_worker(&handle);
             start_hotkey_controller(&handle);
             start_retention_timer(&handle);
+            updater::start_schedule(&handle);
 
             // ウィンドウは tauri.conf.json で非表示にして作られる。
             // 「出してから隠す」と一瞬フラッシュするので、出す側を明示する。
@@ -1390,25 +1405,58 @@ pub fn run() {
 
     app.run(|handle, event| {
         if let RunEvent::Exit = event {
-            // レベル送出スレッドを畳む。
-            stop_level_emitter(handle);
-            // 自動学習の見張りに手を引かせる。放っておくと UIA の購読を
-            // 握ったまま最大 90 秒残る (learn.rs の WATCH_MAX)。
-            learn::abandon_all();
-            // 録音中の終了 (トレイの「終了」等) で音声を無警告に捨てない。
-            finalize_on_exit(handle);
-            // 後処理待ちのキューに残っている録音も同様に退避する。
-            let state = handle.state::<AppState>();
-            let recovered = drain_pending_finalizations(&state.finalize_rx, &state.failed_dir);
-            if recovered > 0 {
-                log::warn!("後処理待ちだった録音 {recovered} 件を退避しました");
-            }
-            // フックスレッドを明示的に畳む (drop 任せにしない)。
-            if let Ok(mut hook) = state.hook.lock() {
-                hook.take();
-            };
+            shutdown_cleanup(handle);
         }
     });
+}
+
+/// 通常の終了 (`RunEvent::Exit`) の後始末。
+fn shutdown_cleanup(handle: &AppHandle) {
+    // レベル送出スレッドを畳む。
+    stop_level_emitter(handle);
+    // 自動学習の見張りに手を引かせる。放っておくと UIA の購読を
+    // 握ったまま最大 90 秒残る (learn.rs の WATCH_MAX)。
+    learn::abandon_all();
+    salvage_recordings(handle);
+    // フックスレッドを明示的に畳む (drop 任せにしない)。
+    if let Ok(mut hook) = handle.state::<AppState>().hook.lock() {
+        hook.take();
+    };
+}
+
+/// 録音中・後処理待ちの音声を WAV として退避する。
+///
+/// **2 か所から呼ばれる**: 通常の終了 ([`shutdown_cleanup`]) と、更新を入れる直前
+/// (`updater` の `on_before_exit`)。後者はプラグインが `std::process::exit(0)` で
+/// 抜けるので `RunEvent::Exit` を通らない。
+///
+/// 更新の側で**これだけ**を呼ぶのは、`on_before_exit` がインストーラの起動より
+/// 前に走り、起動はまだ失敗しうるから。フックやスレッドまで畳むと、失敗して
+/// 戻ってきたとき押しても録れない常駐が残る。畳む側は `exit(0)` でプロセスごと
+/// 消えるので (低レベルフックはスレッドの終了で OS が外す)、そもそも要らない。
+fn salvage_recordings(handle: &AppHandle) {
+    // 録音中の終了 (トレイの「終了」等) で音声を無警告に捨てない。
+    finalize_on_exit(handle);
+    // 後処理待ちのキューに残っている録音も同様に退避する。
+    let state = handle.state::<AppState>();
+    let recovered = drain_pending_finalizations(&state.finalize_rx, &state.failed_dir);
+    if recovered > 0 {
+        log::warn!("後処理待ちだった録音 {recovered} 件を退避しました");
+    }
+}
+
+/// いまの状態 (録音中・処理中・待機中)。更新を入れてよいかの判断に使う。
+fn current_status(app: &AppHandle) -> Status {
+    app.state::<AppState>()
+        .status
+        .lock()
+        .map(|s| *s)
+        .unwrap_or(Status::Idle)
+}
+
+/// 後処理ワーカーのキューに積まれたままの仕事の数 ([`updater::can_install_now`] の doc)。
+fn queued_jobs(app: &AppHandle) -> usize {
+    app.state::<AppState>().finalize_rx.len()
 }
 
 /// 終了時、ファイナライズ待ちのキューに残っているジョブを WAV として退避する。
@@ -2285,6 +2333,156 @@ fn build_fallback_formatter(
     )
 }
 
+/// 設定画面の「試す」の結果。
+///
+/// 失敗も `Ok` で返す (`ok: false` と理由)。**失敗はこの機能の正常な答え**で、
+/// IPC の失敗 (`Err`) と混ぜると、画面が「試せなかった」と「モデルが駄目だった」を
+/// 区別できない。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct FormatModelTest {
+    ok: bool,
+    /// 実際に試したモデル名 (空欄なら既定、`models/` は剥がした後)。
+    model: String,
+    /// API を呼んだ時間。名前の検査で断ったときは 0。
+    elapsed_ms: u64,
+    /// 成功時の整形結果。
+    output: Option<String>,
+    /// 失敗時の理由 (利用者向けの短い文)。
+    reason: Option<String>,
+}
+
+impl FormatModelTest {
+    fn failed(model: String, elapsed_ms: u64, reason: String) -> Self {
+        Self {
+            ok: false,
+            model,
+            elapsed_ms,
+            output: None,
+            reason: Some(reason),
+        }
+    }
+}
+
+/// 整形モデルを試す (設定画面の「試す」)。
+///
+/// **保存済みの** API キーとエンドポイントに、**未保存の**モデル名と共通ルールを
+/// 組み合わせて、固定のサンプル文 ([`format::LIVE_SAMPLE`]) を 1 回整形する。
+/// 辞書・文体・画面テキストは載せない (サンプル文には関係が無く、送る理由も無い)。
+///
+/// # 後処理ワーカーを通さない
+///
+/// ワーカーは直列なので、ここで最大 20 秒待つと**その間の録音の後処理が全部
+/// 詰まる**。かといって同期コマンドのまま走らせると Tauri のメインスレッドが
+/// 止まり、窓ごと固まる。だから非同期コマンドにして、ブロッキングの HTTP は
+/// `spawn_blocking` の別スレッドで回す (`reqwest::blocking` は tokio の
+/// ワーカー上で直接呼ぶと panic する)。
+#[tauri::command]
+async fn test_format_model(
+    app: AppHandle,
+    provider: config::FormatProvider,
+    model: String,
+    rules: Option<String>,
+) -> Result<FormatModelTest, String> {
+    let state = app.state::<AppState>();
+    let cfg = state.config.snapshot();
+    let http = state.http.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_format_model_test(&cfg, http.as_ref(), provider, &model, rules.as_deref())
+    })
+    .await
+    .map_err(|e| format!("試行を実行できませんでした: {e}"))
+}
+
+/// [`test_format_model`] の本体 (同期)。実 API テストからも直接呼べるよう切り出す。
+///
+/// - モデル名は保存と**同じ**検査 ([`config::validate_model_name`]) を通す。
+///   試せたのに保存で断られる (またはその逆の) 名前を作らない
+/// - Gemini は再試行なし・控えが無いときの見切り ([`format::FORMAT_TIMEOUT`])。
+///   試行で 1 回粘ると、駄目なモデルの判定に倍の時間がかかる
+/// - Groq は控えの有効/無効に関わらず試す (有効にするか決める前に試したい)。
+///   キーが無ければ [`format::FormatError::MissingApiKey`] として理由を返す
+/// - 理由文は [`format::provider_reason`]。`Display` は「Gemini」を焼き込んで
+///   いるので、Groq の失敗に使うと嘘になる
+/// - ログには提供元・モデル名・文字数・所要時間だけを出す (キーも本文も出さない)
+fn run_format_model_test(
+    cfg: &config::Config,
+    http: Option<&reqwest::blocking::Client>,
+    provider: config::FormatProvider,
+    model: &str,
+    rules: Option<&str>,
+) -> FormatModelTest {
+    let model = match config::validate_model_name(provider, model) {
+        Ok(name) if name.is_empty() => provider.default_model().to_string(),
+        Ok(name) => name,
+        Err(reason) => return FormatModelTest::failed(model.trim().to_string(), 0, reason),
+    };
+    let rules = match rules.map(config::validate_format_rules).transpose() {
+        Ok(rules) => rules,
+        Err(reason) => return FormatModelTest::failed(model, 0, reason),
+    };
+    let Some(http) = http else {
+        return FormatModelTest::failed(
+            model,
+            0,
+            "HTTP クライアントを構築できなかったため試せません".to_string(),
+        );
+    };
+
+    let request = format::FormatRequest {
+        raw: format::LIVE_SAMPLE,
+        // 空 (= 既定と同じ文) なら既定を使う。system_prompt も空白を既定に倒す。
+        rules: rules.as_deref().filter(|r| !r.is_empty()),
+        ..format::FormatRequest::default()
+    };
+    let (label, result, elapsed) = match provider {
+        config::FormatProvider::Gemini => {
+            let formatter = GeminiFormatter::new(
+                http.clone(),
+                cfg.gemini_url_for(&model),
+                cfg.gemini_key().secret.unwrap_or_default(),
+            )
+            .with_timeout(format::FORMAT_TIMEOUT)
+            .with_retry(false);
+            let started = Instant::now();
+            let result = format::TextFormatter::format(&formatter, &request);
+            (format::PROVIDER_GEMINI, result, started.elapsed())
+        }
+        config::FormatProvider::Groq => {
+            let formatter = GroqFormatter::new(
+                http.clone(),
+                &cfg.groq_chat_endpoint,
+                &model,
+                cfg.groq_key().secret.unwrap_or_default(),
+            )
+            .with_timeout(format_groq::GROQ_FORMAT_TIMEOUT);
+            let started = Instant::now();
+            let result = format::TextFormatter::format(&formatter, &request);
+            (format::PROVIDER_GROQ, result, started.elapsed())
+        }
+    };
+    let elapsed_ms = elapsed.as_millis() as u64;
+    match result {
+        Ok(text) => {
+            log::info!(
+                "整形モデルの試行に成功: {label} {model} / 出力 {} 文字 / {elapsed_ms} ms",
+                text.chars().count()
+            );
+            FormatModelTest {
+                ok: true,
+                model,
+                elapsed_ms,
+                output: Some(text),
+                reason: None,
+            }
+        }
+        Err(e) => {
+            let reason = format::provider_reason(&e, label);
+            log::warn!("整形モデルの試行に失敗: {label} {model} / {elapsed_ms} ms / {reason}");
+            FormatModelTest::failed(model, elapsed_ms, reason)
+        }
+    }
+}
+
 /// WAV を転写し、必要なら整形して結果を通知する。
 ///
 /// - 整形の失敗は [`pipeline::run`] が生転写へ落とす (R2 劣化モード)。
@@ -2371,6 +2569,8 @@ fn transcribe_and_format(
             .is_known()
             .then(|| recording.target_process()),
         context: screen_context.as_prompt_text(),
+        // 共通ルール (設定画面で編集できる部分)。再転写と同じ accessor を通す。
+        rules: cfg.format_rules_for_prompt(),
     };
     let formatter_ref = formatter.as_ref().map(|f| f as &dyn format::TextFormatter);
     let fallback_ref = fallback.as_ref().map(|f| f as &dyn format::TextFormatter);
@@ -2570,6 +2770,8 @@ fn answer_screen_question(
         style: None,
         app: None,
         context: None,
+        // 整形しない経路なので共通ルールも渡さない (画面質問には効かない)。
+        rules: None,
     };
     // 整形器を渡さないので控えも要らない (画面質問モードでは、発話は
     // 整形せず「質問」として asker へ渡す)。
@@ -3512,6 +3714,8 @@ fn retranscribe(app: &AppHandle, id: i64) {
     let entries = cfg.dictionary_entries();
     let mut input = pipeline::PipelineInput::new(&wav, &cfg.language);
     input.dictionary = &entries;
+    // 新規録音と同じ共通ルール。ここを落とすと再転写でだけ既定の指示に戻る。
+    input.rules = cfg.format_rules_for_prompt();
     // 新規録音と同じ経路。ここを別実装にすると設定の見落としが起きる。
     match run_stt_pipeline(
         app,
@@ -3832,6 +4036,272 @@ fn emit_error_from(app: &AppHandle, message: &str, origin: StatusOrigin) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // --- 設定画面の「試す」(test_format_model の本体) ---
+
+    mod format_model_test {
+        use super::*;
+        use crate::http_test_server::{CannedResponse, TestServer};
+
+        fn client() -> reqwest::blocking::Client {
+            reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("テスト用クライアント")
+        }
+
+        /// 試行先をテストサーバへ向けた設定。キーは設定ファイル側に入れる
+        /// (開発機に環境変数のキーがあればそちらが優先されるが、送り先は
+        /// このプロセス内のテストサーバなので外へは出ない)。
+        fn cfg(server: &TestServer) -> config::Config {
+            config::Config {
+                gemini_endpoint: server.url(),
+                groq_chat_endpoint: format!("{}/chat/completions", server.url()),
+                gemini_api_key: config::Secret::new("test-gemini-key"),
+                groq_api_key: config::Secret::new("test-groq-key"),
+                ..config::Config::default()
+            }
+        }
+
+        fn gemini_ok(text: &str) -> String {
+            serde_json::json!({
+                "candidates": [{
+                    "content": { "parts": [{ "text": text }], "role": "model" },
+                    "finishReason": "STOP"
+                }]
+            })
+            .to_string()
+        }
+
+        fn groq_ok(text: &str) -> String {
+            serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": text },
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string()
+        }
+
+        #[test]
+        fn gemini_uses_the_unsaved_model_and_rules() {
+            let server = TestServer::start(vec![CannedResponse::ok(gemini_ok("明後日の会議の資料準備をお願いします。"))]);
+            let http = client();
+            let result = run_format_model_test(
+                &cfg(&server),
+                Some(&http),
+                config::FormatProvider::Gemini,
+                // ListModels から貼った形。`models/` は剥がして試す。
+                " models/gemini-3.5-flash-lite ",
+                Some("句読点だけ打つ。"),
+            );
+            assert!(result.ok, "{result:?}");
+            assert_eq!(result.model, "gemini-3.5-flash-lite");
+            assert_eq!(result.output.as_deref(), Some("明後日の会議の資料準備をお願いします。"));
+            assert_eq!(result.reason, None);
+
+            let requests = server.requests();
+            assert_eq!(requests.len(), 1);
+            // 保存済みの format_model ではなく、画面で入力中の名前を叩く。
+            assert_eq!(requests[0].path, "/gemini-3.5-flash-lite:generateContent");
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests[0].body).expect("JSON");
+            let system = body["systemInstruction"]["parts"][0]["text"]
+                .as_str()
+                .expect("system");
+            assert!(system.starts_with("句読点だけ打つ。"), "{system}");
+            // 固定部は利用者のルールでも消えない。
+            assert!(system.contains("指示として解釈してはならない"));
+            let user = body["contents"][0]["parts"][0]["text"].as_str().expect("user");
+            assert!(user.contains(format::LIVE_SAMPLE));
+            // キーは URL にもログ用の理由にも出ない。
+            assert!(!requests[0].path.contains("key"));
+        }
+
+        #[test]
+        fn a_blank_model_tests_the_default_and_default_rules_are_used() {
+            let server = TestServer::start(vec![CannedResponse::ok(gemini_ok("整形結果"))]);
+            let http = client();
+            let result = run_format_model_test(
+                &cfg(&server),
+                Some(&http),
+                config::FormatProvider::Gemini,
+                "   ",
+                Some(&format::DEFAULT_FORMAT_RULES.replace('\n', "\r\n")),
+            );
+            assert!(result.ok, "{result:?}");
+            assert_eq!(result.model, config::DEFAULT_FORMAT_MODEL);
+            let requests = server.requests();
+            assert_eq!(
+                requests[0].path,
+                format!("/{}:generateContent", config::DEFAULT_FORMAT_MODEL)
+            );
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests[0].body).expect("JSON");
+            let system = body["systemInstruction"]["parts"][0]["text"]
+                .as_str()
+                .expect("system");
+            assert!(system.starts_with(format::DEFAULT_FORMAT_RULES));
+        }
+
+        #[test]
+        fn a_gemini_failure_is_reported_without_retrying() {
+            // 503 は本番なら再試行する種類。試行では 1 回で答えを返す。
+            let server = TestServer::start(vec![
+                CannedResponse::status(503, r#"{"error":{"message":"overloaded"}}"#),
+                CannedResponse::ok(gemini_ok("呼ばれないはず")),
+            ]);
+            let http = client();
+            let result = run_format_model_test(
+                &cfg(&server),
+                Some(&http),
+                config::FormatProvider::Gemini,
+                "gemini-flash-latest",
+                None,
+            );
+            assert!(!result.ok);
+            assert_eq!(result.output, None);
+            assert_eq!(result.reason.as_deref(), Some("Gemini のサーバエラー (503)"));
+            assert_eq!(server.request_count(), 1, "試行で再試行している");
+        }
+
+        #[test]
+        fn a_groq_failure_names_groq_and_works_with_the_fallback_off() {
+            // 控えを有効にするか決める前に試したいので、無効でも試す。
+            let server = TestServer::start(vec![CannedResponse::status(
+                404,
+                r#"{"error":{"message":"model not found"}}"#,
+            )]);
+            let http = client();
+            let mut config = cfg(&server);
+            config.format_fallback_enabled = false;
+            let result = run_format_model_test(
+                &config,
+                Some(&http),
+                config::FormatProvider::Groq,
+                "openai/no-such-model",
+                None,
+            );
+            assert!(!result.ok);
+            assert_eq!(result.model, "openai/no-such-model");
+            let reason = result.reason.expect("理由");
+            assert!(reason.starts_with("Groq "), "提供元が違う: {reason}");
+            assert!(!reason.contains("Gemini"), "{reason}");
+            assert_eq!(server.request_count(), 1);
+        }
+
+        #[test]
+        fn groq_success_returns_the_output() {
+            let server = TestServer::start(vec![CannedResponse::ok(groq_ok("整形済み"))]);
+            let http = client();
+            let result = run_format_model_test(
+                &cfg(&server),
+                Some(&http),
+                config::FormatProvider::Groq,
+                "qwen/qwen3.8-27b",
+                None,
+            );
+            assert!(result.ok, "{result:?}");
+            assert_eq!(result.output.as_deref(), Some("整形済み"));
+            let body: serde_json::Value =
+                serde_json::from_slice(&server.requests()[0].body).expect("JSON");
+            assert_eq!(body["model"], "qwen/qwen3.8-27b");
+        }
+
+        #[test]
+        fn a_url_breaking_name_is_rejected_before_any_request() {
+            let server = TestServer::start(vec![CannedResponse::ok(gemini_ok("呼ばれないはず"))]);
+            let http = client();
+            let result = run_format_model_test(
+                &cfg(&server),
+                Some(&http),
+                config::FormatProvider::Gemini,
+                "gemini?alt=sse",
+                None,
+            );
+            assert!(!result.ok);
+            assert_eq!(result.elapsed_ms, 0);
+            let reason = result.reason.expect("理由");
+            assert!(reason.contains("主の整形モデル"), "{reason}");
+            assert_eq!(server.request_count(), 0, "検査で断る前に送っている");
+        }
+
+        #[test]
+        fn overlong_rules_are_rejected_before_any_request() {
+            let server = TestServer::start(vec![CannedResponse::ok(gemini_ok("呼ばれないはず"))]);
+            let http = client();
+            let long = "あ".repeat(config::MAX_FORMAT_RULES_CHARS + 1);
+            let result = run_format_model_test(
+                &cfg(&server),
+                Some(&http),
+                config::FormatProvider::Gemini,
+                "",
+                Some(&long),
+            );
+            assert!(!result.ok);
+            assert!(result.reason.expect("理由").contains("整形の共通ルール"));
+            assert_eq!(server.request_count(), 0);
+        }
+
+        #[test]
+        fn a_missing_http_client_is_a_reason_not_a_panic() {
+            let result = run_format_model_test(
+                &config::Config::default(),
+                None,
+                config::FormatProvider::Groq,
+                "",
+                None,
+            );
+            assert!(!result.ok);
+            assert_eq!(result.model, config::DEFAULT_GROQ_FORMAT_MODEL);
+            assert!(result.reason.expect("理由").contains("HTTP クライアント"));
+        }
+
+        /// 実 API で「試す」の経路を通す。キーが無ければスキップ。
+        ///
+        /// 実行: `cargo test --lib -- --ignored --nocapture live_format_model_test`
+        #[test]
+        #[ignore = "実 API を呼ぶ。GEMINI_API_KEY / GROQ_API_KEY が必要"]
+        fn live_format_model_test() {
+            let http = crate::stt::build_http_client().expect("クライアント");
+            let cfg = config::Config::default();
+            let cases = [
+                (config::FormatProvider::Gemini, cfg.gemini_key().is_set(), ""),
+                (
+                    config::FormatProvider::Gemini,
+                    cfg.gemini_key().is_set(),
+                    "models/gemini-3.5-flash-lite",
+                ),
+                (config::FormatProvider::Groq, cfg.groq_key().is_set(), ""),
+            ];
+            for (provider, has_key, model) in cases {
+                if !has_key {
+                    println!("{provider:?}: キーが無いのでスキップします");
+                    continue;
+                }
+                let result = run_format_model_test(&cfg, Some(&http), provider, model, None);
+                println!("{provider:?} {} → {result:?}", result.model);
+                assert!(result.ok, "{result:?}");
+                let output = result.output.expect("出力");
+                assert!(!output.contains("えーと"), "フィラーが残っている: {output}");
+            }
+            // 存在しないモデルは理由つきで失敗する (成功に化けない)。
+            if cfg.gemini_key().is_set() {
+                let result = run_format_model_test(
+                    &cfg,
+                    Some(&http),
+                    config::FormatProvider::Gemini,
+                    "gemini-no-such-model-0000",
+                    None,
+                );
+                println!("存在しないモデル → {result:?}");
+                assert!(!result.ok);
+                assert!(result.reason.expect("理由").starts_with("Gemini "));
+            }
+        }
+    }
 
     /// 劣化は貼付済みより長く残す。**ここが逆転すると表示は出ているのに
     /// 読めない**という、一番たちの悪い直り方をする。

@@ -735,6 +735,101 @@ button.danger:hover:not(:disabled) {
   line-height: 1.5;
 }
 
+/* --- 整形モデル・共通ルール ------------------------------------------------
+ * 入力欄とその場の操作 (試す) を 1 行に並べる。ボタンは縮めず、入力欄が
+ * 残りを取る。狭い窓でも横にあふれさせない (min-width: 0)。 */
+
+.model-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.model-row > input {
+  flex: 1;
+  min-width: 0;
+}
+
+.model-row > button {
+  flex: none;
+}
+
+/* ラベルと状態バッジ (既定から変更あり) を同じ行に */
+.field-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.field-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* 文字数は右端へ。桁がそろわないと打つたびに揺れる */
+.field-count {
+  margin-left: auto;
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.field-count[data-over] {
+  color: var(--status-danger);
+  font-weight: 600;
+}
+
+#format-rules {
+  min-height: 14em;
+}
+
+/* 「試す」の結果。成功は控えめに、失敗は理由が読める強さで
+   (失敗は騒がしく、成功は静かに — PRODUCT.md) */
+.model-test {
+  display: grid;
+  gap: var(--space-1);
+  margin: var(--space-1) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.model-test-head {
+  font-weight: 600;
+}
+
+.model-test[data-state="ok"] .model-test-head {
+  color: var(--status-ok);
+}
+
+.model-test[data-state="fail"] {
+  border-color: color-mix(in srgb, var(--status-danger) 40%, transparent);
+  background: var(--status-danger-soft);
+}
+
+.model-test[data-state="fail"] .model-test-head {
+  color: var(--status-danger);
+}
+
+/* 失敗の理由は本文色で読ませる (薄い灰色だと読み飛ばされる) */
+.model-test[data-state="fail"] .model-test-body {
+  color: var(--text-primary);
+}
+
+.model-test-output {
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+}
+
 /* 効かなくなった項目は、消さずに触れなくする (値は残す) */
 input:disabled,
 select:disabled,

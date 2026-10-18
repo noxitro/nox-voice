@@ -389,6 +389,39 @@
                   <input type="checkbox" id="formatting-enabled" />
                   <span>LLM で整形する(オフなら生転写をそのまま使う)</span>
                 </label>
+                <!--
+                  整形モデル。候補 (datalist) と既定のモデル名は Rust の
+                  ConfigView から入る (src-tauri/src/config.rs の
+                  GEMINI_FORMAT_MODEL_CANDIDATES)。ここに写しを書かない。
+                  「試す」は label の外に置く — button も labelable 要素なので、
+                  label の中に入れると入力欄の名前に「試す」が混ざる。
+                -->
+                <div class="field">
+                  <label class="field-label" for="format-model">主の整形モデル(Gemini)</label>
+                  <div class="model-row">
+                    <input
+                      type="text"
+                      id="format-model"
+                      list="format-model-candidates"
+                      autocomplete="off"
+                      spellcheck="false"
+                      aria-describedby="format-model-note format-model-result"
+                    />
+                    <button type="button" id="format-model-test" data-provider="gemini">
+                      試す
+                    </button>
+                  </div>
+                  <datalist id="format-model-candidates"></datalist>
+                  <small class="field-note" id="format-model-note"
+                    >録音のたびの整形(履歴からの再転写を含む)と、画面質問モードの回答に使います。空にすると既定(<code
+                      data-default-model="gemini"
+                    ></code
+                    >)に戻ります。候補から選ぶか、モデル名を直接入力します。考える型の重いモデルにすると、
+                    話し終えてから貼り付くまでが数秒以上遅くなります。「試す」は保存せずに例文を 1 回
+                    整形して確かめます(最大 20 秒ほど)。</small
+                  >
+                  <p class="model-test" id="format-model-result" aria-live="polite" hidden></p>
+                </div>
                 <label class="checkbox">
                   <input type="checkbox" id="format-fallback-enabled" />
                   <span>Gemini が使えないときは Groq で整形する(控え)</span>
@@ -399,14 +432,64 @@
                   音声は既に Groq(音声認識)へ送っていますが、画面のテキストは新しい送信先に
                   なります。オフにすると、Gemini が落ちたときは生転写がそのまま使われます。
                 </p>
-                <label class="field">
-                  <span>控えの整形モデル</span>
-                  <input type="text" id="groq-format-model" placeholder="openai/gpt-oss-20b" />
-                  <small class="field-note"
-                    >空にすると既定(<code>openai/gpt-oss-20b</code>)に戻ります。推論モデルなので、
-                    変更したら所要時間を必ず実測してください。</small
+                <div class="field">
+                  <label class="field-label" for="groq-format-model">控えの整形モデル(Groq)</label>
+                  <div class="model-row">
+                    <input
+                      type="text"
+                      id="groq-format-model"
+                      list="groq-format-model-candidates"
+                      autocomplete="off"
+                      spellcheck="false"
+                      aria-describedby="groq-format-model-note groq-format-model-result"
+                    />
+                    <button type="button" id="groq-format-model-test" data-provider="groq">
+                      試す
+                    </button>
+                  </div>
+                  <datalist id="groq-format-model-candidates"></datalist>
+                  <small class="field-note" id="groq-format-model-note"
+                    >上の控えがオンのとき、Gemini が使えなかった録音の整形にだけ使います。空にすると既定(<code
+                      data-default-model="groq"
+                    ></code
+                    >)に戻ります。推論モデルなので、変更したら「試す」で所要時間を確かめてください。</small
                   >
-                </label>
+                  <p class="model-test" id="groq-format-model-result" aria-live="polite" hidden></p>
+                </div>
+                <!--
+                  整形の共通ルール。編集できるのは「どう整えるか」の部分だけで、
+                  注入への防御 (【データ部の扱い】) と【出力】は Rust 側
+                  (format::system_prompt) が常に後ろへ付け足す。既定文は
+                  ConfigView.default_format_rules から入る。保存は他の項目と同じ
+                  保存ボタンで、既定と同じ文なら Rust 側が空 (= 既定) で保存する。
+                -->
+                <div class="field">
+                  <div class="field-head">
+                    <label class="field-label" for="format-rules">整形の共通ルール</label>
+                    <span class="badge" data-kind="edited" id="format-rules-modified" hidden
+                      >既定から変更あり</span
+                    >
+                  </div>
+                  <textarea
+                    id="format-rules"
+                    rows="14"
+                    spellcheck="false"
+                    aria-describedby="format-rules-note format-rules-result"
+                  ></textarea>
+                  <div class="field-actions">
+                    <button type="button" id="format-rules-reset">既定に戻す</button>
+                    <button type="button" id="format-rules-test">この指示で試す</button>
+                    <span class="field-count" id="format-rules-count" aria-live="off"></span>
+                  </div>
+                  <small class="field-note" id="format-rules-note"
+                    >整形のたびに渡す、<strong>全アプリ共通</strong>の指示です。アプリごとの文体は
+                    「辞書と文体」のアプリ別の文体で足してください。画面のデータに紛れた命令を無視する防御と、
+                    出力形式の決まりは、ここに何を書いても<strong>常に自動で付け足される</strong>ので消えません。
+                    画面質問モードには効きません。「既定に戻す」は入力欄を戻すだけで、保存すると反映されます。
+                    「この指示で試す」は、主の整形モデル欄のモデルで例文を 1 回整形します(保存はしません)。</small
+                  >
+                  <p class="model-test" id="format-rules-result" aria-live="polite" hidden></p>
+                </div>
               </div>
             </div>
 

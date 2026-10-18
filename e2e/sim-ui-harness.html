@@ -155,7 +155,38 @@
           // 「既定 ON」の検査ができなくなる (自動学習と同じ理由)。
           format_fallback_enabled: true,
           groq_format_model: "openai/gpt-oss-20b",
+          // 整形の共通ルール (2026-10-10)。**保存値は空 = 既定を使っている**
+          // 状態を初期値にする。画面は空欄ではなく既定の文を出さねばならない。
+          format_rules: "",
+          // 既定文・候補は Rust の ConfigView が渡す。**わざと本物と違う文に
+          // してある** — 画面がここから読まずにどこかの写しを出していたら、
+          // 本物の文が出てテストが落ちる (写しの検出)。
+          default_format_rules: "既定ルール(模擬)\n【行うこと】\n- フィラーを削除する",
+          format_rules_max_chars: 8000,
+          default_format_model: "gemini-flash-lite-latest",
+          default_groq_format_model: "openai/gpt-oss-20b",
+          format_model_candidates: [
+            { name: "gemini-flash-lite-latest", note: "既定・最速 (模擬)" },
+            { name: "gemini-3.5-flash-lite", note: "良好 (模擬)" },
+            { name: "gemini-flash-latest", note: "遅い (模擬)" },
+          ],
+          groq_format_model_candidates: [
+            { name: "openai/gpt-oss-20b", note: "既定 (模擬)" },
+            { name: "openai/gpt-oss-120b", note: "良好 (模擬)" },
+            { name: "qwen/qwen3.8-27b", note: "最速 (模擬)" },
+          ],
         };
+
+        /** `config::canonical_format_rules` の**結論だけ**を真似る。
+         *
+         * 改行をそろえて前後の空白を落とし、既定と同じなら空で保存する。
+         * ここを素の Object.assign に任せると、既定の全文が保存された
+         * ことになり、「既定と同じなら空」を前提にした検査が**間違った理由で**
+         * 通ってしまう。規則の正しさ自体は config::tests が見る。 */
+        function canonicalRules(text) {
+          const t = String(text ?? "").replace(/\r\n?/g, "\n").trim();
+          return t === config.default_format_rules.trim() ? "" : t;
+        }
 
         /** SoundPreset::id() / label() と同じ並び (src-tauri/src/sound.rs)。 */
         const presets = [
@@ -364,6 +395,15 @@
               // 不具合を検出できない (実機 E2E の代わりにならない穴になる)。
               mock.lastPatch = structuredClone(args.patch);
               Object.assign(mock.config, args.patch);
+              // Rust の normalize の結論: 共通ルールは既定と同じなら空、
+              // 整形モデルは `models/` を剥がし、空なら既定。
+              if ("format_rules" in args.patch) {
+                mock.config.format_rules = canonicalRules(args.patch.format_rules);
+              }
+              if ("format_model" in args.patch) {
+                const m = String(args.patch.format_model).trim().replace(/^models\//, "").trim();
+                mock.config.format_model = m || mock.config.default_format_model;
+              }
               // Rust は保存のたびに枠を計算し直す。ここで据え置くと、
               // 行が増えても「枠外」が出ないビューが返り、E2E が
               // 溢れの表示を検査できない穴になる。
@@ -496,6 +536,33 @@
               mock.config[`${target}_label`] = label;
               mock.emit("nox://hotkey-captured", { label });
               return Promise.resolve({ verdict: "applied", label });
+            }
+            // 設定画面の「試す」(2026-10-10)。lib::FormatModelTest と同じ形。
+            // 名前に "bad" を含むモデルは API が断った体にする (失敗の経路)。
+            // IPC 自体の失敗は `?fail=test_format_model` で見る。
+            case "test_format_model": {
+              const provider = args.provider === "groq" ? "Groq" : "Gemini";
+              const fallbackModel =
+                args.provider === "groq"
+                  ? mock.config.default_groq_format_model
+                  : mock.config.default_format_model;
+              const model = String(args.model ?? "").trim() || fallbackModel;
+              if (model.includes("bad")) {
+                return Promise.resolve({
+                  ok: false,
+                  model,
+                  elapsed_ms: 321,
+                  output: null,
+                  reason: `${provider} がエラーを返しました (404)`,
+                });
+              }
+              return Promise.resolve({
+                ok: true,
+                model,
+                elapsed_ms: 812,
+                output: "明後日の会議の資料の準備をお願いします。",
+                reason: null,
+              });
             }
             case "clear_hotkey":
               mock.config.clipboard_hotkey_vk = 0;

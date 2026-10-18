@@ -42,6 +42,20 @@
 //! `focused(false)` にすると tao は `SW_SHOWNOACTIVATE` を使い、この
 //! マーカーは消費されずに残るので**毎回の表示**に効く。
 //!
+//! # `always_on_top(true)` だけでは最前面に居続けない (2026-10-18)
+//!
+//! 実機で、小窓の HWND に `WS_EX_TOPMOST` が**立ったまま**、Z 順では普通の
+//! ウィンドウより後ろ (最前面グループの外) に落ちている状態を観測した。
+//! この状態で表示すると、ほかのウィンドウの裏に出て見えない。落ちた契機は
+//! 特定していないが、スタイルのビットと Z 順の帯は別物で、ビットが残っていても
+//! 帯から外れることはある。
+//!
+//! tao の `set_always_on_top(true)` は**フラグに差分があるときしか**
+//! `SetWindowPos(HWND_TOPMOST)` を呼ばない (`window_state.rs` の `apply_diff`)
+//! ので、既に真のこの窓に呼んでも何も起きない。そこで表示のたびに
+//! `SetWindowPos(HWND_TOPMOST)` を直接打って帯へ戻す ([`reassert_topmost`])。
+//! `SWP_NOACTIVATE` は必須 (無いと前景を取り、R7 の照合が外れる)。
+//!
 //! # 録音開始を遅らせない
 //!
 //! ウィンドウ生成は起動時に一度だけ行い、以降は表示/非表示の切り替えだけにする。
@@ -180,10 +194,45 @@ pub fn show(app: &AppHandle) {
     // 既定のログレベルでも鳴らす (focus_probe)。ここを黙らせると、
     // ブラウザだけで再発したときに前景照合を通過したまま見えなくなる。
     let guard = crate::focus_probe::FocusGuard::begin("オーバーレイ表示");
+    reassert_topmost(&window);
     if let Err(e) = window.show() {
         log::warn!("オーバーレイを表示できません: {e}");
     }
     guard.end();
+}
+
+/// 最前面の帯へ戻す (モジュール冒頭の 2026-10-18 の注記参照)。
+///
+/// `SWP_ASYNCWINDOWPOS` で投げっぱなしにする。`show` は UI スレッド以外からも
+/// 呼ばれ、同期の `SetWindowPos` は UI スレッドが塞がっていると待たされる。
+/// 非表示の窓も Z 順の位置を持つので、この後の `show()` との前後は問わない。
+fn reassert_topmost(window: &tauri::WebviewWindow) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOPMOST, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    };
+
+    // tauri が返す HWND は tauri 側の `windows` の版の型なので、値で渡し直す。
+    let hwnd = match window.hwnd() {
+        Ok(h) => HWND(h.0 as *mut _),
+        Err(e) => {
+            log::warn!("オーバーレイの HWND を取得できません: {e}");
+            return;
+        }
+    };
+    if let Err(e) = unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+        )
+    } {
+        log::warn!("オーバーレイを最前面へ戻せません: {e}");
+    }
 }
 
 /// 即座に隠す。
