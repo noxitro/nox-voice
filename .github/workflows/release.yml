@@ -12,6 +12,12 @@ name: Release
 #
 # 版にハイフンを含むタグ (v0.6.0-beta.1) はプレリリースになる。MSI (WiX) は
 # 数字だけの版しか受け付けないので、そのときは NSIS のインストーラだけを作る。
+#
+# アプリ内の自動更新 (src-tauri/src/updater.rs) のため、インストーラに署名 (.sig) を付け、
+# latest.json と一緒に Release へ載せる。アプリは
+# releases/latest/download/latest.json を読むので、プレリリースは自動更新に乗らない
+# (/latest はプレリリースを指さない)。署名鍵は Secret の TAURI_SIGNING_PRIVATE_KEY と
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD に置く (README「リリースの手順」)。
 
 on:
   push:
@@ -44,6 +50,22 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+
+      - name: 更新の署名鍵が Secret にあるか
+        # 鍵が無いと tauri build が署名の段で落ちる。Rust の準備とビルドに何十分も使ってから落ちる前に、
+        # 何を設定すればよいかをここで言う。値はログに出さない (空かどうかだけを見る)。
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $missing = @('TAURI_SIGNING_PRIVATE_KEY', 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD') |
+            Where-Object { -not [Environment]::GetEnvironmentVariable($_) }
+          if ($missing) {
+            "::error::Secret が未設定: $($missing -join ', ')。アプリ内の自動更新の署名に要る (README「リリースの手順」の初回設定)"
+            exit 1
+          }
+          '署名鍵の Secret: 設定済み'
 
       - uses: actions/setup-node@v7
         with:
@@ -87,6 +109,10 @@ jobs:
 
       - name: インストーラをビルドする
         shell: pwsh
+        env:
+          # tauri.release.conf.json の createUpdaterArtifacts が、これで .sig を作る
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           # exe には依存クレートのソースの絶対パスが panic 位置として埋め込まれる
           # (手元のビルドなら C:\Users\<ユーザー名>\.cargo\...)。付け替えて、
@@ -102,13 +128,27 @@ jobs:
 
       - name: 成果物とハッシュを揃える
         shell: pwsh
+        env:
+          # 式を run に直接埋め込まない (スクリプトの注入を避ける定石)
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           $out = New-Item -ItemType Directory -Force release-assets
-          Copy-Item src-tauri/target/release/bundle/nsis/*-setup.exe $out
+          # .sig は自動更新の署名。latest.json に中身を写すが、ファイルとしても載せておく
+          Copy-Item src-tauri/target/release/bundle/nsis/*-setup.exe, src-tauri/target/release/bundle/nsis/*-setup.exe.sig $out
           if (Test-Path src-tauri/target/release/bundle/msi) {
-            Copy-Item src-tauri/target/release/bundle/msi/*.msi $out
+            Copy-Item src-tauri/target/release/bundle/msi/*.msi, src-tauri/target/release/bundle/msi/*.msi.sig $out
           }
           Copy-Item src-tauri/target/release-extras/THIRD_PARTY_NOTICES.txt $out
+          # 自動更新が読む latest.json。署名を tauri.conf.json の pubkey で確かめてから書く
+          # (別の鍵を Secret に入れていたら、ここで落ちて公開されない)。
+          # 予行演習 (手動実行) はタグが無いので、package.json の版から組み立てる。
+          $tag = if ($env:EVENT_NAME -eq 'push') { $env:REF_NAME } else {
+            'v' + (Get-Content package.json -Raw | ConvertFrom-Json).version
+          }
+          node scripts/updater-manifest.mjs --dir $out --tag $tag
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Content (Join-Path $out 'latest.json')
           # sha256sum -c でもそのまま使える書式 ("<ハッシュ>  <ファイル名>")
           Get-ChildItem $out -File | Sort-Object Name | ForEach-Object {
             '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
@@ -234,6 +274,8 @@ jobs:
             echo '  ```'
             echo
             echo "同梱している第三者ソフトウェアのライセンス表示は \`THIRD_PARTY_NOTICES.txt\` にあります (インストール先にも入ります)。"
+            echo
+            echo "\`latest.json\` と \`*.sig\` はアプリ内の自動更新が読むファイルです (手で使うものではありません)。"
             echo
             gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" -f tag_name="$TAG" --jq .body
           } > notes.md

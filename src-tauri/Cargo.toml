@@ -1,6 +1,6 @@
 [package]
 name = "nox-voice"
-version = "0.6.0"
+version = "0.7.0"
 description = "Windows 11 向け AI 音声入力常駐アプリ"
 authors = ["noxitro"]
 license = "MIT"
@@ -114,3 +114,8 @@ local-stt = ["dep:whisper-rs"]
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = "2.4.3"
+# アプリ内の自動更新 (updater.rs)。`~2.12` で minor を止めているのは、2.13 以降が
+# `tauri ^2.12` を要求するため。上げると tauri 本体が 2.12 へ上がり、JS 側
+# (@tauri-apps/api・cli は 2.11) と major.minor が食い違って tauri build が落ちる
+# (.github/dependabot.yml の注記と同じ事情)。Tauri を揃えて上げるときに一緒に外す。
+tauri-plugin-updater = "~2.12"

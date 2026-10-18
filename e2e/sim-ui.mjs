@@ -1870,6 +1870,284 @@ async function main() {
     };
   });
 
+  // --- U18〜U24: 整形の共通ルールとモデル選択 (2026-10-10)
+  //
+  // 既定文と候補は Rust の ConfigView が渡す。モックの既定文は**わざと本物と
+  // 違う文**にしてあるので、画面がどこかの写しを出していればここで落ちる。
+  await load(cdp);
+  await check("U18 保存値が空なら共通ルール欄に既定の文 (ConfigView) が出て、候補が datalist に入る", async () => {
+    const r = await cdp.run(`
+      document.querySelector('.nav-item[data-section="transcribe"]').click();
+      await new Promise((r) => setTimeout(r, 50));
+      const m = window.__NOX_MOCK__.config;
+      const rules = document.getElementById("format-rules");
+      const model = document.getElementById("format-model");
+      const groq = document.getElementById("groq-format-model");
+      return {
+        storedEmpty: m.format_rules === "",
+        rulesShowsDefault: rules.value === m.default_format_rules,
+        badgeHidden: document.getElementById("format-rules-modified").hidden,
+        maxLength: rules.maxLength,
+        count: document.getElementById("format-rules-count").textContent,
+        modelValue: model.value,
+        modelPlaceholder: model.placeholder,
+        groqPlaceholder: groq.placeholder,
+        geminiList: [...model.list.options].map((o) => [o.value, o.label]),
+        groqList: [...groq.list.options].map((o) => o.value),
+        defaultCodes: [...document.querySelectorAll("[data-default-model]")].map((c) => c.textContent),
+        r1WarningBeforeToggle:
+          document.getElementById("formatting-enabled").closest("label").previousElementSibling
+            ?.classList.contains("warn-block") ?? false,
+      };
+    `);
+    return {
+      ok:
+        r.storedEmpty &&
+        r.rulesShowsDefault &&
+        r.badgeHidden &&
+        r.maxLength === 8000 &&
+        /\/ 8,000 文字$/.test(r.count) &&
+        r.modelValue === "gemini-2.5-flash" &&
+        r.modelPlaceholder === "gemini-flash-lite-latest" &&
+        r.groqPlaceholder === "openai/gpt-oss-20b" &&
+        r.geminiList.length === 3 &&
+        r.geminiList[0][0] === "gemini-flash-lite-latest" &&
+        r.geminiList[0][1] === "既定・最速 (模擬)" &&
+        r.groqList.length === 3 &&
+        r.groqList[2] === "qwen/qwen3.8-27b" &&
+        JSON.stringify(r.defaultCodes) === JSON.stringify(["gemini-flash-lite-latest", "openai/gpt-oss-20b"]) &&
+        r.r1WarningBeforeToggle,
+      detail: JSON.stringify(r),
+    };
+  });
+
+  await check("U19 共通ルールを書き換えると「既定から変更あり」が出て、「既定に戻す」で既定の文に戻る (保存はしない)", async () => {
+    const r = await cdp.run(`
+      const m = window.__NOX_MOCK__;
+      const rules = document.getElementById("format-rules");
+      const badge = document.getElementById("format-rules-modified");
+      const savesBefore = m.count("set_config");
+      rules.value = "句読点だけ打つ。";
+      rules.dispatchEvent(new Event("input", { bubbles: true }));
+      const edited = { badgeHidden: badge.hidden, count: document.getElementById("format-rules-count").textContent };
+      // 末尾の改行だけの違いは「変更あり」にしない。
+      rules.value = m.config.default_format_rules + "\\n\\n";
+      rules.dispatchEvent(new Event("input", { bubbles: true }));
+      const trailingOnly = badge.hidden;
+      rules.value = "別の指示";
+      rules.dispatchEvent(new Event("input", { bubbles: true }));
+      document.getElementById("format-rules-reset").click();
+      return {
+        edited,
+        trailingOnly,
+        afterReset: rules.value === m.config.default_format_rules,
+        badgeAfterReset: badge.hidden,
+        focused: document.activeElement === rules,
+        saved: m.count("set_config") - savesBefore,
+      };
+    `);
+    return {
+      ok:
+        r.edited.badgeHidden === false &&
+        r.edited.count.startsWith("8 / ") &&
+        r.trailingOnly === true &&
+        r.afterReset &&
+        r.badgeAfterReset === true &&
+        r.focused &&
+        r.saved === 0,
+      detail: JSON.stringify(r),
+    };
+  });
+
+  await check("U20 保存で format_rules / format_model が送られ、往復後も画面に残る (既定と同じ文は空で保存される)", async () => {
+    const r = await cdp.run(`
+      const m = window.__NOX_MOCK__;
+      const rules = document.getElementById("format-rules");
+      const model = document.getElementById("format-model");
+      model.value = " models/gemini-3.5-flash-lite ";
+      rules.value = "句読点だけ打つ。\\r\\n言い換えない。";
+      document.getElementById("settings-form").requestSubmit();
+      await new Promise((r) => setTimeout(r, 250));
+      const first = {
+        patchRules: m.lastPatch.format_rules,
+        patchModel: m.lastPatch.format_model,
+        storedRules: m.config.format_rules,
+        shownRules: rules.value,
+        shownModel: model.value,
+        badge: document.getElementById("format-rules-modified").hidden,
+        note: document.getElementById("settings-note").textContent,
+      };
+      // 既定に戻して保存 → 保存値は空 (= 既定)、画面は既定の文。
+      document.getElementById("format-rules-reset").click();
+      model.value = "";
+      document.getElementById("settings-form").requestSubmit();
+      await new Promise((r) => setTimeout(r, 250));
+      return {
+        first,
+        second: {
+          patchRules: m.lastPatch.format_rules,
+          patchModel: m.lastPatch.format_model,
+          storedRules: m.config.format_rules,
+          storedModel: m.config.format_model,
+          shownRules: rules.value === m.config.default_format_rules,
+          badge: document.getElementById("format-rules-modified").hidden,
+        },
+      };
+    `);
+    const f = r.first;
+    const s = r.second;
+    return {
+      ok:
+        // textarea は CRLF を代入しても LF に揃えて持つ (HTML の仕様)。CRLF の
+        // 正規化そのものは Rust (config::tests) が見る。
+        f.patchRules === "句読点だけ打つ。\n言い換えない。" &&
+        f.patchModel === " models/gemini-3.5-flash-lite " &&
+        f.storedRules === "句読点だけ打つ。\n言い換えない。" &&
+        f.shownRules === "句読点だけ打つ。\n言い換えない。" &&
+        f.shownModel === "gemini-3.5-flash-lite" &&
+        f.badge === false &&
+        f.note === "保存しました" &&
+        s.patchRules === "既定ルール(模擬)\n【行うこと】\n- フィラーを削除する" &&
+        s.patchModel === "" &&
+        s.storedRules === "" &&
+        s.storedModel === "gemini-flash-lite-latest" &&
+        s.shownRules &&
+        s.badge === true,
+      detail: JSON.stringify(r),
+    };
+  });
+
+  await check("U21 「試す」: 処理中はボタンが全部止まり、成功で所要時間と整形結果が出る (入力中のモデル名とルールを送る)", async () => {
+    const r = await cdp.run(`
+      const m = window.__NOX_MOCK__;
+      m.delays.test_format_model = 300;
+      const model = document.getElementById("format-model");
+      const rules = document.getElementById("format-rules");
+      model.value = "gemini-flash-latest";
+      rules.value = "試す用のルール";
+      rules.dispatchEvent(new Event("input", { bubbles: true }));
+      const before = m.count("test_format_model");
+      document.getElementById("format-model-test").click();
+      await new Promise((r) => setTimeout(r, 60));
+      const box = document.getElementById("format-model-result");
+      const ids = ["format-model-test", "groq-format-model-test", "format-rules-test"];
+      const busy = {
+        disabled: ids.map((id) => document.getElementById(id).disabled),
+        state: box.dataset.state,
+        text: box.textContent,
+        hidden: box.hidden,
+        live: box.getAttribute("aria-live"),
+      };
+      // 処理中に別の「試す」を押しても 2 本目は走らない。
+      document.getElementById("groq-format-model-test").click();
+      await new Promise((r) => setTimeout(r, 450));
+      delete m.delays.test_format_model;
+      return {
+        busy,
+        calls: m.count("test_format_model") - before,
+        args: m.lastArgs("test_format_model"),
+        state: box.dataset.state,
+        head: box.querySelector(".model-test-head")?.textContent,
+        output: box.querySelector(".model-test-output")?.textContent,
+        enabled: ids.map((id) => !document.getElementById(id).disabled),
+        savedDuringTest: m.lastPatch?.format_model === "gemini-flash-latest",
+      };
+    `);
+    return {
+      ok:
+        r.busy.disabled.every(Boolean) &&
+        r.busy.state === "busy" &&
+        r.busy.text.includes("処理中") &&
+        r.busy.hidden === false &&
+        r.busy.live === "polite" &&
+        r.calls === 1 &&
+        r.args.provider === "gemini" &&
+        r.args.model === "gemini-flash-latest" &&
+        r.args.rules === "試す用のルール" &&
+        r.state === "ok" &&
+        r.head === "成功: 所要 812 ms(gemini-flash-latest)" &&
+        r.output === "明後日の会議の資料の準備をお願いします。" &&
+        r.enabled.every(Boolean) &&
+        r.savedDuringTest === false,
+      detail: JSON.stringify(r),
+    };
+  });
+
+  await check("U22 「試す」: API が断ったら失敗と理由が出る (控えは Groq の名前で)", async () => {
+    const r = await cdp.run(`
+      const m = window.__NOX_MOCK__;
+      document.getElementById("groq-format-model").value = "openai/bad-model";
+      document.getElementById("groq-format-model-test").click();
+      await new Promise((r) => setTimeout(r, 150));
+      const box = document.getElementById("groq-format-model-result");
+      return {
+        args: m.lastArgs("test_format_model"),
+        state: box.dataset.state,
+        head: box.querySelector(".model-test-head")?.textContent,
+        body: box.querySelector(".model-test-body")?.textContent,
+        hasOutput: Boolean(box.querySelector(".model-test-output")),
+      };
+    `);
+    return {
+      ok:
+        r.args.provider === "groq" &&
+        r.args.model === "openai/bad-model" &&
+        r.state === "fail" &&
+        r.head === "失敗: 所要 321 ms(openai/bad-model)" &&
+        r.body === "Groq がエラーを返しました (404)" &&
+        r.hasOutput === false,
+      detail: JSON.stringify(r),
+    };
+  });
+
+  await check("U23 「この指示で試す」: IPC が失敗しても理由を出し、ボタンが戻る", async () => {
+    await load(cdp, "?fail=test_format_model");
+    const r = await cdp.run(`
+      document.querySelector('.nav-item[data-section="transcribe"]').click();
+      await new Promise((r) => setTimeout(r, 50));
+      document.getElementById("format-rules-test").click();
+      await new Promise((r) => setTimeout(r, 150));
+      const box = document.getElementById("format-rules-result");
+      return {
+        args: window.__NOX_MOCK__.lastArgs("test_format_model"),
+        state: box.dataset.state,
+        text: box.textContent,
+        enabled: !document.getElementById("format-rules-test").disabled,
+      };
+    `);
+    return {
+      ok:
+        r.args.provider === "gemini" &&
+        r.args.rules === "既定ルール(模擬)\n【行うこと】\n- フィラーを削除する" &&
+        r.state === "fail" &&
+        r.text.includes("試せませんでした") &&
+        r.enabled,
+      detail: JSON.stringify(r),
+    };
+  });
+
+  await check("U24 設定を読めなかったときは、空の共通ルールで利用者のルールを上書きしない", async () => {
+    await load(cdp, "?fail=get_config");
+    const r = await cdp.run(`
+      const m = window.__NOX_MOCK__;
+      m.lastPatch = null;
+      // 保存前は空欄 (既定文すら届いていない)。保存の応答で描き直されるので、
+      // 押す前に読む。
+      const rulesValue = document.getElementById("format-rules").value;
+      document.getElementById("settings-form").requestSubmit();
+      await new Promise((r) => setTimeout(r, 250));
+      return {
+        rulesValue,
+        sent: m.lastPatch ? "format_rules" in m.lastPatch : null,
+        note: document.getElementById("settings-note").textContent,
+      };
+    `);
+    return {
+      ok: r.rulesValue === "" && r.sent === false && r.note.includes("共通ルールは読み込めていない"),
+      detail: JSON.stringify(r),
+    };
+  });
+
   const failed = results.filter((r) => r.verdict === "FAIL");
   console.log(`\n=== PASS ${results.length - failed.length} / FAIL ${failed.length} (全 ${results.length}) ===`);
   console.log("疑似テストなので、緑でも実機 E2E (e2e/hotkey.mjs) の代わりにはならない。");
