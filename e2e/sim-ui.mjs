@@ -888,6 +888,137 @@ async function main() {
     };
   });
 
+  // --- U16f〜h: 取り消しキーも他のホットキーと同じ操作で変えられる
+  //
+  // 許可規則がホットキーと違う (Esc・Enter・文字キーも選べる) ので、一覧は
+  // 取り消しキー用の判定を読む必要がある。ホットキー用の判定を読むと
+  // Esc へ戻せなくなる。宛先の取り違えで録音キーが変わらないことも見る。
+  await check("U16f 取り消しキーを一覧から選べる (ホットキーでは選べない Enter・Esc も選べる)", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      const picker = document.getElementById("cancel-key-picker");
+      document.getElementById("cancel-key-pick").click();
+      await new Promise((r) => setTimeout(r, 200));
+      const cat = (re) => [...picker.querySelectorAll(".picker-cat")].find((b) => re.test(b.textContent)).click();
+      const key = (name) => [...picker.querySelectorAll(".picker-key")].find((b) => b.textContent === name);
+      cat(/編集/);
+      await new Promise((r) => setTimeout(r, 120));
+      const usable = {
+        enter: key("Enter").getAttribute("aria-disabled"),
+        esc: key("Esc").getAttribute("aria-disabled"),
+        hint: picker.querySelector(".picker-cat-hint").textContent,
+      };
+      cat(/IME/);
+      await new Promise((r) => setTimeout(r, 120));
+      key("半角/全角").click();
+      await new Promise((r) => setTimeout(r, 120));
+      const refused = {
+        disabled: key("半角/全角").getAttribute("aria-disabled"),
+        note: picker.querySelector(".picker-note").textContent,
+        applyDisabled: picker.querySelector(".picker-apply").disabled,
+      };
+      cat(/F キー/);
+      await new Promise((r) => setTimeout(r, 120));
+      key("F13").click();
+      await new Promise((r) => setTimeout(r, 200));
+      picker.querySelector(".picker-apply").click();
+      await new Promise((r) => setTimeout(r, 300));
+      return {
+        usable,
+        refused,
+        sent: window.__NOX_MOCK__.lastArgs("set_hotkey_from_list"),
+        label: document.getElementById("cancel-key-label").textContent,
+        home: document.getElementById("home-cancel").textContent,
+        injectLabel: document.getElementById("hotkey-label").textContent,
+        closed: picker.hidden,
+      };
+    `);
+    return {
+      ok:
+        r.usable.enter === null &&
+        r.usable.esc === null &&
+        /入力先/.test(r.usable.hint) &&
+        r.refused.disabled === "true" &&
+        /キーコード/.test(r.refused.note) &&
+        r.refused.applyDisabled === true &&
+        r.sent?.mode === "cancel" &&
+        r.sent?.vk === 0x7c &&
+        r.label === "F13" &&
+        r.home === "F13" &&
+        r.injectLabel === "左 Ctrl + Space" &&
+        r.closed === true,
+      detail: JSON.stringify(r),
+    };
+  });
+
+  await check("U16g 取り消しキーの捕獲は Esc も設定でき、録音キーを書き換えない", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      const fire = (type, code) =>
+        window.dispatchEvent(new KeyboardEvent(type, { code, bubbles: true, cancelable: true }));
+      const label = document.getElementById("cancel-key-label");
+      const capture = async (code) => {
+        document.getElementById("cancel-key-capture").click();
+        await new Promise((r) => setTimeout(r, 200));
+        fire("keydown", code);
+        await new Promise((r) => setTimeout(r, 120));
+        fire("keyup", code);
+        await new Promise((r) => setTimeout(r, 300));
+        return { label: label.textContent, capturing: label.dataset.capturing };
+      };
+      const first = await capture("F9");
+      const second = await capture("Escape");
+      return {
+        first,
+        second,
+        codes: window.__NOX_MOCK__.invokes.filter((c) => c.cmd === "finish_hotkey_capture").map((c) => c.args.codes),
+        modes: window.__NOX_MOCK__.invokes.filter((c) => c.cmd === "start_hotkey_capture").map((c) => c.args.mode),
+        cancels: window.__NOX_MOCK__.count("cancel_hotkey_capture"),
+        injectLabel: document.getElementById("hotkey-label").textContent,
+      };
+    `);
+    return {
+      ok:
+        r.first.label === "F9" &&
+        r.first.capturing === undefined &&
+        // Esc は捕獲の中止にならず、設定値として Rust へ届く。
+        r.second.label === "Esc" &&
+        r.cancels === 0 &&
+        JSON.stringify(r.codes) === JSON.stringify([["F9"], ["Escape"]]) &&
+        JSON.stringify(r.modes) === JSON.stringify(["cancel", "cancel"]) &&
+        r.injectLabel === "左 Ctrl + Space",
+      detail: JSON.stringify(r),
+    };
+  });
+
+  await check("U16h 取り消しキーを解除すると未設定になり、ホームの案内も消える", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      const clear = document.getElementById("cancel-key-clear");
+      const hint = document.getElementById("home-cancel-hint");
+      const before = { disabled: clear.disabled, hint: hint.hidden };
+      clear.click();
+      await new Promise((r) => setTimeout(r, 250));
+      return {
+        before,
+        sent: window.__NOX_MOCK__.lastArgs("clear_hotkey"),
+        label: document.getElementById("cancel-key-label").textContent,
+        disabled: clear.disabled,
+        hint: hint.hidden,
+      };
+    `);
+    return {
+      ok:
+        r.before.disabled === false &&
+        r.before.hint === false &&
+        r.sent?.mode === "cancel" &&
+        r.label === "未設定" &&
+        r.disabled === true &&
+        r.hint === true,
+      detail: JSON.stringify(r),
+    };
+  });
+
   // --- U16e: キーボードだけで一覧を使い切れる (2026-08-31 のレビュー指摘)
   //
   // 選ぶたびにキーのボタンを作り直していると、**Tab で辿り着いて Enter を

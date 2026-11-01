@@ -127,6 +127,8 @@
           hotkey_vk: 0x20,
           hotkey_mods: [0xa2],
           hotkey_label: "左 Ctrl + Space",
+          cancel_vk: 0x1b,
+          cancel_mods: [],
           cancel_label: "Esc",
           clipboard_hotkey_vk: 0,
           clipboard_hotkey_mods: [],
@@ -297,6 +299,7 @@
             AltLeft: "左 Alt",
             Space: "Space",
             Enter: "Enter",
+            Escape: "Esc",
           };
           return codes
             .map((c) => names[c] ?? (/^F([1-9]|1\d|2[0-4])$/.test(c) ? c : `VK ${c}`))
@@ -312,29 +315,36 @@
          * - F13 = 単独で選べる (この機能の存在理由。物理キーが無い)
          * - Space = 修飾キーを足したときだけ選べる (状態遷移の検査用)
          * - A = どうやっても選べない (理由を出す経路の検査用)
+         * - Esc = 取り消しキーにだけ選べる / 半角/全角 = 取り消しキーにも選べない
          * 規則の正しさは Rust の hotkey::tests が見る。 */
         const hotkeyKeyList = {
           max_mods: 3,
           categories: [
-            { id: "modifier", label: "修飾キー (左右を区別)", hint: "単独でも組み合わせにも" },
-            { id: "function", label: "F キー (F1〜F24)", hint: "F13〜F24 は衝突しません" },
-            { id: "edit", label: "編集・移動キー", hint: "" },
-            { id: "alnum", label: "英数字", hint: "" },
+            { id: "modifier", label: "修飾キー (左右を区別)", hint: "単独でも組み合わせにも", cancel_hint: "単独でも組み合わせにも" },
+            { id: "function", label: "F キー (F1〜F24)", hint: "F13〜F24 は衝突しません", cancel_hint: "F13〜F24 は衝突しません" },
+            { id: "edit", label: "編集・移動キー", hint: "", cancel_hint: "録音中に押したキーは入力先アプリにも届きます" },
+            { id: "ime", label: "IME・ロック系", hint: "", cancel_hint: "" },
+            { id: "alnum", label: "英数字", hint: "文字キーは選べません", cancel_hint: "録音中に押した文字は入力先アプリにも入力されます" },
           ],
           keys: [
-            { vk: 0xa2, label: "左 Ctrl", category: "modifier", alone: true, with_mods: true, is_modifier: true, note: "" },
-            { vk: 0xa0, label: "左 Shift", category: "modifier", alone: true, with_mods: true, is_modifier: true, note: "" },
-            { vk: 0xa5, label: "右 Alt", category: "modifier", alone: true, with_mods: true, is_modifier: true, note: "" },
-            { vk: 0x5b, label: "左 Win", category: "modifier", alone: true, with_mods: true, is_modifier: true, note: "" },
-            { vk: 0x70, label: "F1", category: "function", alone: true, with_mods: true, is_modifier: false, note: "" },
-            { vk: 0x7c, label: "F13", category: "function", alone: true, with_mods: true, is_modifier: false, note: "" },
-            { vk: 0x7d, label: "F14", category: "function", alone: true, with_mods: true, is_modifier: false, note: "" },
+            { vk: 0xa2, label: "左 Ctrl", category: "modifier", alone: true, with_mods: true, is_modifier: true, note: "", cancel: true, cancel_note: "" },
+            { vk: 0xa0, label: "左 Shift", category: "modifier", alone: true, with_mods: true, is_modifier: true, note: "", cancel: true, cancel_note: "" },
+            { vk: 0xa5, label: "右 Alt", category: "modifier", alone: true, with_mods: true, is_modifier: true, note: "", cancel: true, cancel_note: "" },
+            { vk: 0x5b, label: "左 Win", category: "modifier", alone: true, with_mods: true, is_modifier: true, note: "", cancel: true, cancel_note: "" },
+            { vk: 0x70, label: "F1", category: "function", alone: true, with_mods: true, is_modifier: false, note: "", cancel: true, cancel_note: "" },
+            { vk: 0x7c, label: "F13", category: "function", alone: true, with_mods: true, is_modifier: false, note: "", cancel: true, cancel_note: "" },
+            { vk: 0x7d, label: "F14", category: "function", alone: true, with_mods: true, is_modifier: false, note: "", cancel: true, cancel_note: "" },
             { vk: 0x20, label: "Space", category: "edit", alone: false, with_mods: true, is_modifier: false,
-              note: "修飾キー (Ctrl / Alt / Shift / Win) を 1 つ以上選ぶと使えます" },
+              note: "修飾キー (Ctrl / Alt / Shift / Win) を 1 つ以上選ぶと使えます", cancel: true, cancel_note: "" },
             { vk: 0x0d, label: "Enter", category: "edit", alone: false, with_mods: false, is_modifier: false,
-              note: "押している間ずっと入力先アプリへ流れ続けるため、ホットキーには選べません" },
+              note: "押している間ずっと入力先アプリへ流れ続けるため、ホットキーには選べません", cancel: true, cancel_note: "" },
+            { vk: 0x1b, label: "Esc", category: "edit", alone: false, with_mods: false, is_modifier: false,
+              note: "Esc はキー設定の中止と録音の取り消しに使うため、ホットキーには選べません", cancel: true, cancel_note: "" },
+            { vk: 0xf3, label: "半角/全角", category: "ime", alone: false, with_mods: false, is_modifier: false,
+              note: "このキーは押すたびに別のキーコードを送るため、確実に発火しません",
+              cancel: false, cancel_note: "このキーは押すたびに別のキーコードを送るため、確実に発火しません" },
             { vk: 0x41, label: "A", category: "alnum", alone: false, with_mods: false, is_modifier: false,
-              note: "押している間ずっと入力先アプリへ流れ続けるため、ホットキーには選べません" },
+              note: "押している間ずっと入力先アプリへ流れ続けるため、ホットキーには選べません", cancel: true, cancel_note: "" },
           ],
         };
 
@@ -450,6 +460,8 @@
             case "list_sound_presets":
               return Promise.resolve(structuredClone(presets));
             case "start_hotkey_capture":
+              // 確定の宛先を Rust の capture_slot と同じく覚えておく。
+              mock.captureMode = args.mode ?? "inject";
               return Promise.resolve(10);
             case "cancel_hotkey_capture":
               return Promise.resolve();
@@ -472,8 +484,10 @@
               //
               // Enter は「押しっぱなしで入力先へ流れる」、Space 単独は
               // `is_allowed_hotkey` が許さない。どちらも Rust が拒否する代表例。
+              const cancelTarget = mock.captureMode === "cancel";
               const rejected =
-                codes.includes("Enter") ? "Enter"
+                cancelTarget ? null
+                : codes.includes("Enter") ? "Enter"
                 : codes.length === 1 && codes[0] === "Space" ? "Space"
                 : null;
               if (rejected) {
@@ -483,7 +497,9 @@
                 });
               }
               const label = describeCodes(codes);
-              mock.config.hotkey_label = label;
+              // 宛先を見ずに hotkey_label へ書くと、「取り消しキーの捕獲が
+              // 録音キーを書き換えた」を検査できない。
+              mock.config[cancelTarget ? "cancel_label" : "hotkey_label"] = label;
               mock.emit("nox://hotkey-captured", { label });
               return Promise.resolve({ verdict: "accepted" });
             }
@@ -502,7 +518,11 @@
                 (m) => m !== vk && hotkeyKeyList.keys.find((k) => k.vk === m)?.is_modifier,
               );
               const key = hotkeyKeyList.keys.find((k) => k.vk === vk);
-              const usable = key && (mods.length > 0 ? key.with_mods : key.alone);
+              const usable =
+                key &&
+                (args.mode === "cancel"
+                  ? key.cancel
+                  : mods.length > 0 ? key.with_mods : key.alone);
               if (!usable) {
                 return Promise.resolve({
                   verdict: "invalid",
@@ -513,6 +533,7 @@
                 inject: "hotkey",
                 clipboard_only: "clipboard_hotkey",
                 screen_ask: "screen_ask_hotkey",
+                cancel: "cancel",
               }[args.mode ?? "inject"];
               // 他用途との重複は Rust の `Config::normalize` が解消する。
               // **そのとき旧い割り当ても残らない** — normalize は該当用途の
@@ -564,11 +585,17 @@
                 reason: null,
               });
             }
-            case "clear_hotkey":
-              mock.config.clipboard_hotkey_vk = 0;
-              mock.config.clipboard_hotkey_mods = [];
-              mock.config.clipboard_hotkey_label = "";
+            case "clear_hotkey": {
+              const target = {
+                clipboard_only: "clipboard_hotkey",
+                screen_ask: "screen_ask_hotkey",
+                cancel: "cancel",
+              }[args.mode];
+              mock.config[`${target}_vk`] = 0;
+              mock.config[`${target}_mods`] = [];
+              mock.config[`${target}_label`] = "";
               return Promise.resolve(structuredClone(mock.config));
+            }
             default:
               // 未知のコマンドは黙って成功させない。Rust 側に無い名前を
               // 呼んでいたら、そこで気づけるようにする。

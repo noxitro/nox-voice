@@ -231,6 +231,48 @@ impl HotkeyMode {
     }
 }
 
+/// キー設定 (捕獲・一覧選択・解除) の宛先。
+///
+/// キャンセルキーを [`HotkeyMode`] の 4 つ目にしないのは、あちらが
+/// 「押すと録音が始まる用途」だから。スロット配列 ([`HOTKEY_COMBOS`] など) に
+/// 混ぜると、`Press` の解釈や録音の分岐まで全部がキャンセルを気にすることになる。
+/// 設定 UI から見たときだけ同列なので、その入口だけをこの型でそろえる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyTarget {
+    Hotkey(HotkeyMode),
+    Cancel,
+}
+
+impl KeyTarget {
+    /// 捕獲中の宛先を atomic 1 本で持つための番号。
+    pub const fn slot(self) -> usize {
+        match self {
+            KeyTarget::Hotkey(mode) => mode.slot(),
+            KeyTarget::Cancel => HOTKEY_SLOTS,
+        }
+    }
+
+    /// [`Self::slot`] の逆。
+    ///
+    /// **[`HotkeyMode::from_slot`] へ直接渡さない**こと。あちらは範囲外を
+    /// `Inject` に倒すので、取り消しキーの捕獲が録音キーを書き換えてしまう。
+    pub const fn from_slot(slot: usize) -> Self {
+        if slot == HOTKEY_SLOTS {
+            KeyTarget::Cancel
+        } else {
+            KeyTarget::Hotkey(HotkeyMode::from_slot(slot))
+        }
+    }
+
+    /// ログに出す日本語名。
+    pub fn label(self) -> &'static str {
+        match self {
+            KeyTarget::Hotkey(mode) => mode.label(),
+            KeyTarget::Cancel => "取り消し",
+        }
+    }
+}
+
 /// 現在のホットキー (用途ごと)。設定から差し替えられる。**0 は未設定**。
 ///
 /// フックは 1 度しか設置しない (再設置は OS 全体の入力経路を触り直すことになる)。
@@ -284,10 +326,19 @@ static SUPPRESS_UNTIL_RELEASE: [AtomicU32; SUPPRESS_SLOTS] =
 /// キャンセル専用としては「取り消し」の意味がそのまま生きる。
 pub const DEFAULT_CANCEL_VK: u32 = 0x1B;
 
+/// 既定のキャンセルキーを 1 本の `u64` へ詰めた値 (static 初期化用の定数式)。
+const PACKED_DEFAULT_CANCEL: u64 = (DEFAULT_CANCEL_VK as u64) << 48;
+
 /// 現在のキャンセルキー (0 = 無効)。設定から差し替えられる。
-static CANCEL_VK: AtomicU32 = AtomicU32::new(DEFAULT_CANCEL_VK);
+///
+/// ホットキーと同じく組み合わせを持てる ([`HOTKEY_COMBOS`] と同じ詰め方)。
+/// ただし用途 ([`HotkeyMode`]) ではない: 発火しても録音は始まらず、
+/// 押している間という概念も無い。キー設定の宛先としては [`KeyTarget`] で区別する。
+static CANCEL_COMBO: AtomicU64 = AtomicU64::new(PACKED_DEFAULT_CANCEL);
 /// キャンセルキーの押下状態。オートリピート除去用 ([`KEY_IS_DOWN`] と同じ手法)。
 static CANCEL_IS_DOWN: AtomicBool = AtomicBool::new(false);
+/// キャンセルキーの修飾キーの押下状態 ([`MODS_DOWN`] と同じ形)。
+static CANCEL_MODS_DOWN: AtomicU32 = AtomicU32::new(0);
 /// 録音中のみ立てる。キャンセルキーは録音中しか効かない (武装フラグ)。
 static RECORDING_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -316,12 +367,16 @@ pub fn mode_hotkey(mode: HotkeyMode) -> Option<HotkeyCombo> {
     (raw != 0).then(|| unpack_combo(raw))
 }
 
-/// キャンセルキーを差し替える (0 = 無効)。フックの再設置は不要。
-pub fn set_cancel_vk(vk: u32) {
-    CANCEL_VK.store(vk, Ordering::SeqCst);
+/// キャンセルキーを差し替える。`None` で無効化。フックの再設置は不要。
+pub fn set_cancel_combo(combo: Option<HotkeyCombo>) {
+    CANCEL_COMBO.store(combo.as_ref().map_or(0, pack_combo), Ordering::SeqCst);
     // 押しっぱなしの状態が残っていると、次の離しだけが届いて状態がねじれる。
     CANCEL_IS_DOWN.store(false, Ordering::SeqCst);
-    log::info!("キャンセルキーを変更: {} (VK 0x{vk:02X})", key_label(vk));
+    CANCEL_MODS_DOWN.store(0, Ordering::SeqCst);
+    match combo {
+        Some(combo) => log::info!("キャンセルキーを変更: {} ({combo:?})", combo.label()),
+        None => log::info!("キャンセルキーを無効化"),
+    }
 }
 
 /// 録音の有無をフックへ教える。**録音中のみ**キャンセルキーが効く。
@@ -692,14 +747,7 @@ pub fn sanitize_combo(mods: &[u32], vk: u32) -> Option<HotkeyCombo> {
     if vk == 0 || vk > 0xFF {
         return None;
     }
-    let mut cleaned: Vec<u32> = mods
-        .iter()
-        .copied()
-        .filter(|m| is_modifier(*m) && *m != vk)
-        .collect();
-    cleaned.sort_by_key(|m| (modifier_order(*m), *m));
-    cleaned.dedup();
-    cleaned.truncate(MAX_HOTKEY_MODS);
+    let cleaned = clean_mods(mods, vk);
 
     let trigger_is_valid = if cleaned.is_empty() {
         // 単独キーは従来基準 (押しっぱなしで実害が出ないキーのみ)。
@@ -710,10 +758,51 @@ pub fn sanitize_combo(mods: &[u32], vk: u32) -> Option<HotkeyCombo> {
     if !trigger_is_valid {
         return None;
     }
+    Some(combo_from_cleaned(&cleaned, vk))
+}
 
+/// 設定値を正規化されたキャンセルキーへ組み立てる。無効なら `None`。
+///
+/// 正規化は [`sanitize_combo`] と同じで、トリガーの基準だけが違う
+/// ([`is_allowed_cancel_vk`])。修飾キーの有無で基準は変わらない。
+pub fn sanitize_cancel_combo(mods: &[u32], vk: u32) -> Option<HotkeyCombo> {
+    if !is_allowed_cancel_vk(vk) {
+        return None;
+    }
+    Some(combo_from_cleaned(&clean_mods(mods, vk), vk))
+}
+
+/// 修飾子リストから非修飾キー・重複・トリガー自身を除き、表示順に並べる。
+fn clean_mods(mods: &[u32], vk: u32) -> Vec<u32> {
+    let mut cleaned: Vec<u32> = mods
+        .iter()
+        .copied()
+        .filter(|m| is_modifier(*m) && *m != vk)
+        .collect();
+    cleaned.sort_by_key(|m| (modifier_order(*m), *m));
+    cleaned.dedup();
+    cleaned.truncate(MAX_HOTKEY_MODS);
+    cleaned
+}
+
+/// [`clean_mods`] 済みの修飾子から組み立てる。
+fn combo_from_cleaned(cleaned: &[u32], vk: u32) -> HotkeyCombo {
     let mut arr = [0u32; MAX_HOTKEY_MODS];
-    arr[..cleaned.len()].copy_from_slice(&cleaned);
-    Some(HotkeyCombo { mods: arr, vk })
+    arr[..cleaned.len()].copy_from_slice(cleaned);
+    HotkeyCombo { mods: arr, vk }
+}
+
+/// キャンセルキーと録音用ホットキーが同時に押されることになるか。
+///
+/// 次のどれかなら衝突とする:
+/// - トリガーが同じ、またはキャンセルのトリガーがホットキーの修飾キー:
+///   録音操作とキャンセルが同時に起こる
+/// - ホットキーのトリガーがキャンセルの修飾キー: トグル録音中にその修飾キーを
+///   押した時点で録音が止まり、キャンセルする相手がいなくなる
+///
+/// 修飾キー同士の重なりは衝突にしない (左 Ctrl + Space と左 Ctrl + Z は両立する)。
+pub fn cancel_clashes_with(cancel: &HotkeyCombo, hotkey: &HotkeyCombo) -> bool {
+    cancel.vk == hotkey.vk || hotkey.mods.contains(&cancel.vk) || cancel.mods.contains(&hotkey.vk)
 }
 
 // --- 一覧から選ぶ (2026-08-31) ----------------------------------------------
@@ -742,6 +831,9 @@ pub struct HotkeyKeyCategory {
     pub label: &'static str,
     /// そのカテゴリを開いた人への一言 (空なら出さない)。
     pub hint: &'static str,
+    /// 取り消しキーを選んでいるときの一言。許可規則が違うので [`Self::hint`] は
+    /// 使えない (「文字キーは選べません」が嘘になる)。
+    pub cancel_hint: &'static str,
 }
 
 /// 一覧に出す 1 キー分。
@@ -768,6 +860,10 @@ pub struct HotkeyKeyOption {
     /// **灰色にするだけにしない**ための文言。「なぜ Enter が選べないのか」に
     /// 答えられないと、利用者は壊れていると解釈して押し続ける。
     pub note: String,
+    /// 取り消しキーに選べるか ([`is_allowed_cancel_vk`])。修飾キーの有無によらない。
+    pub cancel: bool,
+    /// 取り消しキーに選べないときの理由 (選べるなら空)。
+    pub cancel_note: String,
 }
 
 const CAT_MODIFIER: &str = "modifier";
@@ -791,36 +887,43 @@ pub fn hotkey_key_categories() -> Vec<HotkeyKeyCategory> {
             id: CAT_MODIFIER,
             label: "修飾キー (左右を区別)",
             hint: "単独でも、組み合わせの一部にも使えます",
+            cancel_hint: "単独でも、組み合わせの一部にも使えます",
         },
         HotkeyKeyCategory {
             id: CAT_FUNCTION,
             label: "F キー (F1〜F24)",
             hint: "F13〜F24 は物理キーボードに無い分、他アプリと衝突しません (ペダル向き)",
+            cancel_hint: "F13〜F24 は物理キーボードに無い分、他アプリと衝突しません (ペダル向き)",
         },
         HotkeyKeyCategory {
             id: CAT_NUMPAD,
             label: "テンキー",
             hint: "修飾キーと組み合わせたときだけ選べます",
+            cancel_hint: "",
         },
         HotkeyKeyCategory {
             id: CAT_EDIT,
             label: "編集・移動キー",
             hint: "Space 以外は、押している間ずっと入力先へ流れるため選べません",
+            cancel_hint: "録音中に押したキーは入力先アプリにも届きます",
         },
         HotkeyKeyCategory {
             id: CAT_IME,
             label: "IME・ロック系",
             hint: "",
+            cancel_hint: "",
         },
         HotkeyKeyCategory {
             id: CAT_ALNUM,
             label: "英数字",
             hint: "文字キーは Ctrl+S のような既存の操作を奪うため、このアプリでは選べません",
+            cancel_hint: "録音中に押した文字は入力先アプリにも入力されます",
         },
         HotkeyKeyCategory {
             id: CAT_OTHER,
             label: "その他",
             hint: "",
+            cancel_hint: "",
         },
     ]
 }
@@ -832,7 +935,7 @@ pub fn hotkey_key_categories() -> Vec<HotkeyKeyCategory> {
 /// Esc に「入力先へ流れる」と書いても嘘になり、利用者は納得できない。
 fn unusable_reason(vk: u32) -> String {
     match vk {
-        ESCAPE_VK => "Esc は設定の取り消しと録音のキャンセルに使うため、ホットキーには選べません"
+        ESCAPE_VK => "Esc はキー設定の中止と録音の取り消しに使うため、ホットキーには選べません"
             .to_string(),
         // 押すたびに別の VK が来るキー。片方だけ登録すると 2 回に 1 回しか
         // 効かない ([`is_allowed_hotkey`] の doc)。
@@ -851,6 +954,7 @@ fn unusable_reason(vk: u32) -> String {
 fn key_option(vk: u32, category: &'static str) -> HotkeyKeyOption {
     let alone = is_allowed_hotkey(vk);
     let with_mods = is_allowed_combo_key(vk);
+    let cancel = is_allowed_cancel_vk(vk);
     HotkeyKeyOption {
         vk,
         label: key_label(vk),
@@ -866,6 +970,12 @@ fn key_option(vk: u32, category: &'static str) -> HotkeyKeyOption {
                 // それを解く方法が同じ 1 文に入っている必要がある。
                 "修飾キー (Ctrl / Alt / Shift / Win) を 1 つ以上選ぶと使えます".to_string()
             }
+        } else {
+            unusable_reason(vk)
+        },
+        cancel,
+        cancel_note: if cancel {
+            String::new()
         } else {
             unusable_reason(vk)
         },
@@ -1194,6 +1304,16 @@ fn interpret_key(vk: u32, is_down: bool, source: KeySource) {
         }
         combos[slot] = Some(combo);
     }
+    // キャンセルキーの修飾キーも同じ理由で常に追跡する。
+    let cancel_raw = CANCEL_COMBO.load(Ordering::SeqCst);
+    let cancel = (cancel_raw != 0).then(|| unpack_combo(cancel_raw));
+    if let Some(bit) = cancel.and_then(|combo| combo.mod_bit(vk)) {
+        if is_down {
+            CANCEL_MODS_DOWN.fetch_or(1 << bit, Ordering::SeqCst);
+        } else {
+            CANCEL_MODS_DOWN.fetch_and(!(1 << bit), Ordering::SeqCst);
+        }
+    }
 
     // 捕獲モード中は、キーを一切解釈せずに捨てる。
     //
@@ -1217,19 +1337,23 @@ fn interpret_key(vk: u32, is_down: bool, source: KeySource) {
 
     // 録音中のキャンセルキー。押下で Cancel を 1 回だけ報告し、離しで状態を戻す。
     // ホットキー経路の前に判定する (録音中は PTT の解釈より破棄が優先)。
-    let cancel_vk = CANCEL_VK.load(Ordering::SeqCst);
-    if cancel_vk != 0 && vk == cancel_vk && RECORDING_ACTIVE.load(Ordering::SeqCst) {
-        if is_down {
-            // オートリピートの連打を 1 回の押下に畳む。
-            if !CANCEL_IS_DOWN.swap(true, Ordering::SeqCst) {
-                send(HotkeyEvent::new(HotkeyEventKind::Cancel));
+    if let Some(cancel) = cancel {
+        if vk == cancel.vk && RECORDING_ACTIVE.load(Ordering::SeqCst) {
+            // キー自体は抑制しない。Esc は挿入先アプリでも「取り消し」として
+            // 働くべきなので、そのまま流す (CallNextHookEx は呼び出し側で必ず通る)。
+            if !is_down {
+                CANCEL_IS_DOWN.store(false, Ordering::SeqCst);
+                return;
             }
-        } else {
-            CANCEL_IS_DOWN.store(false, Ordering::SeqCst);
+            // 修飾キーが足りない押下はキャンセルではない。ただの打鍵として通す。
+            if cancel.mods_are_down(CANCEL_MODS_DOWN.load(Ordering::SeqCst)) {
+                // オートリピートの連打を 1 回の押下に畳む。
+                if !CANCEL_IS_DOWN.swap(true, Ordering::SeqCst) {
+                    send(HotkeyEvent::new(HotkeyEventKind::Cancel));
+                }
+                return;
+            }
         }
-        // キー自体は抑制しない。Esc は挿入先アプリでも「取り消し」として
-        // 働くべきなので、そのまま流す (CallNextHookEx は呼び出し側で必ず通る)。
-        return;
     }
 
     // どのスロットのトリガーでもなければ、これ以上見る必要がない。
@@ -1923,6 +2047,50 @@ pub fn decide_capture_combo(keys: &[u32]) -> CaptureOutcome {
             return CaptureOutcome::Rejected(key_label(*vk));
         }
     }
+    let (mods, trigger) = match split_captured_keys(keys) {
+        Ok(split) => split,
+        Err(outcome) => return outcome,
+    };
+
+    match sanitize_combo(&mods, trigger) {
+        Some(combo) => CaptureOutcome::Accept(combo),
+        None => CaptureOutcome::Rejected(key_label(trigger)),
+    }
+}
+
+/// 取り消しキーの捕獲で、捕獲したキーの集合をどう扱うか決める。
+///
+/// [`decide_capture_combo`] との違いは 2 つ。許可規則が [`is_allowed_cancel_vk`]
+/// であること、**Esc が「捕獲の中止」ではなく採用できるキー**であること。
+/// 別のキーへ変えた人が Esc へ戻す操作を、押して行えないのは不自然なので。
+/// 中止は捕獲中の「キャンセル」ボタンかタイムアウトで行う。
+pub fn decide_cancel_capture(keys: &[u32]) -> CaptureOutcome {
+    if keys.is_empty() {
+        return CaptureOutcome::Rejected("(キーが観測できませんでした)".to_string());
+    }
+    for vk in keys {
+        if !is_allowed_cancel_vk(*vk) {
+            return CaptureOutcome::Rejected(key_label(*vk));
+        }
+    }
+    let (mods, trigger) = match split_captured_keys(keys) {
+        Ok(split) => split,
+        Err(outcome) => return outcome,
+    };
+
+    match sanitize_cancel_combo(&mods, trigger) {
+        Some(combo) => CaptureOutcome::Accept(combo),
+        None => CaptureOutcome::Rejected(key_label(trigger)),
+    }
+}
+
+/// 捕獲したキーを修飾キーとトリガーへ分ける。`keys` は空でないこと。
+///
+/// トリガーの決め方:
+/// - 非修飾キーがあればそれがトリガー (Ctrl + Space の Space)
+/// - 修飾キーだけの組み合わせなら、最後に押した修飾キーをトリガーにする
+///   (Ctrl → Shift の順に押したら「Shift をタップ」で発火する形になる)
+fn split_captured_keys(keys: &[u32]) -> Result<(Vec<u32>, u32), CaptureOutcome> {
     let non_mods: Vec<u32> = keys
         .iter()
         .copied()
@@ -1930,23 +2098,17 @@ pub fn decide_capture_combo(keys: &[u32]) -> CaptureOutcome {
         .collect();
     if non_mods.len() > 1 {
         let names = describe_keys(&non_mods);
-        return CaptureOutcome::Rejected(format!("{names} (非修飾キーは 1 つまでです)"));
+        return Err(CaptureOutcome::Rejected(format!(
+            "{names} (非修飾キーは 1 つまでです)"
+        )));
     }
 
-    // トリガーの決め方:
-    // - 非修飾キーがあればそれがトリガー (Ctrl + Space の Space)
-    // - 修飾キーだけの組み合わせなら、最後に押した修飾キーをトリガーにする
-    //   (Ctrl → Shift の順に押したら「Shift をタップ」で発火する形になる)
     let trigger = match non_mods.first() {
         Some(vk) => *vk,
-        None => *keys.last().expect("空は上で弾いた"),
+        None => *keys.last().expect("空は呼び出し側で弾いた"),
     };
     let mods: Vec<u32> = keys.iter().copied().filter(|vk| *vk != trigger).collect();
-
-    match sanitize_combo(&mods, trigger) {
-        Some(combo) => CaptureOutcome::Accept(combo),
-        None => CaptureOutcome::Rejected(key_label(trigger)),
-    }
+    Ok((mods, trigger))
 }
 
 /// ホットキーに選んでよいキーか。
@@ -2375,6 +2537,88 @@ mod tests {
     }
 
     #[test]
+    fn catalog_agrees_with_the_cancel_capture_path() {
+        // 取り消しキーでも、一覧で選べるもの = 押して決まるもの。
+        for key in hotkey_key_catalog() {
+            assert_eq!(
+                matches!(decide_cancel_capture(&[key.vk]), CaptureOutcome::Accept(_)),
+                key.cancel,
+                "単独 {}",
+                key.label
+            );
+            assert_eq!(key.cancel_note.is_empty(), key.cancel, "{}", key.label);
+        }
+    }
+
+    #[test]
+    fn escape_can_be_captured_as_the_cancel_key() {
+        // Esc へ戻す操作を押して行える。ホットキー側の捕獲では中止のまま。
+        assert_eq!(
+            decide_cancel_capture(&[ESCAPE_VK]),
+            CaptureOutcome::Accept(sanitize_cancel_combo(&[], ESCAPE_VK).expect("Esc は許可"))
+        );
+        assert_eq!(decide_capture_combo(&[ESCAPE_VK]), CaptureOutcome::Cancel);
+    }
+
+    #[test]
+    fn cancel_capture_accepts_chords_and_rejects_unstable_keys() {
+        assert_eq!(
+            decide_cancel_capture(&[0xA2, 0x5A]),
+            CaptureOutcome::Accept(sanitize_cancel_combo(&[0xA2], 0x5A).expect("許可"))
+        );
+        // ホットキーでは選べない Enter も、1 回押しなので通す。
+        assert!(matches!(
+            decide_cancel_capture(&[0x0D]),
+            CaptureOutcome::Accept(_)
+        ));
+        // 非修飾キーの同時押しは照合できない。
+        assert!(matches!(
+            decide_cancel_capture(&[0x41, 0x42]),
+            CaptureOutcome::Rejected(_)
+        ));
+        // 押すたびに VK が変わるキーは確実に発火しない。
+        assert!(matches!(
+            decide_cancel_capture(&[0xF3]),
+            CaptureOutcome::Rejected(_)
+        ));
+        assert!(matches!(
+            decide_cancel_capture(&[]),
+            CaptureOutcome::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn the_cancel_target_never_decays_into_the_recording_hotkey() {
+        // 宛先の取り違えは「取り消しキーを設定したら録音キーが変わった」になる。
+        assert_eq!(
+            KeyTarget::from_slot(KeyTarget::Cancel.slot()),
+            KeyTarget::Cancel
+        );
+        for slot in 0..HOTKEY_SLOTS {
+            let mode = HotkeyMode::from_slot(slot);
+            assert_eq!(
+                KeyTarget::from_slot(KeyTarget::Hotkey(mode).slot()),
+                KeyTarget::Hotkey(mode)
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_clash_rules() {
+        let ctrl_space = sanitize_combo(&[0xA2], 0x20).expect("許可");
+        let cancel = |mods: &[u32], vk: u32| sanitize_cancel_combo(mods, vk).expect("許可");
+        // トリガーが同じ / ホットキーの修飾キーをキャンセルにする。
+        assert!(cancel_clashes_with(&cancel(&[], 0x20), &ctrl_space));
+        assert!(cancel_clashes_with(&cancel(&[], 0xA2), &ctrl_space));
+        // 修飾キー同士の重なりは両立する。
+        assert!(!cancel_clashes_with(&cancel(&[0xA2], 0x5A), &ctrl_space));
+        assert!(!cancel_clashes_with(&cancel(&[], ESCAPE_VK), &ctrl_space));
+        // ホットキーのトリガーを修飾キーに含むと、トグル録音中に先に止まる。
+        let lone_ctrl = sanitize_combo(&[], 0xA2).expect("許可");
+        assert!(cancel_clashes_with(&cancel(&[0xA2], 0x5A), &lone_ctrl));
+    }
+
+    #[test]
     fn cancel_key_rules_differ_from_hotkey_rules() {
         // 回帰: キャンセルキーの検証に is_allowed_hotkey を流用すると、
         // 既定の Esc 自身が「不正」と判定され毎回警告が出る (実機で発覚)。
@@ -2641,6 +2885,11 @@ mod tests {
         while rx.try_recv().is_ok() {}
     }
 
+    /// 単独キーをキャンセルキーにする (0 は無効化)。
+    fn set_cancel_vk(vk: u32) {
+        set_cancel_combo(sanitize_cancel_combo(&[], vk));
+    }
+
     /// テスト後の後片付け (プロセス共有の状態を既定へ戻す)。
     fn disarm_cancel_state() {
         set_recording_active(false);
@@ -2789,9 +3038,111 @@ mod tests {
         CANCEL_IS_DOWN.store(true, Ordering::SeqCst);
         set_cancel_vk(0x70);
         assert!(!CANCEL_IS_DOWN.load(Ordering::SeqCst));
-        assert_eq!(CANCEL_VK.load(Ordering::SeqCst), 0x70);
+        assert_eq!(unpack_combo(CANCEL_COMBO.load(Ordering::SeqCst)).vk, 0x70);
         // 後片付け (プロセス共有の状態なので戻す)。
         set_cancel_vk(DEFAULT_CANCEL_VK);
+    }
+
+    #[test]
+    fn a_cancel_chord_fires_only_with_its_modifier() {
+        let _guard = hook_state_lock();
+        let rx = hook_events();
+        set_cancel_combo(sanitize_cancel_combo(&[0xA2], 0x5A)); // 左 Ctrl + Z
+        set_recording_active(true);
+        drain(&rx);
+
+        // 修飾キー無しの Z はただの打鍵。
+        feed_key(0x5A, WM_KEYDOWN);
+        feed_key(0x5A, WM_KEYUP);
+        assert!(rx.try_recv().is_err(), "修飾キー無しで Cancel が発火した");
+
+        feed_key(0xA2, WM_KEYDOWN);
+        feed_key(0x5A, WM_KEYDOWN);
+        assert_eq!(
+            rx.try_recv().map(|e| e.kind).ok(),
+            Some(HotkeyEventKind::Cancel)
+        );
+        // オートリピートは 1 回に畳む。
+        feed_key(0x5A, WM_KEYDOWN);
+        assert!(rx.try_recv().is_err(), "オートリピートごとに発火した");
+        feed_key(0x5A, WM_KEYUP);
+        feed_key(0xA2, WM_KEYUP);
+
+        // 修飾キーを離したあとは、また Z だけでは発火しない。
+        feed_key(0x5A, WM_KEYDOWN);
+        feed_key(0x5A, WM_KEYUP);
+        assert!(rx.try_recv().is_err(), "修飾キーの離しを追跡できていない");
+
+        disarm_cancel_state();
+    }
+
+    #[test]
+    fn a_modifier_pressed_during_capture_still_counts_for_the_cancel_chord() {
+        let _guard = hook_state_lock();
+        let rx = hook_events();
+        set_cancel_combo(sanitize_cancel_combo(&[0xA2], 0x5A)); // 左 Ctrl + Z
+        set_recording_active(true);
+        drain(&rx);
+
+        // 捕獲中に押し始めた修飾キーを、捕獲が終わったあとも押し続けている。
+        let previous = CAPTURE_MODE.swap(true, Ordering::SeqCst);
+        feed_key(0xA2, WM_KEYDOWN);
+        CAPTURE_MODE.store(previous, Ordering::SeqCst);
+
+        feed_key(0x5A, WM_KEYDOWN);
+        assert_eq!(
+            rx.try_recv().map(|e| e.kind).ok(),
+            Some(HotkeyEventKind::Cancel)
+        );
+
+        feed_key(0x5A, WM_KEYUP);
+        feed_key(0xA2, WM_KEYUP);
+        disarm_cancel_state();
+    }
+
+    #[test]
+    fn changing_the_cancel_chord_forgets_the_old_modifiers() {
+        let _guard = hook_state_lock();
+        let rx = hook_events();
+        set_cancel_combo(sanitize_cancel_combo(&[0xA2], 0x5A)); // 左 Ctrl + Z
+        feed_key(0xA2, WM_KEYDOWN);
+        assert_ne!(CANCEL_MODS_DOWN.load(Ordering::SeqCst), 0);
+
+        // 同じビット位置を別の修飾キーが使う組み合わせへ差し替える。
+        // 古いビットが残ると、左 Shift を押していないのに発火する。
+        set_cancel_combo(sanitize_cancel_combo(&[0xA0], 0x5A)); // 左 Shift + Z
+        assert_eq!(CANCEL_MODS_DOWN.load(Ordering::SeqCst), 0);
+
+        set_recording_active(true);
+        drain(&rx);
+        feed_key(0x5A, WM_KEYDOWN);
+        feed_key(0x5A, WM_KEYUP);
+        assert!(rx.try_recv().is_err(), "古い修飾キーの状態で発火した");
+
+        feed_key(0xA2, WM_KEYUP);
+        disarm_cancel_state();
+    }
+
+    #[test]
+    fn a_new_cancel_key_replaces_escape() {
+        let _guard = hook_state_lock();
+        let rx = hook_events();
+        set_cancel_vk(0x78); // F9
+        set_recording_active(true);
+        drain(&rx);
+
+        feed_key(DEFAULT_CANCEL_VK as i32, WM_KEYDOWN);
+        feed_key(DEFAULT_CANCEL_VK as i32, WM_KEYUP);
+        assert!(rx.try_recv().is_err(), "差し替えた後も Esc で発火した");
+
+        feed_key(0x78, WM_KEYDOWN);
+        feed_key(0x78, WM_KEYUP);
+        assert_eq!(
+            rx.try_recv().map(|e| e.kind).ok(),
+            Some(HotkeyEventKind::Cancel)
+        );
+
+        disarm_cancel_state();
     }
 
     // --- 組み合わせホットキーの照合 ------------------------------------------

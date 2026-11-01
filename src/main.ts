@@ -180,7 +180,10 @@ interface ConfigView {
   /** ホットキーの修飾キー VK 一覧。空なら単独キー。 */
   hotkey_mods: number[];
   hotkey_label: string;
-  /** 録音中の取り消しキーの表示名 (「Esc」など)。設定ファイルからのみ変更できる。 */
+  /** 録音中の取り消しキー。`0` は無効。 */
+  cancel_vk: number;
+  cancel_mods: number[];
+  /** 取り消しキーの表示名 (「Esc」など)。無効なら空。 */
   cancel_label: string;
   /** クリップボードのみモードのトリガー (0 = 未設定)。 */
   clipboard_hotkey_vk: number;
@@ -931,14 +934,22 @@ function renderConfig(view: ConfigView) {
     delete clipboardLabel.dataset.capturing;
   }
   const cancelKeyLabel = el("cancel-key-label");
-  if (cancelKeyLabel) cancelKeyLabel.textContent = view.cancel_label || "なし";
+  if (cancelKeyLabel) {
+    cancelKeyLabel.textContent = view.cancel_label || "未設定";
+    delete cancelKeyLabel.dataset.capturing;
+  }
+  const cancelKeyClear = el<HTMLButtonElement>("cancel-key-clear");
+  if (cancelKeyClear) cancelKeyClear.disabled = view.cancel_vk === 0;
 
   // ホームの案内は実際の割り当てを写す。固定文にしておくと、キーを変えた
   // 利用者に嘘を教え続けることになる (旧 UI は「右 Ctrl」と書いたままだった)。
   const homeHotkey = el("home-hotkey");
   if (homeHotkey) homeHotkey.textContent = view.hotkey_label;
   const homeCancel = el("home-cancel");
-  if (homeCancel) homeCancel.textContent = view.cancel_label || "(未設定)";
+  if (homeCancel) homeCancel.textContent = view.cancel_label;
+  // 無効のときは文ごと出さない。「録音中に 未設定 で取り消せます」は読めない文になる。
+  const homeCancelHint = el("home-cancel-hint");
+  if (homeCancelHint) homeCancelHint.hidden = view.cancel_vk === 0;
   const clipboardHint = el("home-clipboard-hint");
   const homeClipboardHotkey = el("home-clipboard-hotkey");
   if (homeClipboardHotkey) {
@@ -2009,8 +2020,8 @@ interface HotkeyCaptured {
   label: string;
 }
 
-/** ホットキーの用途。Rust 側 `hotkey::HotkeyMode` と対応。 */
-type HotkeyModeId = "inject" | "clipboard_only" | "screen_ask";
+/** キー設定の宛先。Rust 側 `hotkey::KeyTarget` と対応。 */
+type HotkeyModeId = "inject" | "clipboard_only" | "screen_ask" | "cancel";
 
 /** 用途ごとの DOM 要素 id。捕獲 UI と一覧 UI はこの表だけを見て動く。
  *
@@ -2037,6 +2048,12 @@ const HOTKEY_ELEMENTS: Record<
     button: "screen-ask-hotkey-capture",
     pick: "screen-ask-hotkey-pick",
     picker: "screen-ask-hotkey-picker",
+  },
+  cancel: {
+    label: "cancel-key-label",
+    button: "cancel-key-capture",
+    pick: "cancel-key-pick",
+    picker: "cancel-key-picker",
   },
 };
 
@@ -2204,9 +2221,11 @@ function onCaptureKeyDown(event: KeyboardEvent) {
   // `code` が空になる環境がある (IME 経由の合成キーなど)。捨てずに
   // そのまま積み、確定時に Rust 側から「使えません」と言わせる。
   const code = event.code || "Unidentified";
-  if (code === "Escape") {
+  if (code === "Escape" && capturingMode !== "cancel") {
     // Esc は「取り消し」。ホットキーには選べない (選べると設定を
     // やり直す手段が無くなる)。押した瞬間に畳む。
+    // 取り消しキーの捕獲だけは Esc も設定できるキーとして受ける。
+    // 別のキーへ変えたあと Esc へ戻せるように。中止はボタンで行う。
     void cancelHotkeyCapture();
     return;
   }
@@ -2389,14 +2408,15 @@ async function toggleHotkeyCapture(mode: HotkeyModeId) {
  * # フロントは判定を持たない
  *
  * 選択肢 (キー名・カテゴリ・選べるかどうか) は Rust の `list_hotkey_keys` が
- * 既存の許可規則 (`is_allowed_hotkey` / `is_allowed_combo_key` / `key_label`)
- * から組み立てたものをそのまま描くだけ。ここに表を持つと、Rust 側の規則を
+ * 既存の許可規則 (`is_allowed_hotkey` / `is_allowed_combo_key` /
+ * `is_allowed_cancel_vk` / `key_label`) から組み立てたものをそのまま描くだけ。ここに表を持つと、Rust 側の規則を
  * 直した日に**一覧には出るのに確定できないキー**が生まれる。
  * 確定も `sanitize_combo` → 捕獲と同じ `commit_combo` を通す。
  *
- * このモジュールが自分で決めてよいのは「今チェックされている修飾キーの数が
- * 0 か 1 以上か」だけで、それに応じて Rust がくれた 2 つの真偽値
- * (`alone` / `with_mods`) のどちらを読むかを切り替える。 */
+ * このモジュールが自分で決めてよいのは「宛先が取り消しキーか」と
+ * 「今チェックされている修飾キーの数が 0 か 1 以上か」だけで、それに応じて
+ * Rust がくれた真偽値 (`cancel` / `alone` / `with_mods`) のどれを読むかを
+ * 切り替える。 */
 
 /** `hotkey::HotkeyKeyOption`。 */
 interface HotkeyKeyOption {
@@ -2410,6 +2430,10 @@ interface HotkeyKeyOption {
   is_modifier: boolean;
   /** 選べないときの理由 (選べるなら空)。 */
   note: string;
+  /** 取り消しキーに選べるか (修飾キーの有無によらない)。 */
+  cancel: boolean;
+  /** 取り消しキーに選べないときの理由 (選べるなら空)。 */
+  cancel_note: string;
 }
 
 /** `hotkey::HotkeyKeyCategory`。 */
@@ -2417,6 +2441,8 @@ interface HotkeyKeyCategory {
   id: string;
   label: string;
   hint: string;
+  /** 取り消しキーを選んでいるときの一言。 */
+  cancel_hint: string;
 }
 
 /** `lib::HotkeyKeyList`。 */
@@ -2449,7 +2475,13 @@ let pickerPreviewSeq = 0;
 /** いま選べるキーか。**判定そのものは Rust が計算済み**で、ここでは
  * 「修飾キーを選んだか」でどちらの真偽値を読むかを切り替えるだけ。 */
 function pickerKeyUsable(key: HotkeyKeyOption): boolean {
+  if (pickerMode === "cancel") return key.cancel;
   return pickerMods.length > 0 ? key.with_mods : key.alone;
+}
+
+/** いま選べない理由。許可規則が宛先で違うので、理由も宛先ごとに持つ。 */
+function pickerKeyNote(key: HotkeyKeyOption): string {
+  return pickerMode === "cancel" ? key.cancel_note : key.note;
 }
 
 /** 一覧の中身を組み立てる。目録は Rust から来たものだけを使う。 */
@@ -2566,8 +2598,9 @@ async function renderPicker(mode: HotkeyModeId) {
   const category = list.categories.find((c) => c.id === pickerCategory);
   const catHint = root.querySelector<HTMLElement>(".picker-cat-hint");
   if (catHint) {
-    catHint.textContent = category?.hint ?? "";
-    catHint.hidden = !category?.hint;
+    const hint = mode === "cancel" ? category?.cancel_hint : category?.hint;
+    catHint.textContent = hint ?? "";
+    catHint.hidden = !hint;
   }
 
   const keysBox = root.querySelector<HTMLElement>(".picker-keys");
@@ -2591,7 +2624,7 @@ async function renderPicker(mode: HotkeyModeId) {
         button.addEventListener("click", () => {
           if (!pickerKeyUsable(key)) {
             // 選べない理由を出すだけ。選択状態は変えない。
-            setPickerNote(mode, key.note);
+            setPickerNote(mode, pickerKeyNote(key));
             return;
           }
           pickerVk = key.vk;
@@ -2616,7 +2649,7 @@ async function renderPicker(mode: HotkeyModeId) {
         button.removeAttribute("title");
       } else {
         button.setAttribute("aria-disabled", "true");
-        button.title = key.note;
+        button.title = pickerKeyNote(key);
       }
     }
   }
@@ -2634,7 +2667,7 @@ async function renderPicker(mode: HotkeyModeId) {
     // 選んだ後で修飾キーを外すと、Space のように「組み合わせ限定」の
     // キーは選べない側へ戻る。「選択中: Space」のまま確定だけ死ぬと
     // 理由が分からないので、ここでも理由を出す。
-    setPickerNote(mode, selected.note);
+    setPickerNote(mode, pickerKeyNote(selected));
     return;
   }
   // 表示名は Rust に作らせる。ここで連結すると、修飾キーの並び順が
@@ -2878,6 +2911,9 @@ window.addEventListener("DOMContentLoaded", async () => {
     "click",
     () => void toggleHotkeyPicker("screen_ask"),
   );
+  el("cancel-key-capture")?.addEventListener("click", () => void toggleHotkeyCapture("cancel"));
+  el("cancel-key-pick")?.addEventListener("click", () => void toggleHotkeyPicker("cancel"));
+  el("cancel-key-clear")?.addEventListener("click", () => void clearHotkey("cancel"));
   el("screen-ask-enabled")?.addEventListener("change", syncScreenAskEnabled);
   // 自動起動は保存ボタンを通さない。押した時点で OS を触る (関数群の doc)。
   el("autostart")?.addEventListener("change", () => void onAutostartToggle());

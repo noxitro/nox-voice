@@ -429,6 +429,12 @@ pub struct Config {
     ///
     /// ホットキーとの重複は不可 ([`Config::normalize`] が解消する)。
     pub cancel_vk: u32,
+    /// キャンセルキーと一緒に押す修飾キー (VK コード、表示順に正規化される)。
+    ///
+    /// 空なら単独キー。旧形式の設定ファイルには無い項目なので、
+    /// フィールド単位の `#[serde(default)]` で空として受ける。
+    #[serde(default)]
+    pub cancel_mods: Vec<u32>,
     /// 「クリップボードへ入れるだけ」モードのトリガーキー。**0 で無効**。
     ///
     /// 貼り付けモード ([`Self::hotkey_vk`]) とは別のキーを割り当てる。
@@ -591,6 +597,7 @@ impl Default for Config {
             hotkey_vk: crate::hotkey::DEFAULT_HOTKEY_VK,
             hotkey_mods: crate::hotkey::DEFAULT_HOTKEY_MODS.to_vec(),
             cancel_vk: crate::hotkey::DEFAULT_CANCEL_VK,
+            cancel_mods: Vec::new(),
             // 既定は未設定。ユーザーが設定 UI で割り当てて初めて効く。
             clipboard_hotkey_vk: 0,
             clipboard_hotkey_mods: Vec::new(),
@@ -771,6 +778,31 @@ impl Config {
         )
     }
 
+    /// 録音を破棄するキーの組み合わせ。無効なら `None`。
+    pub fn cancel_combo(&self) -> Option<crate::hotkey::HotkeyCombo> {
+        crate::hotkey::sanitize_cancel_combo(&self.cancel_mods, self.cancel_vk)
+    }
+
+    /// `combo` が割り当て済みのホットキーのどれかと衝突するか
+    /// ([`crate::hotkey::cancel_clashes_with`])。
+    ///
+    /// 画面質問は有効化フラグを見ない。機能をオンにした瞬間に衝突が生まれて
+    /// 取り消しキーが黙って変わるのを防ぐため、キーがあれば数える。
+    pub fn cancel_clashes(&self, combo: &crate::hotkey::HotkeyCombo) -> bool {
+        let screen_ask = crate::hotkey::HotkeyCombo::from_parts(
+            &self.screen_ask_hotkey_mods,
+            self.screen_ask_hotkey_vk,
+        );
+        [
+            Some(self.hotkey_combo()),
+            self.clipboard_hotkey_combo(),
+            screen_ask,
+        ]
+        .iter()
+        .flatten()
+        .any(|hotkey| crate::hotkey::cancel_clashes_with(combo, hotkey))
+    }
+
     /// 録音開始時に鳴らす音。
     pub fn start_sound_choice(&self) -> SoundChoice {
         SoundChoice::new(self.start_sound, &self.start_sound_path)
@@ -886,7 +918,10 @@ pub struct ConfigView {
     pub hotkey_mods: Vec<u32>,
     /// 表示用のキー名 (「左 Ctrl + Space」など)。
     pub hotkey_label: String,
-    /// 録音キャンセルキーの表示名 (「Esc」など)。
+    /// 録音キャンセルキーのトリガー。0 は無効。
+    pub cancel_vk: u32,
+    pub cancel_mods: Vec<u32>,
+    /// 録音キャンセルキーの表示名 (「Esc」など)。無効なら空。
     pub cancel_label: String,
     /// クリップボードのみモードのトリガー (0 = 未設定)。
     pub clipboard_hotkey_vk: u32,
@@ -973,7 +1008,12 @@ impl ConfigView {
             hotkey_vk: c.hotkey_vk,
             hotkey_mods: c.hotkey_combo().mods_vec(),
             hotkey_label: c.hotkey_combo().label(),
-            cancel_label: crate::hotkey::key_label(c.cancel_vk),
+            cancel_vk: c.cancel_vk,
+            cancel_mods: c.cancel_mods.clone(),
+            cancel_label: c
+                .cancel_combo()
+                .map(|combo| combo.label())
+                .unwrap_or_default(),
             clipboard_hotkey_vk: c.clipboard_hotkey_vk,
             clipboard_hotkey_mods: c
                 .clipboard_hotkey_combo()
@@ -1056,6 +1096,7 @@ pub struct ConfigPatch {
     pub hotkey_vk: Option<u32>,
     pub hotkey_mods: Option<Vec<u32>>,
     pub cancel_vk: Option<u32>,
+    pub cancel_mods: Option<Vec<u32>>,
     pub clipboard_hotkey_vk: Option<u32>,
     pub clipboard_hotkey_mods: Option<Vec<u32>>,
     pub screen_ask_enabled: Option<bool>,
@@ -1115,6 +1156,7 @@ impl fmt::Debug for ConfigPatch {
             .field("hotkey_vk", &self.hotkey_vk)
             .field("hotkey_mods", &self.hotkey_mods.as_ref().map(Vec::len))
             .field("cancel_vk", &self.cancel_vk)
+            .field("cancel_mods", &self.cancel_mods.as_ref().map(Vec::len))
             .field("clipboard_hotkey_vk", &self.clipboard_hotkey_vk)
             .field(
                 "clipboard_hotkey_mods",
@@ -1290,24 +1332,29 @@ impl Config {
         // 文字キーも可。hotkey.rs の is_allowed_cancel_vk を参照)。マウスや
         // VK が揺れる IME 系だけ弾く。ただし **0 は「無効化」という意味の
         // 正しい値**なので、そのまま通す。
-        if self.cancel_vk != 0 && !crate::hotkey::is_allowed_cancel_vk(self.cancel_vk) {
+        if self.cancel_vk == 0 {
+            // トリガーが無いのに修飾子だけ残っていると、UI の表示が嘘になる。
+            self.cancel_mods.clear();
+        } else if let Some(combo) = self.cancel_combo() {
+            self.cancel_mods = combo.mods_vec();
+        } else {
             log::warn!(
                 "キャンセルキーに使えない値 (VK 0x{:02X}) が設定されていたので既定へ戻します",
                 self.cancel_vk
             );
             self.cancel_vk = crate::hotkey::DEFAULT_CANCEL_VK;
+            self.cancel_mods.clear();
         }
         // ホットキーとの重複は禁止。トリガーと同じキーや、組み合わせの修飾子と
         // 同じキーをキャンセルにすると、押すたびに録音操作とキャンセルが同時に
         // 起こってしまう。キャンセル側を既定 (Esc) へ戻して解消する — ホットキーは
         // Esc を選べないので、これで必ず外れる。
-        if self.cancel_vk != 0
-            && (self.cancel_vk == self.hotkey_vk
-                || self.hotkey_mods.contains(&self.cancel_vk)
-                || self.cancel_vk == self.clipboard_hotkey_vk
-                || self.clipboard_hotkey_mods.contains(&self.cancel_vk)
-                || self.cancel_vk == self.screen_ask_hotkey_vk
-                || self.screen_ask_hotkey_mods.contains(&self.cancel_vk))
+        //
+        // 設定 UI はここへ来る前に断る (`lib.rs` の `cancel_clash_message`)。
+        // ここは手編集された設定ファイルの受け皿。
+        if self
+            .cancel_combo()
+            .is_some_and(|combo| self.cancel_clashes(&combo))
         {
             log::warn!(
                 "キャンセルキーがホットキー ({}) と重複していたため、既定の {} へ戻します",
@@ -1315,6 +1362,7 @@ impl Config {
                 crate::hotkey::key_label(crate::hotkey::DEFAULT_CANCEL_VK)
             );
             self.cancel_vk = crate::hotkey::DEFAULT_CANCEL_VK;
+            self.cancel_mods.clear();
         }
         self.restore_delay_ms = self
             .restore_delay_ms
@@ -1555,6 +1603,9 @@ impl Config {
         }
         if let Some(v) = patch.cancel_vk {
             self.cancel_vk = v;
+        }
+        if let Some(v) = patch.cancel_mods {
+            self.cancel_mods = v;
         }
         if let Some(v) = patch.clipboard_hotkey_vk {
             self.clipboard_hotkey_vk = v;
@@ -3126,6 +3177,72 @@ mod tests {
         };
         disabled.normalize();
         assert_eq!(disabled.cancel_vk, 0);
+    }
+
+    #[test]
+    fn a_cancel_chord_is_normalized_and_labelled() {
+        let mut cfg = Config {
+            cancel_vk: 0x5A,
+            // 非修飾キーと重複は落ち、表示順 (Ctrl → Shift) に並ぶ。
+            cancel_mods: vec![0xA0, 0x41, 0xA2, 0xA0],
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.cancel_mods, vec![0xA2, 0xA0]);
+        assert_eq!(
+            ConfigView::from(&cfg).cancel_label,
+            "左 Ctrl + 左 Shift + Z"
+        );
+    }
+
+    #[test]
+    fn a_disabled_cancel_key_has_no_label_or_mods() {
+        // 旧実装は key_label(0) をそのまま出し、画面に「VK 0x00」と表示された。
+        let mut cfg = Config {
+            cancel_vk: 0,
+            cancel_mods: vec![0xA2],
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert!(cfg.cancel_mods.is_empty());
+        assert_eq!(ConfigView::from(&cfg).cancel_label, "");
+    }
+
+    #[test]
+    fn a_cancel_chord_may_share_a_modifier_with_the_hotkey() {
+        // 左 Ctrl + Space の録音中に左 Ctrl + Z で取り消す、は両立する。
+        let mut cfg = Config {
+            cancel_vk: 0x5A,
+            cancel_mods: vec![0xA2],
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.cancel_vk, 0x5A);
+        assert_eq!(cfg.cancel_mods, vec![0xA2]);
+
+        // ホットキーのトリガーを修飾キーに含むのは不可。修飾子も一緒に既定へ戻る。
+        let mut clash = Config {
+            hotkey_vk: 0xA2,
+            hotkey_mods: Vec::new(),
+            cancel_vk: 0x5A,
+            cancel_mods: vec![0xA2],
+            ..Config::default()
+        };
+        clash.normalize();
+        assert_eq!(clash.cancel_vk, crate::hotkey::DEFAULT_CANCEL_VK);
+        assert!(clash.cancel_mods.is_empty());
+    }
+
+    #[test]
+    fn a_config_without_cancel_mods_loads_as_a_single_key() {
+        // 旧形式の設定ファイルには cancel_mods が無い。
+        let mut value = serde_json::to_value(Config::default()).expect("直列化できる");
+        let object = value.as_object_mut().expect("オブジェクト");
+        object.remove("cancel_mods");
+        object.insert("cancel_vk".to_string(), serde_json::json!(0x91));
+        let cfg: Config = serde_json::from_value(value).expect("読める");
+        assert_eq!(cfg.cancel_vk, 0x91);
+        assert!(cfg.cancel_mods.is_empty());
     }
 
     #[test]
