@@ -191,7 +191,9 @@
                 <strong id="home-hotkey">左 Ctrl + Space</strong>
                 を<strong>長押し</strong>している間だけ録音(離すと確定)。<br />
                 <strong>短押し</strong>すると録音が継続し、もう一度押すと停止。
-                録音中に <strong id="home-cancel">Esc</strong> で取り消せます。
+                <span id="home-cancel-hint">
+                  録音中に <strong id="home-cancel">Esc</strong> で取り消せます。
+                </span>
               </p>
               <p class="hint" id="home-clipboard-hint" hidden>
                 <strong id="home-clipboard-hotkey">未設定</strong>
@@ -813,7 +815,7 @@
                     入力先アプリにも流れます。単独では文字キー・Enter・Space は選べず、
                     <strong>Ctrl / Alt / Shift / Win / CapsLock / F1〜F12</strong>
                     などから選びます。修飾キーと組み合わせると Space も使えます。
-                    Esc で取り消せます。
+                    設定中は Esc で中止できます。
                   </span>
                 </p>
               </div>
@@ -929,11 +931,24 @@
                       aria-describedby="cancel-key-desc"
                       >Esc</output
                     >
+                    <button type="button" id="cancel-key-capture">キーを押して設定</button>
+                    <button
+                      type="button"
+                      id="cancel-key-pick"
+                      aria-expanded="false"
+                      aria-controls="cancel-key-picker"
+                    >
+                      一覧から選ぶ
+                    </button>
+                    <button type="button" id="cancel-key-clear">解除</button>
                   </span>
                 </div>
+                <div class="hotkey-picker" id="cancel-key-picker" hidden></div>
                 <p class="hint">
-                  取り消しキーは設定ファイル (<code>cancel_vk</code>) で変更します。
-                  録音していない間は素通しなので、他アプリの Esc は奪いません。
+                  録音していない間は素通しなので、他アプリのキー操作は奪いません。
+                  録音中に押したキーは入力先アプリにも届きます。文字キーや Enter も選べ、
+                  録音用のホットキーと重なるキーは選べません。Esc も設定できるので、
+                  設定を中止するときは「キャンセル」ボタンを押してください。
                 </p>
               </div>
             </div>

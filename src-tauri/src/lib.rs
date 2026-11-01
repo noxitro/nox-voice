@@ -75,7 +75,9 @@ use config::{ConfigPatch, ConfigStore, ConfigView};
 use format::{GeminiFormatter, ScreenAnswerer};
 use format_groq::GroqFormatter;
 use history::{DashboardStats, HistoryStore, SessionDraft, SessionRow};
-use hotkey::{HookHandle, HotkeyAction, HotkeyMode, PttInterpreter, HOTKEY_SLOTS, TAP_THRESHOLD};
+use hotkey::{
+    HookHandle, HotkeyAction, HotkeyMode, KeyTarget, PttInterpreter, HOTKEY_SLOTS, TAP_THRESHOLD,
+};
 use inject::{ClipboardState, InjectOutcome, InjectTarget};
 use pipeline::FormatOutcome;
 use session::{
@@ -298,7 +300,7 @@ struct AppState {
     failed_dir: PathBuf,
     /// ローカル STT のモデル置き場。
     models_dir: PathBuf,
-    /// 進行中のキー捕獲がどの用途のものか ([`HotkeyMode::slot`])。
+    /// 進行中のキー捕獲がどの宛先のものか ([`KeyTarget::slot`])。
     ///
     /// 捕獲の確定はコントローラスレッドで起きるが、「どのキーを設定しに
     /// 来たのか」を知っているのは捕獲を始めたコマンド側だけ。
@@ -395,8 +397,6 @@ fn set_config(
     }
     // ホットキーはフックを設置し直さず、比較する組み合わせだけ差し替える。
     apply_hotkeys(&updated);
-    // キャンセルキーも同じく即時反映 (0 なら無効化)。
-    hotkey::set_cancel_vk(updated.cancel_vk);
     // オーバーレイを後から有効にした場合はその場で作る。
     if updated.overlay_enabled {
         if let Err(e) = overlay::create(&app) {
@@ -552,13 +552,13 @@ fn start_hotkey_capture(app: AppHandle, mode: Option<String>) -> Result<u64, Str
     // 録音中に捕獲へ入ると、PTT の離しが捕獲側へ吸われて録音が止まらなくなる。
     hotkey::can_begin_capture(app.state::<AppState>().is_recording()).map_err(str::to_string)?;
 
-    // どの用途のキーを設定しに来たのか。確定はコントローラスレッドで
+    // どの宛先のキーを設定しに来たのか。確定はコントローラスレッドで
     // 起きるので、ここで残しておかないと行き先が分からない。
-    let mode = parse_mode(mode.as_deref())?;
+    let target = parse_target(mode.as_deref())?;
     app.state::<AppState>()
         .capture_slot
-        .store(mode.slot(), std::sync::atomic::Ordering::SeqCst);
-    log::info!("キー捕獲を開始 [{}]", mode.label());
+        .store(target.slot(), std::sync::atomic::Ordering::SeqCst);
+    log::info!("キー捕獲を開始 [{}]", target.label());
 
     let generation = hotkey::begin_capture();
 
@@ -686,10 +686,14 @@ fn set_hotkey_from_list(
     mods: Vec<u32>,
     vk: u32,
 ) -> Result<SelectionVerdict, String> {
-    let mode = parse_mode(mode.as_deref())?;
+    let target = parse_target(mode.as_deref())?;
     hotkey::can_begin_capture(app.state::<AppState>().is_recording()).map_err(str::to_string)?;
 
-    let Some(combo) = hotkey::sanitize_combo(&mods, vk) else {
+    let combo = match target {
+        KeyTarget::Hotkey(_) => hotkey::sanitize_combo(&mods, vk),
+        KeyTarget::Cancel => hotkey::sanitize_cancel_combo(&mods, vk),
+    };
+    let Some(combo) = combo else {
         // 一覧側で選ばせないはずの組み合わせ (フロントの取りこぼし・
         // 古い画面のまま押した等)。理由はキー名で言う。
         log::info!("一覧選択: 使えない組み合わせ (トリガー VK 0x{vk:02X} / 修飾子 {mods:?})");
@@ -700,6 +704,11 @@ fn set_hotkey_from_list(
             ),
         });
     };
+    // 取り消しキーとの衝突は保存する前に断る ([`cancel_clash_message`] の doc)。
+    let snapshot = app.state::<AppState>().config.snapshot();
+    if let Some(message) = cancel_clash_message(&snapshot, target, &combo) {
+        return Ok(SelectionVerdict::Invalid { message });
+    }
 
     // 確定する組み合わせのキーを**そのまま**抑制へ回す。
     //
@@ -717,7 +726,7 @@ fn set_hotkey_from_list(
     // 空を渡していたのは、この絞り込みを見落とした誤った論拠だった)。
     let mut pressed = combo.mods_vec();
     pressed.push(combo.vk);
-    match commit_combo(&app, mode, &pressed, combo) {
+    match commit_combo(&app, target, &pressed, combo) {
         Ok(Some(label)) => Ok(SelectionVerdict::Applied { label }),
         Ok(None) => Ok(SelectionVerdict::Dropped {
             message: "その組み合わせは他の用途のホットキーと同じなので設定できません".to_string(),
@@ -728,13 +737,48 @@ fn set_hotkey_from_list(
     }
 }
 
-/// フロントから来た用途名を [`HotkeyMode`] へ。既定は貼り付け。
-fn parse_mode(raw: Option<&str>) -> Result<HotkeyMode, String> {
+/// フロントから来た用途名を [`KeyTarget`] へ。既定は貼り付け。
+fn parse_target(raw: Option<&str>) -> Result<KeyTarget, String> {
     match raw.unwrap_or("inject") {
-        "inject" => Ok(HotkeyMode::Inject),
-        "clipboard_only" => Ok(HotkeyMode::ClipboardOnly),
-        "screen_ask" => Ok(HotkeyMode::ScreenAsk),
+        "inject" => Ok(KeyTarget::Hotkey(HotkeyMode::Inject)),
+        "clipboard_only" => Ok(KeyTarget::Hotkey(HotkeyMode::ClipboardOnly)),
+        "screen_ask" => Ok(KeyTarget::Hotkey(HotkeyMode::ScreenAsk)),
+        "cancel" => Ok(KeyTarget::Cancel),
         other => Err(format!("不明なホットキー用途です: {other}")),
+    }
+}
+
+/// 設定しようとしている組み合わせが取り消しキーと衝突するなら、断る理由を返す。
+///
+/// # なぜ `Config::normalize` に任せないのか
+///
+/// normalize は衝突を**取り消しキーを Esc へ戻して**解消する。手編集された
+/// 設定ファイルの受け皿としては正しいが、UI の操作でそれが起きると、
+/// 利用者が選んだ取り消しキーが別の操作の副作用で黙って Esc へ変わる
+/// (取り消しキーを設定し損ねた場合も、元のキーを失う)。
+/// UI からの設定は保存する前にここで断り、どのキーも変えない。
+fn cancel_clash_message(
+    cfg: &config::Config,
+    target: KeyTarget,
+    combo: &hotkey::HotkeyCombo,
+) -> Option<String> {
+    match target {
+        KeyTarget::Cancel => cfg.cancel_clashes(combo).then(|| {
+            format!(
+                "「{}」は録音用のホットキーとキーが重なるため、取り消しキーにできません",
+                combo.label()
+            )
+        }),
+        KeyTarget::Hotkey(_) => {
+            let cancel = cfg.cancel_combo()?;
+            hotkey::cancel_clashes_with(&cancel, combo).then(|| {
+                format!(
+                    "「{}」は取り消しキー ({}) とキーが重なるため設定できません",
+                    combo.label(),
+                    cancel.label()
+                )
+            })
+        }
     }
 }
 
@@ -744,13 +788,13 @@ fn parse_mode(raw: Option<&str>) -> Result<HotkeyMode, String> {
 /// 設定画面を開くことでしか復旧できないアプリになる。
 #[tauri::command]
 fn clear_hotkey(app: AppHandle, mode: Option<String>) -> Result<ConfigView, String> {
-    let mode = parse_mode(mode.as_deref())?;
-    if mode == HotkeyMode::Inject {
-        return Err("録音用のホットキーは解除できません".to_string());
-    }
+    let target = parse_target(mode.as_deref())?;
     let state = app.state::<AppState>();
-    let patch = match mode {
-        HotkeyMode::ClipboardOnly => config::ConfigPatch {
+    // 録音中は受け付けない。[`apply_hotkeys`] が押下状態を畳むので、
+    // PTT の離しが届かず録音が止まらなくなる ([`set_hotkey_from_list`] と同じ理由)。
+    hotkey::can_begin_capture(state.is_recording()).map_err(str::to_string)?;
+    let patch = match target {
+        KeyTarget::Hotkey(HotkeyMode::ClipboardOnly) => config::ConfigPatch {
             clipboard_hotkey_vk: Some(0),
             clipboard_hotkey_mods: Some(Vec::new()),
             ..Default::default()
@@ -758,13 +802,19 @@ fn clear_hotkey(app: AppHandle, mode: Option<String>) -> Result<ConfigView, Stri
         // 画面質問は**有効化フラグには触らない**。「キーを付け替えたい」と
         // 「機能ごと止めたい」は別の意図で、解除のたびにトグルまで倒すと
         // 前者のつもりの操作が後者になる。
-        HotkeyMode::ScreenAsk => config::ConfigPatch {
+        KeyTarget::Hotkey(HotkeyMode::ScreenAsk) => config::ConfigPatch {
             screen_ask_hotkey_vk: Some(0),
             screen_ask_hotkey_mods: Some(Vec::new()),
             ..Default::default()
         },
-        // 上で弾いてある。
-        HotkeyMode::Inject => return Err("録音用のホットキーは解除できません".to_string()),
+        KeyTarget::Cancel => config::ConfigPatch {
+            cancel_vk: Some(0),
+            cancel_mods: Some(Vec::new()),
+            ..Default::default()
+        },
+        KeyTarget::Hotkey(HotkeyMode::Inject) => {
+            return Err("録音用のホットキーは解除できません".to_string())
+        }
     };
     let updated = state.config.update(patch)?;
     apply_hotkeys(&updated);
@@ -1337,7 +1387,6 @@ pub fn run() {
             // 設定のホットキーを反映してからフックを設置する。
             let cfg = handle.state::<AppState>().config.snapshot();
             apply_hotkeys(&cfg);
-            hotkey::set_cancel_vk(cfg.cancel_vk);
 
             if cfg.overlay_enabled {
                 if let Err(e) = overlay::create(&handle) {
@@ -1545,6 +1594,7 @@ fn apply_hotkeys(cfg: &config::Config) {
     // `screen_ask_hotkey_combo()` は有効化フラグも見る。設定でオフにした
     // 瞬間にキーが死ぬ ({「オフなのに押すと画面が送られる」}を作らない)。
     hotkey::set_mode_hotkey(HotkeyMode::ScreenAsk, cfg.screen_ask_hotkey_combo());
+    hotkey::set_cancel_combo(cfg.cancel_combo());
 }
 
 /// フックを設置し、ホットキーイベントを解釈するコントローラスレッドを起動する。
@@ -3368,6 +3418,15 @@ fn finish_hotkey_capture(app: AppHandle, codes: Vec<String>) -> CaptureVerdict {
         };
     }
 
+    // 捕獲を始めたコマンドが残した宛先。用途が増えるたびに if を足して
+    // いくと、足し忘れた用途が黙って貼り付け側へ書き込む (= 録音キーが
+    // 勝手に変わる)。スロット番号から機械的に戻す。
+    let target = KeyTarget::from_slot(
+        app.state::<AppState>()
+            .capture_slot
+            .load(std::sync::atomic::Ordering::SeqCst),
+    );
+
     // 写せない `code` は**黙って落とさない**。落とすと「Win + F13」の
     // つもりが「F13」単独で保存される。捕獲は続けたまま理由を返す。
     let keys = match hotkey::codes_to_vks(&codes) {
@@ -3375,15 +3434,24 @@ fn finish_hotkey_capture(app: AppHandle, codes: Vec<String>) -> CaptureVerdict {
         Err(code) => {
             log::info!("捕獲: 写せない code を受け取りました: {code}");
             return CaptureVerdict::Rejected {
-                message: format!(
-                    "このキー ({code}) はホットキーに使えません。
+                message: match target {
+                    KeyTarget::Hotkey(_) => format!(
+                        "このキー ({code}) はホットキーに使えません。
 Ctrl / Alt / Shift / Win / CapsLock / F1〜F24 などから選んでください"
-                ),
+                    ),
+                    KeyTarget::Cancel => {
+                        format!("このキー ({code}) は取り消しキーに使えません。別のキーを押してください")
+                    }
+                },
             };
         }
     };
 
-    match hotkey::decide_capture_combo(&keys) {
+    let outcome = match target {
+        KeyTarget::Hotkey(_) => hotkey::decide_capture_combo(&keys),
+        KeyTarget::Cancel => hotkey::decide_cancel_capture(&keys),
+    };
+    match outcome {
         hotkey::CaptureOutcome::Cancel => {
             hotkey::end_capture(None);
             log::info!("キー捕獲を取り消しました");
@@ -3397,24 +3465,27 @@ Ctrl / Alt / Shift / Win / CapsLock / F1〜F24 などから選んでください
             // そのたびにボタンを押し直す羽目になる。
             log::info!("ホットキーに使えない組み合わせです: {label} (捕獲は継続)");
             CaptureVerdict::Rejected {
-                message: format!(
-                    "「{label}」はホットキーに使えません。押している間ずっと入力先へ流れてしまいます。
+                message: match target {
+                    KeyTarget::Hotkey(_) => format!(
+                        "「{label}」はホットキーに使えません。押している間ずっと入力先へ流れてしまいます。
 Ctrl / Alt / Shift / Win / CapsLock / F1〜F12 などから選んでください"
-                ),
+                    ),
+                    KeyTarget::Cancel => format!(
+                        "「{label}」は取り消しキーに使えません。別のキーを押してください"
+                    ),
+                },
             }
         }
         hotkey::CaptureOutcome::Accept(combo) => {
-            // 捕獲を始めたコマンドが残した用途へ書く。用途が増えるたびに
-            // if を足していくと、足し忘れた用途が黙って貼り付け側へ
-            // 書き込む (= 録音キーが勝手に変わる)。スロット番号から機械的に戻す。
-            let mode = HotkeyMode::from_slot(
-                app.state::<AppState>()
-                    .capture_slot
-                    .load(std::sync::atomic::Ordering::SeqCst),
-            );
+            // 取り消しキーと重なる組み合わせも、押し直せる拒否として扱う。
+            let snapshot = app.state::<AppState>().config.snapshot();
+            if let Some(message) = cancel_clash_message(&snapshot, target, &combo) {
+                log::info!("{message} (捕獲は継続)");
+                return CaptureVerdict::Rejected { message };
+            }
             // 戻り値は使わない。捕獲の結果はイベント (`nox://hotkey-captured`)
             // と、そこから引き直す `get_config` で UI に届く。
-            let _ = commit_combo(&app, mode, &keys, combo);
+            let _ = commit_combo(&app, target, &keys, combo);
             CaptureVerdict::Accepted
         }
     }
@@ -3444,11 +3515,11 @@ Ctrl / Alt / Shift / Win / CapsLock / F1〜F12 などから選んでください
 /// 追加の文脈 (一覧 UI 側の表示など) が要るときだけ戻り値を読む。
 fn commit_combo(
     app: &AppHandle,
-    mode: HotkeyMode,
+    target: KeyTarget,
     pressed: &[u32],
     combo: hotkey::HotkeyCombo,
 ) -> Result<Option<String>, String> {
-    log::info!("ホットキー確定 [{}]: {} ({combo:?})", mode.label(), combo.label());
+    log::info!("ホットキー確定 [{}]: {} ({combo:?})", target.label(), combo.label());
 
     // 抑制を**先に**張ってから捕獲モードを抜ける。逆順だと、その隙間に
     // 押しっぱなしのオートリピートが通常経路へ流れ、設定しただけで録音が
@@ -3459,20 +3530,25 @@ fn commit_combo(
     hotkey::end_capture(None);
 
     let state = app.state::<AppState>();
-    let patch = match mode {
-        HotkeyMode::Inject => config::ConfigPatch {
+    let patch = match target {
+        KeyTarget::Hotkey(HotkeyMode::Inject) => config::ConfigPatch {
             hotkey_vk: Some(combo.vk),
             hotkey_mods: Some(combo.mods_vec()),
             ..Default::default()
         },
-        HotkeyMode::ClipboardOnly => config::ConfigPatch {
+        KeyTarget::Hotkey(HotkeyMode::ClipboardOnly) => config::ConfigPatch {
             clipboard_hotkey_vk: Some(combo.vk),
             clipboard_hotkey_mods: Some(combo.mods_vec()),
             ..Default::default()
         },
-        HotkeyMode::ScreenAsk => config::ConfigPatch {
+        KeyTarget::Hotkey(HotkeyMode::ScreenAsk) => config::ConfigPatch {
             screen_ask_hotkey_vk: Some(combo.vk),
             screen_ask_hotkey_mods: Some(combo.mods_vec()),
+            ..Default::default()
+        },
+        KeyTarget::Cancel => config::ConfigPatch {
+            cancel_vk: Some(combo.vk),
+            cancel_mods: Some(combo.mods_vec()),
             ..Default::default()
         },
     };
@@ -3485,16 +3561,17 @@ fn commit_combo(
             // その場合 `clipboard_hotkey_combo()` は None を返すので、
             // UI には「設定されなかった」ことがそのまま伝わる。
             apply_hotkeys(&updated);
-            let saved = match mode {
-                HotkeyMode::Inject => Some(updated.hotkey_combo()),
-                HotkeyMode::ClipboardOnly => updated.clipboard_hotkey_combo(),
+            let saved = match target {
+                KeyTarget::Hotkey(HotkeyMode::Inject) => Some(updated.hotkey_combo()),
+                KeyTarget::Hotkey(HotkeyMode::ClipboardOnly) => updated.clipboard_hotkey_combo(),
                 // 有効化フラグを見ない方で確認する。無効のまま
                 // キーだけ先に決めるのは正しい操作順なので、
                 // それを「保存できなかった」と報告してはいけない。
-                HotkeyMode::ScreenAsk => hotkey::HotkeyCombo::from_parts(
+                KeyTarget::Hotkey(HotkeyMode::ScreenAsk) => hotkey::HotkeyCombo::from_parts(
                     &updated.screen_ask_hotkey_mods,
                     updated.screen_ask_hotkey_vk,
                 ),
+                KeyTarget::Cancel => updated.cancel_combo(),
             };
             match saved {
                 Some(combo) => {
@@ -4036,6 +4113,49 @@ fn emit_error_from(app: &AppHandle, message: &str, origin: StatusOrigin) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // --- 取り消しキーとの衝突 (保存する前に断る) ---
+
+    #[test]
+    fn a_hotkey_on_the_cancel_key_is_refused_before_saving() {
+        let cfg = config::Config {
+            cancel_vk: 0x78, // F9
+            ..config::Config::default()
+        };
+        let f9 = hotkey::sanitize_combo(&[], 0x78).expect("許可");
+        let target = KeyTarget::Hotkey(HotkeyMode::ClipboardOnly);
+        let message = cancel_clash_message(&cfg, target, &f9).expect("衝突する");
+        assert!(message.contains("F9"), "{message}");
+
+        // 取り消しキーが無効なら断る理由が無い。
+        let disabled = config::Config {
+            cancel_vk: 0,
+            ..config::Config::default()
+        };
+        assert_eq!(cancel_clash_message(&disabled, target, &f9), None);
+    }
+
+    #[test]
+    fn a_cancel_key_on_a_hotkey_is_refused_before_saving() {
+        let cfg = config::Config::default(); // 左 Ctrl + Space
+        let space = hotkey::sanitize_cancel_combo(&[], 0x20).expect("許可");
+        assert!(cancel_clash_message(&cfg, KeyTarget::Cancel, &space).is_some());
+
+        let f9 = hotkey::sanitize_cancel_combo(&[], 0x78).expect("許可");
+        assert_eq!(cancel_clash_message(&cfg, KeyTarget::Cancel, &f9), None);
+    }
+
+    #[test]
+    fn a_cancel_key_on_a_disabled_screen_ask_key_is_still_refused() {
+        // 機能をオンにした瞬間に衝突が生まれると、取り消しキーが黙って変わる。
+        let cfg = config::Config {
+            screen_ask_enabled: false,
+            screen_ask_hotkey_vk: 0x7C, // F13
+            ..config::Config::default()
+        };
+        let f13 = hotkey::sanitize_cancel_combo(&[], 0x7C).expect("許可");
+        assert!(cancel_clash_message(&cfg, KeyTarget::Cancel, &f13).is_some());
+    }
 
     // --- 設定画面の「試す」(test_format_model の本体) ---
 
