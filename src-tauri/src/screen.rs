@@ -1099,7 +1099,7 @@ mod tests {
         // ここが要点。ブラウザのタイトルは平気で 40 文字を超えるので、
         // 文字数だけで判定すると Chrome が「読めた」ことになり、
         // スクリーンショットが添付されなくなる。
-        let title = "設計ドキュメントの読み方について — 社内 Wiki — Google Chrome の長いタイトル";
+        let title = "設計ドキュメントの読み方について — チーム Wiki — Google Chrome の長いタイトル";
         assert!(title.chars().count() > MIN_USABLE_CHARS);
         assert!(!is_usable_text(title, ContextSource::ElementName));
     }
@@ -1293,7 +1293,7 @@ mod tests {
 
     #[test]
     fn a_title_never_displaces_a_body() {
-        let title = "設計ドキュメントの読み方について — 社内 Wiki — Google Chrome";
+        let title = "設計ドキュメントの読み方について — チーム Wiki — Google Chrome";
         let body = "あ".repeat(MIN_USABLE_CHARS);
         assert!(!is_better_read(
             (title, ContextSource::ElementName),

@@ -1,0 +1,15 @@
+# エディタの既定。改行コードはファイルごとに元の形式を保つので end_of_line は決めない
+# (.gitattributes と file-format.yml を参照)。charset は .github/scripts/bom_policy.py と揃える。
+root = true
+
+[*]
+charset = utf-8
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.md]
+trim_trailing_whitespace = false
+
+# Windows PowerShell 5.1 は BOM の無いスクリプトを Shift-JIS として読む
+[*.{ps1,psm1,psd1}]
+charset = utf-8-bom
