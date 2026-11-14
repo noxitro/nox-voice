@@ -1,0 +1,28 @@
+# BOM と改行コードの検査。本体は noxitro/github-templates の共通ワークフロー。
+#
+# 意図して BOM や改行を変えるときは、コミットメッセージに「Format-Change: <パス or glob>」の行を書く。
+# BOM の決まりを変えたいときは .github/scripts/bom_policy.py を置く (雛形は templates/.github/scripts/)。
+# 失敗を Discord に流すなら Secret DISCORD_WEBHOOK_URL を作り、下の secrets のコメントを外す。
+name: File format
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "比較元のリビジョン (空なら直前のコミット)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    uses: noxitro/github-templates/.github/workflows/file-format.yml@main
+    with:
+      base: ${{ inputs.base || '' }}
+    # secrets:
+    #   DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}

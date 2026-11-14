@@ -1,0 +1,21 @@
+# ワークフローの静的検査 (actionlint と、スクリプトの ruff)。本体は noxitro/github-templates の共通ワークフロー。
+name: Workflow lint
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - '.github/**'
+  pull_request:
+    paths:
+      - '.github/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    uses: noxitro/github-templates/.github/workflows/workflow-lint.yml@main
+    # with:
+    #   python-paths: ".github/scripts scripts"   # ruff で見るパス。空文字なら ruff を走らせない
