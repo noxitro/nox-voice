@@ -1,0 +1,15 @@
+# Paths the pre-publish scanner (git-hooks/scan.sh) skips.
+# One path per line, exactly as git lists it. Lines starting with # are comments.
+# Every entry says why it is here.
+
+# Built-in style profiles describe the Teams preset as a chat with colleagues.
+# legacy_v0_profiles() is frozen: its strings must match old saved settings
+# byte for byte, so the wording cannot be changed to satisfy the scanner.
+src-tauri/src/style.rs
+
+# Generates the third-party license notices, so it writes notice lines by design.
+scripts/third-party-notices.mjs
+
+# Holds the app's own copyright notice inside a JSON string. The scanner only
+# accepts the owner's notice when the line ends right after the name.
+src-tauri/tauri.conf.json
