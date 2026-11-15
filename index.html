@@ -365,6 +365,13 @@
                     placeholder="変更するときだけ入力"
                   />
                 </label>
+                <p class="hint">
+                  キーは <code id="dotenv-path"></code> に
+                  <code>GROQ_API_KEY=…</code> / <code>GEMINI_API_KEY=…</code> の形でも書けます。
+                  優先順は <strong>.env &gt; 環境変数 &gt; この画面</strong> で、.env は書き換えると
+                  次の録音から効きます(再起動は不要)。他のアプリと同じ名前の環境変数を
+                  使っていて、nox-voice だけ別のキーにしたいときに使ってください。
+                </p>
                 <label class="field">
                   <span>言語 (空欄で自動判定)</span>
                   <input type="text" id="language" autocomplete="off" />

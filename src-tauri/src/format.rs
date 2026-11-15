@@ -82,7 +82,7 @@ impl fmt::Display for FormatError {
         match self {
             FormatError::MissingApiKey => write!(
                 f,
-                "Gemini の API キーが設定されていません (設定画面または環境変数 GEMINI_API_KEY)"
+                "Gemini の API キーが設定されていません (.env・環境変数 GEMINI_API_KEY・設定画面のいずれか)"
             ),
             FormatError::Unauthorized(b) => {
                 write!(f, "Gemini の認証に失敗しました。API キーを確認してください: {b}")
@@ -2167,7 +2167,8 @@ fn main() {}
             return;
         };
         let cfg: crate::config::Config = serde_json::from_str(&text).expect("設定を読める");
-        // キーは本番と同じ解決 (環境変数優先) を通す。実際この環境では
+        // キーは本番と同じ解決 (.env > 環境変数 > 設定) を通す。テストでは .env の
+        // 場所を設定しないので、実際には環境変数か設定ファイルから来る。実際この環境では
         // 設定ファイル側は空で、キーは環境変数から来ている。
         let Some(key) = cfg.gemini_key().secret else {
             println!("Gemini のキーが解決できないのでスキップします");
