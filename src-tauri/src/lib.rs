@@ -336,7 +336,11 @@ impl AppState {
             limit_rx,
             finalize_tx,
             finalize_rx,
-            config: ConfigStore::load(config_path),
+            // 画面から保存するキーは .env へ (setup で場所を決めてから呼ばれる)。
+            config: ConfigStore::load_with_dotenv(
+                config_path,
+                config::dotenv_path().map(std::path::Path::to_path_buf),
+            ),
             history: HistoryStore::new(db_path),
             retranscribing: Mutex::new(std::collections::HashSet::new()),
             level_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),

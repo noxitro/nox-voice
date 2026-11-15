@@ -366,11 +366,10 @@
                   />
                 </label>
                 <p class="hint">
-                  キーは <code id="dotenv-path"></code> に
-                  <code>GROQ_API_KEY=…</code> / <code>GEMINI_API_KEY=…</code> の形でも書けます。
-                  優先順は <strong>.env &gt; 環境変数 &gt; この画面</strong> で、.env は書き換えると
-                  次の録音から効きます(再起動は不要)。他のアプリと同じ名前の環境変数を
-                  使っていて、nox-voice だけ別のキーにしたいときに使ってください。
+                  ここで保存したキーは <code id="dotenv-path"></code> に書かれ、
+                  同じ名前の環境変数(<code>GROQ_API_KEY</code> / <code>GEMINI_API_KEY</code>)より
+                  優先されます。他のアプリと環境変数を共有していても、nox-voice はここのキーを使います。
+                  キーは平文で保存されます。メモ帳で直接書き換えてもよく、次の録音から効きます(再起動は不要)。
                 </p>
                 <label class="field">
                   <span>言語 (空欄で自動判定)</span>

@@ -726,6 +726,16 @@ impl Config {
         )
     }
 
+    /// `.env` での名前 (`GROQ_API_KEY` / `GEMINI_API_KEY`) から、config.json 側の欄を引く。
+    fn api_key_field(&mut self, name: &str) -> &mut Secret {
+        if name == ENV_GROQ_KEY {
+            &mut self.groq_api_key
+        } else {
+            debug_assert_eq!(name, ENV_GEMINI_KEY);
+            &mut self.gemini_api_key
+        }
+    }
+
     /// Gemini の API キーを解決する (`.env` > 環境変数 > 設定ファイル)。
     pub fn gemini_key(&self) -> ResolvedKey {
         resolve_key_layers(
@@ -902,15 +912,136 @@ fn env_value(name: &str) -> Option<String> {
 /// 書き込むと子プロセスにキーが渡り、他の箇所の `std::env::var` の結果も変わる。
 fn dotenv_value(name: &str) -> Option<String> {
     let path = dotenv_path()?;
-    match fs::read(path) {
-        Ok(bytes) => parse_dotenv_value(&decode_dotenv(&bytes), name),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+    match read_dotenv_text(path) {
+        Ok(text) => parse_dotenv_value(&text, name),
         Err(e) => {
             // 中身はキーなので出さない。場所と原因だけ書く。
             log::warn!(".env を読めません ({}): {e}", path.display());
             None
         }
     }
+}
+
+/// `.env` の本文を読む。**ファイルが無いのは空のファイルと同じ扱い。**
+fn read_dotenv_text(path: &Path) -> std::io::Result<String> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(decode_dotenv(&bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// `.env` の 1 行が代入なら、その名前と **trim 前の**値を返す。
+///
+/// 注釈行・空行・`=` の無い行は `None`。読む側 ([`parse_dotenv_value`]) と
+/// 書く側 ([`render_dotenv`]) が同じ判定を使うための関数 — 別々に書くと、
+/// 「読めるのに書き換えられない行」が生まれて、同じ名前の行が 2 つ残る。
+fn dotenv_assignment(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let line = line
+        .strip_prefix("export")
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .map(str::trim_start)
+        .unwrap_or(line);
+    let (key, value) = line.split_once('=')?;
+    Some((key.trim(), value))
+}
+
+/// `.env` の本文に書き込みを反映した本文を返す (純関数)。
+///
+/// - `Some(値)`: 同じ名前の**最初の行をその場で**書き換える (並び順を保つ)。
+///   無ければ末尾に足す
+/// - `None`: その名前の行を消す
+/// - どちらでも、同じ名前の 2 行目以降は消す (後勝ちで古い値が蘇らないように)
+/// - 他の名前の行・注釈・空行はそのまま残す。改行は CRLF に揃える
+fn render_dotenv(current: &str, writes: &[(&str, Option<String>)]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut done: Vec<&str> = Vec::new();
+    for line in current.lines() {
+        let write = dotenv_assignment(line)
+            .and_then(|(key, _)| writes.iter().find(|(name, _)| *name == key));
+        let Some((name, value)) = write else {
+            out.push(line.to_string());
+            continue;
+        };
+        if !done.contains(name) {
+            done.push(name);
+            if let Some(v) = value {
+                out.push(format!("{name}={v}"));
+            }
+        }
+    }
+    for (name, value) in writes {
+        if !done.contains(name) {
+            if let Some(v) = value {
+                out.push(format!("{name}={v}"));
+            }
+        }
+    }
+    while out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.pop();
+    }
+    if out.is_empty() {
+        return String::new();
+    }
+    let mut text = out.join("\r\n");
+    text.push_str("\r\n");
+    text
+}
+
+/// `.env` に書き込む。アトミック (書きかけのファイルを残さない)。
+///
+/// 書き出しは UTF-8 (BOM 無し)。元が UTF-16 でも、読んで直した本文を
+/// UTF-8 で書き直す (どちらでも読めるので困らない)。
+fn write_dotenv(path: &Path, writes: &[(&str, Option<String>)]) -> Result<(), String> {
+    let current = read_dotenv_text(path)
+        .map_err(|e| format!(".env を読めません ({}): {e}", path.display()))?;
+    if !path.exists() && writes.iter().all(|(_, value)| value.is_none()) {
+        // 無いファイルから消すものは無い。空の .env を作らない。
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("設定ディレクトリを作成できません ({}): {e}", parent.display()))?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, render_dotenv(&current, writes).as_bytes())
+        .map_err(|e| format!(".env を書き出せません ({}): {e}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!(".env を保存できません ({}): {e}", path.display())
+    })?;
+    let names: Vec<&str> = writes.iter().map(|(name, _)| *name).collect();
+    log::info!(".env を更新しました ({}): {}", names.join(", "), path.display());
+    Ok(())
+}
+
+/// 画面から保存する API キーの検査。`.env` の 1 行として壊れない形だけを通す。
+///
+/// 本物のキーは英数字と `_` `-` でできているので、空白・制御文字・引用符は
+/// 貼り付けの事故 (改行ごとコピーした、など) とみなして断る。改行を通すと、
+/// `.env` に**別の行を書き込めてしまう**。
+pub fn validate_api_key(label: &str, raw: &str) -> Result<(), String> {
+    // ASCII の印字可能文字 (空白を除く) だけを通す。ゼロ幅文字や BOM (U+200B /
+    // U+FEFF) は空白にも制御文字にも数えられないが、貼り付けに紛れると 401 になる。
+    if let Some(c) = raw
+        .trim()
+        .chars()
+        .find(|c| !c.is_ascii_graphic() || matches!(c, '"' | '\''))
+    {
+        let shown = if c.is_ascii_graphic() {
+            c.to_string()
+        } else {
+            format!("U+{:04X}", c as u32)
+        };
+        return Err(format!(
+            "{label}に使えない文字「{shown}」が含まれています。キーだけを貼り付けてください"
+        ));
+    }
+    Ok(())
 }
 
 /// `.env` のバイト列を文字列にする。
@@ -943,19 +1074,10 @@ fn decode_dotenv(bytes: &[u8]) -> String {
 fn parse_dotenv_value(text: &str, name: &str) -> Option<String> {
     let mut found = None;
     for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line
-            .strip_prefix("export")
-            .filter(|rest| rest.starts_with(char::is_whitespace))
-            .map(str::trim_start)
-            .unwrap_or(line);
-        let Some((key, value)) = line.split_once('=') else {
+        let Some((key, value)) = dotenv_assignment(line) else {
             continue;
         };
-        if key.trim() != name {
+        if key != name {
             continue;
         }
         // trim する前の値を渡す。`=` の直後の空白も「注釈の前の空白」に数えたい。
@@ -1356,6 +1478,12 @@ impl ConfigPatch {
     /// 断るとき、エラー文は**どの項目の何が駄目か**を名指しする。保存は
     /// 全項目まとめて断られるので、名指しが無いと何を直せばよいか分からない。
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(key) = &self.groq_api_key {
+            validate_api_key("Groq API キー", key)?;
+        }
+        if let Some(key) = &self.gemini_api_key {
+            validate_api_key("Gemini API キー", key)?;
+        }
         if let Some(model) = &self.format_model {
             validate_model_name(FormatProvider::Gemini, model)?;
         }
@@ -1859,6 +1987,12 @@ fn non_empty_or(value: String, fallback: &str) -> String {
 /// 設定の保持と永続化。
 pub struct ConfigStore {
     path: PathBuf,
+    /// 画面から保存した API キーの書き先 (`.env`)。
+    ///
+    /// `None` なら従来どおり config.json に書く。本番は
+    /// [`ConfigStore::load_with_dotenv`] で必ず渡す。単体テストの多くは
+    /// [`ConfigStore::load`] (= `None`) のままで、キーを config.json で往復させる。
+    dotenv: Option<PathBuf>,
     config: Mutex<Config>,
     /// 起動時に設定ファイルが存在したか (初回起動の判定に使う)。
     existed: bool,
@@ -1866,7 +2000,24 @@ pub struct ConfigStore {
 
 impl ConfigStore {
     /// ファイルから読み込む。壊れていても既定値で起動する (落とさない)。
+    ///
+    /// キーの書き先は config.json のまま。本番は [`ConfigStore::load_with_dotenv`] を使う。
+    #[cfg(test)]
     pub fn load(path: PathBuf) -> Self {
+        Self::load_with_dotenv(path, None)
+    }
+
+    /// 読み込んだうえで、画面から保存するキーの書き先を `dotenv` にする。
+    ///
+    /// config.json にキーが残っていれば (0.8.0 より前に画面から保存したもの)、
+    /// ここで `.env` へ移す ([`migrate_keys_to_dotenv`])。
+    pub fn load_with_dotenv(path: PathBuf, dotenv: Option<PathBuf>) -> Self {
+        Self::load_inner(path, dotenv, &env_value)
+    }
+
+    /// 本体。`env` は環境変数の引き方 — 移行の判定に使う。テストから差し替える
+    /// ためだけに引数にしてある (開発機には本物の `GROQ_API_KEY` がありうる)。
+    fn load_inner(path: PathBuf, dotenv: Option<PathBuf>, env: &dyn Fn(&str) -> Option<String>) -> Self {
         let existed = path.exists();
         let config = match fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<Config>(&text) {
@@ -1928,8 +2079,15 @@ impl ConfigStore {
             }
         }
 
+        if let Some(dotenv) = &dotenv {
+            if existed {
+                migrate_keys_to_dotenv(&path, dotenv, &mut config, env);
+            }
+        }
+
         Self {
             path,
+            dotenv,
             config: Mutex::new(config),
             existed,
         }
@@ -1984,7 +2142,12 @@ impl ConfigStore {
     }
 
     /// パッチを適用して保存する。
-    pub fn update(&self, patch: ConfigPatch) -> Result<Config, String> {
+    ///
+    /// `.env` の書き先があれば、**キーは config.json ではなく `.env` に書く**。
+    /// `.env` は解決の最上位なので、画面で入れたキーが、他のアプリと共有している
+    /// 同名の環境変数に負けなくなる。`.env` へ書けたら、config.json に残っていた
+    /// 古い写しは消す (平文のキーを 2 か所に置かない)。
+    pub fn update(&self, mut patch: ConfigPatch) -> Result<Config, String> {
         // 断るなら、ロックを取る前・何も書き換えないうちに断る。
         patch.validate()?;
         let updated = {
@@ -1992,12 +2155,113 @@ impl ConfigStore {
                 .config
                 .lock()
                 .map_err(|_| "設定のロックが毒化しました".to_string())?;
+            if let Some(dotenv) = &self.dotenv {
+                let writes: Vec<(&str, Option<String>)> = [
+                    (ENV_GROQ_KEY, patch.groq_api_key.take()),
+                    (ENV_GEMINI_KEY, patch.gemini_api_key.take()),
+                ]
+                .into_iter()
+                .filter_map(|(name, value)| {
+                    // 空文字 = 消去 (ConfigPatch の約束)。.env からも行を消す。
+                    value.map(|v| (name, Some(v.trim().to_string()).filter(|v| !v.is_empty())))
+                })
+                .collect();
+                if !writes.is_empty() {
+                    // ロックを持ったまま書く。2 つの保存が .env を読み書きし合って
+                    // 片方の変更が消える隙間を作らない。
+                    write_dotenv(dotenv, &writes)?;
+                    for (name, _) in &writes {
+                        *guard.api_key_field(name) = Secret::default();
+                    }
+                }
+            }
             guard.apply(patch);
             guard.clone()
         };
         save(&self.path, &updated)?;
         Ok(updated)
     }
+}
+
+/// config.json に残っている API キーを `.env` へ移す (起動時に 1 回)。
+///
+/// 0.8.0 より前は、画面から保存したキーを config.json に書いていた。保存先が
+/// `.env` に変わったので、残っている写しを `.env` へ寄せる。
+///
+/// **原則: 上げただけで、使われるキーを変えない。**
+///
+/// - **同じ名前の環境変数があれば移さない** (config.json に残す)。0.7.0 までは
+///   環境変数が config.json に勝っていたので、そのキーは使われていなかった。
+///   移すと `.env` (最上位) に入って環境変数を追い越し、**黙って古いキーへ
+///   切り替わる** (Fable レビューの指摘)。画面のキーを勝たせたい人は、画面から
+///   保存し直せば `.env` に入る
+/// - `.env` に同じ名前が既にあれば移さない (手で書いた `.env` を上書きしない)。
+///   値が同じなら config.json の写しだけ消す。違えば残す (どちらが正しいか決められない)
+/// - `.env` へ書けなければ何も変えない。書けたあと config.json の保存に失敗しても、
+///   キーが 2 か所に残るだけで失われはしない (次の起動では `.env` に同名があるので、
+///   値が同じとして写しを消しに行く)
+/// - 失敗しても起動は続ける
+fn migrate_keys_to_dotenv(
+    config_path: &Path,
+    dotenv: &Path,
+    config: &mut Config,
+    env: &dyn Fn(&str) -> Option<String>,
+) {
+    let current = match read_dotenv_text(dotenv) {
+        Ok(text) => text,
+        Err(e) => {
+            log::warn!("キーを .env へ移せません (.env を読めない: {}): {e}", dotenv.display());
+            return;
+        }
+    };
+    let mut writes: Vec<(&str, Option<String>)> = Vec::new();
+    // `.env` に同じ値が既にある = 写しは不要。消すだけで書き込みは要らない。
+    let mut duplicates: Vec<&str> = Vec::new();
+    for name in [ENV_GROQ_KEY, ENV_GEMINI_KEY] {
+        let key = config.api_key_field(name).expose().trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        if let Some(existing) = parse_dotenv_value(&current, name) {
+            if existing == key {
+                duplicates.push(name);
+            } else {
+                log::info!("{name} は .env に別の値があるので、設定ファイルのキーは移しません");
+            }
+            continue;
+        }
+        if env(name).is_some() {
+            log::info!(
+                "{name} は環境変数にもあるので、設定ファイルのキーは移しません \
+                 (移すと使われるキーが変わる。画面から保存し直せば .env に入ります)"
+            );
+            continue;
+        }
+        if validate_api_key(name, &key).is_err() {
+            // 1 行に収まらないキーを書くと .env が壊れる。値は出さない。
+            log::warn!("{name} は .env に書けない文字を含むので、設定ファイルに残します");
+            continue;
+        }
+        writes.push((name, Some(key)));
+    }
+    if writes.is_empty() && duplicates.is_empty() {
+        return;
+    }
+    if !writes.is_empty() {
+        if let Err(e) = write_dotenv(dotenv, &writes) {
+            log::warn!("キーを .env へ移せません: {e}");
+            return;
+        }
+    }
+    let names: Vec<&str> = writes.iter().map(|(name, _)| *name).chain(duplicates).collect();
+    for name in &names {
+        *config.api_key_field(name) = Secret::default();
+    }
+    if let Err(e) = save(config_path, config) {
+        log::warn!("キーを .env へ寄せましたが、設定ファイルから消せません (両方に残ります): {e}");
+        return;
+    }
+    log::info!("設定ファイルの API キーを .env へ寄せました: {}", names.join(", "));
 }
 
 /// 壊れた設定ファイルを `.bak` へ退避する。
@@ -2468,6 +2732,194 @@ mod tests {
         // `export` の後はタブでもよい。`exportK` は別の名前。
         assert_eq!(parse_dotenv_value("export\tK=v", "K").as_deref(), Some("v"));
         assert_eq!(parse_dotenv_value("exportK=v", "K"), None);
+    }
+
+    #[test]
+    fn render_dotenv_rewrites_in_place_and_keeps_other_lines() {
+        let current = "# nox-voice 専用\r\nOTHER=1\r\nGROQ_API_KEY=old\r\nexport GROQ_API_KEY=older\r\n# GROQ_API_KEY=注釈は残す\r\n";
+        let out = render_dotenv(current, &[(ENV_GROQ_KEY, Some("gsk_new".to_string()))]);
+        assert_eq!(
+            out,
+            "# nox-voice 専用\r\nOTHER=1\r\nGROQ_API_KEY=gsk_new\r\n# GROQ_API_KEY=注釈は残す\r\n"
+        );
+        assert_eq!(parse_dotenv_value(&out, ENV_GROQ_KEY).as_deref(), Some("gsk_new"));
+    }
+
+    #[test]
+    fn render_dotenv_appends_missing_names_and_removes_cleared_ones() {
+        let out = render_dotenv(
+            "GROQ_API_KEY=gsk_keep\n",
+            &[(ENV_GEMINI_KEY, Some("AIza_new".to_string()))],
+        );
+        assert_eq!(out, "GROQ_API_KEY=gsk_keep\r\nGEMINI_API_KEY=AIza_new\r\n");
+        let out = render_dotenv(&out, &[(ENV_GROQ_KEY, None)]);
+        assert_eq!(out, "GEMINI_API_KEY=AIza_new\r\n");
+        assert_eq!(render_dotenv("", &[(ENV_GROQ_KEY, None)]), "");
+        assert_eq!(
+            render_dotenv("", &[(ENV_GROQ_KEY, Some("gsk_a".to_string()))]),
+            "GROQ_API_KEY=gsk_a\r\n"
+        );
+    }
+
+    #[test]
+    fn api_keys_with_whitespace_or_quotes_are_rejected() {
+        assert!(validate_api_key("Groq API キー", "  gsk_ok-123_ABC \n").is_ok());
+        let err = validate_api_key("Groq API キー", "gsk_a\nGEMINI_API_KEY=x").unwrap_err();
+        assert!(err.contains("Groq API キー") && err.contains("U+000A"), "{err}");
+        assert!(!err.contains("gsk_a"), "キーをエラー文に出さない: {err}");
+        assert!(validate_api_key("k", "gsk a").is_err());
+        assert!(validate_api_key("k", "\"gsk\"").is_err());
+        let patch = ConfigPatch {
+            gemini_api_key: Some("AIza\tbad".to_string()),
+            ..ConfigPatch::default()
+        };
+        assert!(patch.validate().is_err());
+    }
+
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nox-dotenv-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("一時フォルダ");
+        dir
+    }
+
+    #[test]
+    fn saving_a_key_from_the_screen_writes_dotenv_not_config_json() {
+        let dir = fresh_dir("save");
+        let (path, dotenv) = (dir.join("config.json"), dir.join(DOTENV_FILE_NAME));
+        fs::write(&dotenv, "# 手で書いた注釈\r\nGEMINI_API_KEY=AIza_hand\r\n").unwrap();
+        let store = ConfigStore::load_with_dotenv(path.clone(), Some(dotenv.clone()));
+        let updated = store
+            .update(ConfigPatch {
+                groq_api_key: Some(" gsk_screen ".to_string()),
+                language: Some("en".to_string()),
+                ..ConfigPatch::default()
+            })
+            .expect("保存できる");
+
+        let env_text = fs::read_to_string(&dotenv).unwrap();
+        assert_eq!(parse_dotenv_value(&env_text, ENV_GROQ_KEY).as_deref(), Some("gsk_screen"));
+        assert_eq!(parse_dotenv_value(&env_text, ENV_GEMINI_KEY).as_deref(), Some("AIza_hand"));
+        assert!(env_text.contains("# 手で書いた注釈"), "{env_text}");
+        let json = fs::read_to_string(&path).unwrap();
+        assert!(!json.contains("gsk_screen"), "config.json にキーを書かない: {json}");
+        assert!(updated.groq_api_key.is_empty());
+        assert_eq!(updated.language, "en");
+
+        // 空文字 = 消去。.env からも行が消える。
+        store
+            .update(ConfigPatch {
+                groq_api_key: Some(String::new()),
+                ..ConfigPatch::default()
+            })
+            .expect("消去できる");
+        let env_text = fs::read_to_string(&dotenv).unwrap();
+        assert_eq!(parse_dotenv_value(&env_text, ENV_GROQ_KEY), None);
+        assert_eq!(parse_dotenv_value(&env_text, ENV_GEMINI_KEY).as_deref(), Some("AIza_hand"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejected_key_changes_neither_dotenv_nor_config_json() {
+        let dir = fresh_dir("reject");
+        let (path, dotenv) = (dir.join("config.json"), dir.join(DOTENV_FILE_NAME));
+        let store = ConfigStore::load_with_dotenv(path.clone(), Some(dotenv.clone()));
+        let result = store.update(ConfigPatch {
+            groq_api_key: Some("gsk_a\nOTHER=1".to_string()),
+            language: Some("en".to_string()),
+            ..ConfigPatch::default()
+        });
+        assert!(result.is_err());
+        assert!(!dotenv.exists());
+        assert!(!path.exists());
+        assert_eq!(store.snapshot().language, Config::default().language);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keys_left_in_config_json_move_to_dotenv_on_load() {
+        let dir = fresh_dir("migrate");
+        let (path, dotenv) = (dir.join("config.json"), dir.join(DOTENV_FILE_NAME));
+        // 0.8.0 より前に画面から保存した形。Gemini は .env に手で書いたものがある。
+        let old = Config {
+            groq_api_key: Secret::new("gsk_from_json"),
+            gemini_api_key: Secret::new("AIza_from_json"),
+            ..Config::default()
+        };
+        save(&path, &old).unwrap();
+        fs::write(&dotenv, "GEMINI_API_KEY=AIza_hand\r\n").unwrap();
+
+        let no_env = |_: &str| None;
+        let store = ConfigStore::load_inner(path.clone(), Some(dotenv.clone()), &no_env);
+        let env_text = fs::read_to_string(&dotenv).unwrap();
+        assert_eq!(parse_dotenv_value(&env_text, ENV_GROQ_KEY).as_deref(), Some("gsk_from_json"));
+        // 手で書いた .env は上書きしない。config.json の写しも消さない。
+        assert_eq!(parse_dotenv_value(&env_text, ENV_GEMINI_KEY).as_deref(), Some("AIza_hand"));
+        let snap = store.snapshot();
+        assert!(snap.groq_api_key.is_empty());
+        assert_eq!(snap.gemini_api_key.expose(), "AIza_from_json");
+        let json = fs::read_to_string(&path).unwrap();
+        assert!(!json.contains("gsk_from_json"), "{json}");
+        assert!(json.contains("AIza_from_json"), "{json}");
+
+        // 2 回目の起動では何も変わらない (冪等)。
+        drop(store);
+        let _ = ConfigStore::load_inner(path.clone(), Some(dotenv.clone()), &no_env);
+        assert_eq!(fs::read_to_string(&dotenv).unwrap(), env_text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_never_changes_which_key_is_used() {
+        // 0.7.0 では環境変数が config.json に勝っていた。上げただけで、隠れていた
+        // 古い画面キーが .env (最上位) に入って環境変数を追い越してはいけない。
+        let dir = fresh_dir("migrate-env");
+        let (path, dotenv) = (dir.join("config.json"), dir.join(DOTENV_FILE_NAME));
+        let old = Config {
+            groq_api_key: Secret::new("gsk_stale_in_json"),
+            gemini_api_key: Secret::new("AIza_same"),
+            ..Config::default()
+        };
+        save(&path, &old).unwrap();
+        fs::write(&dotenv, "GEMINI_API_KEY=AIza_same\r\n").unwrap();
+        let groq_env = |name: &str| (name == ENV_GROQ_KEY).then(|| "gsk_live_env".to_string());
+
+        let store = ConfigStore::load_inner(path.clone(), Some(dotenv.clone()), &groq_env);
+        let env_text = fs::read_to_string(&dotenv).unwrap();
+        assert_eq!(parse_dotenv_value(&env_text, ENV_GROQ_KEY), None, "{env_text}");
+        let snap = store.snapshot();
+        assert_eq!(snap.groq_api_key.expose(), "gsk_stale_in_json");
+        // .env と同じ値の写しは消える (平文を 2 か所に置かない)。
+        assert!(snap.gemini_api_key.is_empty());
+        let json = fs::read_to_string(&path).unwrap();
+        assert!(!json.contains("AIza_same"), "{json}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clearing_a_key_without_dotenv_creates_no_file() {
+        let dir = fresh_dir("clear");
+        let dotenv = dir.join(DOTENV_FILE_NAME);
+        write_dotenv(&dotenv, &[(ENV_GROQ_KEY, None)]).expect("何もしない");
+        assert!(!dotenv.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn api_keys_with_invisible_characters_are_rejected() {
+        for bad in ["\u{200B}gsk_a", "gsk_\u{FEFF}a", "gsk_a\u{7F}", "gsk_あ"] {
+            let err = validate_api_key("Groq API キー", bad).expect_err(bad);
+            assert!(err.contains("U+"), "{err}");
+        }
+    }
+
+    #[test]
+    fn first_run_without_config_json_creates_no_dotenv() {
+        let dir = fresh_dir("first");
+        let (path, dotenv) = (dir.join("config.json"), dir.join(DOTENV_FILE_NAME));
+        let _ = ConfigStore::load_with_dotenv(path, Some(dotenv.clone()));
+        assert!(!dotenv.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
