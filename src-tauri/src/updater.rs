@@ -45,12 +45,20 @@
 //! 書くことになるが、そこまでして黙らせる理由が無い。
 //! トレイから「更新を確認」を選んだときは、結果を必ず返す (選んだのに無反応は
 //! 壊れているのと区別できない)。
+//!
+//! # 画面の「更新を確認」ボタン
+//!
+//! メイン画面の版表示の横にも同じ操作を置く。状態はトレイと**同じもの**を
+//! 共有し ([`UpdateView`])、変わるたびに `nox://update` で画面へ送る。
+//! 画面から確かめたとき ([`Trigger::Window`]) はトーストを出さない — 結果は
+//! 押したボタンのすぐ横に出るので、トーストは同じことを二度言うだけになる。
 
 use std::sync::Mutex;
 use std::time::Duration;
 
+use serde::Serialize;
 use tauri::menu::MenuItem;
-use tauri::{AppHandle, Manager, Wry};
+use tauri::{AppHandle, Emitter, Manager, Wry};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::session::Status;
@@ -79,6 +87,49 @@ pub enum Trigger {
     Scheduled,
     /// トレイの「更新を確認」。結果を必ず知らせる。
     Manual,
+    /// メイン画面のボタン。結果は画面に出すので、トーストは出さない。
+    Window,
+}
+
+/// 画面へ送る更新の状態。トレイの 2 項目と同じ状態から作る ([`view_of`])。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum UpdateView {
+    /// まだ一度も確かめていない (起動後 30 秒の間など)。
+    Idle,
+    /// 確認かダウンロードの最中。
+    Checking,
+    /// 直近の確認で最新だった。
+    UpToDate,
+    /// 新しい版を入れられる。
+    Ready { version: String },
+    /// 直近の確認に失敗した。
+    Failed { reason: String },
+}
+
+/// 状態から画面の表示を決める (純関数)。
+///
+/// 準備済みの版があれば、確認中でも失敗のあとでも `Ready` を見せる — いつでも
+/// 入れられるから (トレイの「更新して再起動」も確認中に押せる。6 時間ごとの
+/// 再確認のたびに画面のボタンだけが消えると、トレイと食い違う)。
+pub fn view_of(running: bool, ready: Option<&str>, last: Option<&CheckOutcome>) -> UpdateView {
+    if let Some(version) = ready {
+        return UpdateView::Ready {
+            version: version.to_string(),
+        };
+    }
+    if running {
+        return UpdateView::Checking;
+    }
+    match last {
+        Some(CheckOutcome::UpToDate) => UpdateView::UpToDate,
+        Some(CheckOutcome::Failed { reason }) => UpdateView::Failed {
+            reason: reason.clone(),
+        },
+        // 「準備できた」はずが手元に無い = 入れるのに失敗して取り下げた等。
+        // 押せば確かめ直せる初期状態に戻す。
+        Some(CheckOutcome::Ready { .. }) | None => UpdateView::Idle,
+    }
 }
 
 /// 1 回の確認の結末。
@@ -102,6 +153,7 @@ pub fn report_message(
     already_notified: bool,
 ) -> Option<String> {
     match (trigger, outcome) {
+        (Trigger::Window, _) => None,
         (Trigger::Manual, CheckOutcome::UpToDate) => Some(format!("最新です (v{current_version})")),
         (Trigger::Scheduled, CheckOutcome::UpToDate) => None,
         (Trigger::Scheduled, CheckOutcome::Ready { .. }) if already_notified => None,
@@ -194,6 +246,8 @@ struct Inner {
     ready: Option<Ready>,
     /// 定期の確認で知らせ済みの版。
     notified: Option<String>,
+    /// 直近の確認の結末 (画面の表示に使う)。
+    last: Option<CheckOutcome>,
 }
 
 /// 更新の状態。`app.manage` で登録する。
@@ -238,6 +292,28 @@ impl UpdaterState {
     }
 }
 
+/// いまの状態を画面向けに読む。
+pub fn current_view(app: &AppHandle) -> UpdateView {
+    let Some(state) = app.try_state::<UpdaterState>() else {
+        return UpdateView::Idle;
+    };
+    let Ok(inner) = state.inner.lock() else {
+        return UpdateView::Idle;
+    };
+    view_of(
+        inner.running,
+        inner.ready.as_ref().map(|r| r.update.version.as_str()),
+        inner.last.as_ref(),
+    )
+}
+
+/// 状態が変わったことを画面へ知らせる。窓が閉じていても害は無い (受け手が居ないだけ)。
+fn publish(app: &AppHandle) {
+    if let Err(e) = app.emit("nox://update", current_view(app)) {
+        log::warn!("更新の状態を画面へ送れません: {e}");
+    }
+}
+
 /// 更新のトースト。
 ///
 /// `crate::notify` は使わない。あちらは WebView へ**エラー**としても送るので、
@@ -277,6 +353,11 @@ pub fn check_now(app: &AppHandle) {
     spawn_check(app, Trigger::Manual);
 }
 
+/// 画面の「更新を確認」。結果は `nox://update` で画面に出る。
+pub fn check_from_window(app: &AppHandle) {
+    spawn_check(app, Trigger::Window);
+}
+
 /// 確認を 1 本、非同期に走らせる。既に走っていれば何もしない。
 fn spawn_check(app: &AppHandle, trigger: Trigger) {
     let Some(state) = app.try_state::<UpdaterState>() else {
@@ -297,6 +378,7 @@ fn spawn_check(app: &AppHandle, trigger: Trigger) {
         inner.running = true;
     }
     state.set_running(true);
+    publish(app);
 
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -401,6 +483,7 @@ fn finish_check(app: &AppHandle, trigger: Trigger, outcome: CheckOutcome) {
                 // ものなので入れさせない (Release を消した・差し戻した場合)。
                 inner.ready = None;
             }
+            inner.last = Some(outcome.clone());
             let already = match &outcome {
                 CheckOutcome::Ready { version } => {
                     let already = !should_notify(version, inner.notified.as_deref());
@@ -421,37 +504,60 @@ fn finish_check(app: &AppHandle, trigger: Trigger, outcome: CheckOutcome) {
     };
     state.set_running(false);
     state.set_ready(ready_version.as_deref());
+    publish(app);
 
     let current = app.package_info().version.to_string();
+    // 画面から確かめたあと窓を隠すと (ダウンロードは最長 10 分)、結果を見る場所が
+    // 無くなる。その間に準備できたら、トレイの手動確認と同じく知らせる。
+    let trigger = if trigger == Trigger::Window && !main_window_visible(app) {
+        Trigger::Manual
+    } else {
+        trigger
+    };
     if let Some(message) = report_message(trigger, &outcome, &current, already_notified) {
         toast(app, &message);
     }
 }
 
-/// トレイの「更新して再起動」。
+/// メイン画面が見えているか。取れなければ「見えていない」側に倒す (知らせ損ねない)。
+fn main_window_visible(app: &AppHandle) -> bool {
+    app.get_webview_window("main")
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false)
+}
+
+/// トレイの「更新して再起動」。断ったり失敗したりした理由はトーストで言う。
+pub fn install_now(app: &AppHandle) {
+    if let Err(reason) = install(app) {
+        toast(app, &reason);
+    }
+}
+
+/// 準備済みの更新を入れる。トレイと画面の共通の本体。
 ///
 /// 成功すればこの関数は戻らない (プラグインがプロセスを終了させる)。
-pub fn install_now(app: &AppHandle) {
+/// 戻ってきたら断ったか失敗したかで、利用者に見せる理由を `Err` で返す。
+pub fn install(app: &AppHandle) -> Result<(), String> {
     let status = crate::current_status(app);
     let queued = crate::queued_jobs(app);
     if let Err(reason) = can_install_now(status, queued) {
         log::info!("更新を見送り: {reason} (状態 {status:?} / 待ち {queued})");
-        toast(app, reason);
-        return;
+        return Err(reason.to_string());
     }
 
     let Some(state) = app.try_state::<UpdaterState>() else {
-        return;
+        return Err("更新の状態を読めません".to_string());
     };
     let ready = match state.inner.lock() {
         Ok(mut inner) => inner.ready.take(),
         Err(_) => None,
     };
     let Some(ready) = ready else {
-        // 項目は準備済みのときしか押せないので、ここへは来ないはず。
+        // 準備済みのときしか押せないので、ここへは来ないはず。
         log::warn!("準備済みの更新が無いのに「更新して再起動」が選ばれた");
         state.set_ready(None);
-        return;
+        publish(app);
+        return Err("入れられる更新がありません。もう一度「更新を確認」してください".to_string());
     };
 
     log::info!(
@@ -462,17 +568,17 @@ pub fn install_now(app: &AppHandle) {
     if let Err(e) = ready.update.install(&ready.bytes) {
         // フックは畳んでいないので、今の版のまま録音は続けられる (モジュールの doc)。
         log::error!("更新を入れられませんでした: {e}");
-        toast(
-            app,
-            &format!("更新を入れられませんでした: {}", describe_error(&e)),
-        );
+        let reason = format!("更新を入れられませんでした: {}", describe_error(&e));
         // もう一度選べるように戻しておく。
         let version = ready.update.version.clone();
         if let Ok(mut inner) = state.inner.lock() {
             inner.ready = Some(ready);
         }
         state.set_ready(Some(&version));
+        publish(app);
+        return Err(reason);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -540,6 +646,67 @@ mod tests {
             reason: "offline".into(),
         };
         assert!(report_message(Trigger::Scheduled, &failed, "0.7.0", false).is_none());
+    }
+
+    #[test]
+    fn window_check_never_toasts() {
+        // 画面のボタンは結果をその場に出す。トーストは同じことを二度言うだけ。
+        let ready = CheckOutcome::Ready {
+            version: "0.8.1".into(),
+        };
+        let failed = CheckOutcome::Failed { reason: "x".into() };
+        for outcome in [&CheckOutcome::UpToDate, &ready, &failed] {
+            assert!(report_message(Trigger::Window, outcome, "0.8.0", false).is_none());
+        }
+    }
+
+    #[test]
+    fn view_prefers_checking_then_ready_then_last_outcome() {
+        let failed = CheckOutcome::Failed {
+            reason: "offline".into(),
+        };
+        assert_eq!(view_of(true, None, None), UpdateView::Checking);
+        // 準備済みなら、再確認の最中でも入れられる (トレイと同じ)
+        assert_eq!(
+            view_of(true, Some("0.8.1"), None),
+            UpdateView::Ready {
+                version: "0.8.1".into()
+            }
+        );
+        // 準備済みなら、そのあとの確認が失敗しても入れられる
+        assert_eq!(
+            view_of(false, Some("0.8.1"), Some(&failed)),
+            UpdateView::Ready {
+                version: "0.8.1".into()
+            }
+        );
+        assert_eq!(
+            view_of(false, None, Some(&CheckOutcome::UpToDate)),
+            UpdateView::UpToDate
+        );
+        assert_eq!(
+            view_of(false, None, Some(&failed)),
+            UpdateView::Failed {
+                reason: "offline".into()
+            }
+        );
+        assert_eq!(view_of(false, None, None), UpdateView::Idle);
+        // 「準備できた」のに手元に無い (取り下げた) なら、確かめ直せる状態へ
+        let ready = CheckOutcome::Ready {
+            version: "0.8.1".into(),
+        };
+        assert_eq!(view_of(false, None, Some(&ready)), UpdateView::Idle);
+    }
+
+    #[test]
+    fn view_serializes_with_a_state_tag() {
+        let json = serde_json::to_string(&UpdateView::Ready {
+            version: "0.8.1".into(),
+        })
+        .unwrap();
+        assert_eq!(json, "{\"state\":\"ready\",\"version\":\"0.8.1\"}");
+        let json = serde_json::to_string(&UpdateView::UpToDate).unwrap();
+        assert_eq!(json, "{\"state\":\"up_to_date\"}");
     }
 
     #[test]

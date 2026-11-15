@@ -260,6 +260,10 @@
           failing,
           /** コマンド名 -> 応答を遅らせるミリ秒。IPC の往復時間を模す。 */
           delays: {},
+          /** 更新の状態 (updater::UpdateView)。`get_update_state` が返す。 */
+          update: { state: "idle" },
+          /** `install_update` を断る理由。`null` なら成功 (= 本物ならアプリが終了する)。 */
+          installRefusal: null,
           /** 登録済みリスナ: event 名 -> handler id の配列。 */
           listeners: new Map(),
           callbacks: new Map(),
@@ -393,6 +397,16 @@
               return Promise.resolve();
             case "get_status":
               return Promise.resolve("idle");
+            case "get_update_state":
+              return Promise.resolve(structuredClone(mock.update));
+            case "check_update":
+              // 本物はすぐ戻り、結果は nox://update で届く。テストが emit で結果を送る。
+              mock.update = { state: "checking" };
+              return Promise.resolve(null);
+            case "install_update":
+              return mock.installRefusal
+                ? Promise.reject(mock.installRefusal)
+                : Promise.resolve(null);
             case "get_last_session":
               return Promise.resolve(null);
             case "get_last_result":

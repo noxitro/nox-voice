@@ -2306,6 +2306,105 @@ async function main() {
     };
   });
 
+  await check("U26 版の横の更新ボタン: 確認中 (フォーカスは残る) → 準備済みで「更新して再起動」→ 断られたら理由 → 最新 / 失敗を言い分ける", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      const m = window.__NOX_MOCK__;
+      const button = document.getElementById("update-button");
+      const version = document.getElementById("app-version");
+      const note = document.getElementById("update-note");
+      const wait = () => new Promise((r) => setTimeout(r, 50));
+      const snap = () => ({
+        version: version.textContent,
+        button: button.textContent,
+        disabled: button.getAttribute("aria-disabled") === "true",
+        // 押しても無効化 (disabled) しないので、フォーカスはボタンに残る
+        focused: document.activeElement === button,
+        ready: button.classList.contains("is-ready"),
+        note: note.textContent || null,
+        noteError: note.classList.contains("is-error"),
+      });
+      const initial = snap();
+      button.focus();
+      button.click();
+      await wait();
+      const checking = { ...snap(), called: m.count("check_update") };
+      // 確認中に押しても、もう 1 本は走らない
+      button.click();
+      await wait();
+      const checkingAgain = m.count("check_update");
+      m.emit("nox://update", { state: "ready", version: "9.9.9" });
+      await wait();
+      const ready = snap();
+      m.installRefusal = "録音中のため更新できません。録音が終わってからもう一度選んでください";
+      button.click();
+      await wait();
+      const refused = { ...snap(), installCalls: m.count("install_update") };
+      // 別の版が準備できたら、前の版について断られた理由は消える
+      m.emit("nox://update", { state: "ready", version: "9.9.10" });
+      await wait();
+      const newerReady = snap();
+      // 入れようとしたら準備済みの版が無かった: idle と理由が同時に届く
+      m.installRefusal = "入れられる更新がありません。もう一度「更新を確認」してください";
+      button.click();
+      m.emit("nox://update", { state: "idle" });
+      await wait();
+      const vanished = snap();
+      m.emit("nox://update", { state: "up_to_date" });
+      await wait();
+      const upToDate = snap();
+      m.emit("nox://update", { state: "failed", reason: "offline" });
+      await wait();
+      const failed = snap();
+      return { initial, checking, checkingAgain, ready, refused, newerReady, vanished, upToDate, failed };
+    `);
+    const v = r.initial.version;
+    const ok =
+      /^v\d+\.\d+\.\d+$/.test(v) &&
+      r.initial.button === "更新を確認" && r.initial.note === null && !r.initial.disabled &&
+      r.checking.button === "確認中…" && r.checking.disabled && r.checking.called === 1 &&
+      r.checking.focused && r.checkingAgain === 1 &&
+      r.ready.version === `${v} → v9.9.9` && r.ready.button === "更新して再起動" && r.ready.ready &&
+      r.ready.focused &&
+      r.refused.installCalls === 1 && r.refused.ready && r.refused.noteError &&
+      r.refused.note.includes("録音中") &&
+      r.newerReady.version === `${v} → v9.9.10` && r.newerReady.note === null &&
+      !r.vanished.ready && r.vanished.button === "更新を確認" && r.vanished.noteError &&
+      (r.vanished.note ?? "").includes("入れられる更新がありません") &&
+      r.upToDate.note === "最新です" && !r.upToDate.noteError && r.upToDate.button === "更新を確認" &&
+      !r.upToDate.ready && r.upToDate.focused &&
+      r.failed.note === "確認できませんでした: offline" && r.failed.noteError;
+    return { ok, detail: JSON.stringify(r) };
+  });
+
+  await check("U26b 畳んだレール (420px) では更新ボタンを出さず、入れられる版があるとロゴの角に点が出る", async () => {
+    await setViewport(cdp, 420, 420);
+    await load(cdp);
+    const r = await cdp.run(`
+      const m = window.__NOX_MOCK__;
+      const button = document.getElementById("update-button");
+      const mark = document.querySelector(".brand-mark");
+      const dot = () => getComputedStyle(mark, "::after").content;
+      const before = { display: getComputedStyle(button).display, dot: dot() };
+      m.emit("nox://update", { state: "ready", version: "9.9.9" });
+      await new Promise((r) => setTimeout(r, 50));
+      return {
+        before,
+        after: { display: getComputedStyle(button).display, dot: dot() },
+        title: document.querySelector(".brand").title,
+      };
+    `);
+    // 他の検査と同じ既定の大きさへ戻す (main の冒頭と同じ値)
+    await setViewport(cdp, 1280, 900);
+    return {
+      ok:
+        r.before.display === "none" && r.before.dot === "none" &&
+        r.after.display === "none" && r.after.dot === '""' &&
+        r.title.includes("v9.9.9"),
+      detail: JSON.stringify(r),
+    };
+  });
+
   const failed = results.filter((r) => r.verdict === "FAIL");
   console.log(`\n=== PASS ${results.length - failed.length} / FAIL ${failed.length} (全 ${results.length}) ===`);
   console.log("疑似テストなので、緑でも実機 E2E (e2e/hotkey.mjs) の代わりにはならない。");

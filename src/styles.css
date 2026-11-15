@@ -129,6 +129,89 @@ svg[hidden] {
   font-variant-numeric: tabular-nums;
 }
 
+/* 版の行。新しい版があると「更新して再起動」が並び、狭ければ折り返す */
+.brand-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: var(--space-2);
+  row-gap: var(--space-1);
+  min-width: 0;
+}
+
+/* 普段は版の横に添える文字だけのボタン。押せることは下線で示す
+   (枠付きにすると、ロゴの横で一番強い要素になってしまう) */
+.brand-update {
+  position: relative;
+  min-height: 0;
+  padding: 1px 2px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  line-height: 1.3;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+  text-underline-offset: 2px;
+}
+
+/* 文字だけだと押せる高さが 17px ほどしかない。見た目は変えずに、押せる範囲を
+   上下に広げて 24px 以上にする (WCAG 2.5.8) */
+.brand-update::before {
+  content: "";
+  position: absolute;
+  inset: -4px -2px;
+}
+
+.brand-update:hover:not([aria-disabled="true"]) {
+  background: none;
+  color: var(--text-primary);
+  text-decoration-color: currentColor;
+}
+
+/* 確認中は押しても何もしない (aria-disabled。フォーカスは残す)。薄くしすぎない
+   (何が起きているかの文言なので) */
+.brand-update[aria-disabled="true"] {
+  opacity: 1;
+  color: var(--text-tertiary);
+  text-decoration: none;
+  cursor: default;
+}
+
+/* 新しい版を入れられるときだけ、強調色の小さなボタンにする */
+.brand-update.is-ready {
+  min-height: 24px;
+  padding: 0 var(--space-2);
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.brand-update.is-ready:hover:not([aria-disabled="true"]) {
+  background: var(--accent-hover);
+  color: var(--accent-text);
+}
+
+.brand-update-note {
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  /* 失敗の理由は英語の長文になりうる。2 行で切り、全文は title で読ませる */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+
+.brand-update-note.is-error {
+  color: var(--status-danger);
+}
+
 .nav {
   list-style: none;
   display: grid;
@@ -1313,6 +1396,30 @@ label[hidden] {
   .brand {
     justify-content: center;
     padding: var(--space-1);
+  }
+
+  /* 畳んだレールでは版の文字が見えないので、更新ボタンも出さない (見えない
+     ボタンにフォーカスが止まるのを避ける)。入れられる版があることだけ、
+     ロゴの角の点で知らせる。操作はウィンドウを広げるかトレイから。 */
+  .brand-update,
+  .brand-update-note {
+    display: none;
+  }
+
+  .brand-mark {
+    position: relative;
+  }
+
+  .brand[data-update="ready"] .brand-mark::after {
+    content: "";
+    position: absolute;
+    top: -3px;
+    right: -3px;
+    width: 9px;
+    height: 9px;
+    border: 2px solid var(--surface-rail);
+    border-radius: 50%;
+    background: var(--status-ok);
   }
 
   /* ラベルは display:none にしない。消すとアクセシビリティツリーからも

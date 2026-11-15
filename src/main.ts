@@ -556,6 +556,150 @@ function renderResult(r: ResultPayload) {
   }
 }
 
+/** Rust 側 `updater::UpdateView` と対応。トレイの 2 項目と同じ状態。 */
+type UpdateView =
+  | { state: "idle" }
+  | { state: "checking" }
+  | { state: "up_to_date" }
+  | { state: "ready"; version: string }
+  | { state: "failed"; reason: string };
+
+/** 版表示の横の更新ボタンに出すもの。 */
+interface UpdateUi {
+  version: string;
+  button: string;
+  disabled: boolean;
+  ready: boolean;
+  /** ボタンの下の 1〜2 行。`null` なら出さない。 */
+  note: string | null;
+  noteIsError: boolean;
+}
+
+/**
+ * 更新の状態から表示を決める (純関数)。
+ *
+ * `refusal` は「更新して再起動」を断られた / 失敗した理由 (録音中など)。状態
+ * そのものは変わらない (準備済みのまま) ことが多いので、状態とは別に持って重ね、
+ * 状態の注記より優先して出す。
+ */
+function updateUi(view: UpdateView, current: string, refusal: string | null): UpdateUi {
+  const base = `v${current}`;
+  const withRefusal = (ui: UpdateUi): UpdateUi =>
+    refusal === null ? ui : { ...ui, note: refusal, noteIsError: true };
+  switch (view.state) {
+    case "checking":
+      return { version: base, button: "確認中…", disabled: true, ready: false, note: null, noteIsError: false };
+    case "ready":
+      return withRefusal({
+        version: `${base} → v${view.version}`,
+        button: "更新して再起動",
+        disabled: false,
+        ready: true,
+        note: null,
+        noteIsError: false,
+      });
+    case "up_to_date":
+      return { version: base, button: "更新を確認", disabled: false, ready: false, note: "最新です", noteIsError: false };
+    case "failed":
+      return {
+        version: base,
+        button: "更新を確認",
+        disabled: false,
+        ready: false,
+        note: `確認できませんでした: ${view.reason}`,
+        noteIsError: true,
+      };
+    case "idle":
+      // 入れようとしたら準備済みの版が無かった、などの理由はここに出る
+      return withRefusal({
+        version: base,
+        button: "更新を確認",
+        disabled: false,
+        ready: false,
+        note: null,
+        noteIsError: false,
+      });
+  }
+}
+
+let updateView: UpdateView = { state: "idle" };
+let updateRefusal: string | null = null;
+
+function renderUpdate() {
+  const ui = updateUi(updateView, __APP_VERSION__, updateRefusal);
+  const version = el("app-version");
+  if (version) version.textContent = ui.version;
+  const button = el<HTMLButtonElement>("update-button");
+  if (button) {
+    button.textContent = ui.button;
+    // `disabled` にはしない。押した直後に無効にするとフォーカスが文書の先頭へ
+    // 落ち、確認が終わっても戻らない (キーボードだと Tab し直しになる。
+    // design.md「一覧はキーボードで通せる」と同じ問題)。押しても無視するだけにする。
+    button.setAttribute("aria-disabled", String(ui.disabled));
+    button.classList.toggle("is-ready", ui.ready);
+  }
+  const note = el("update-note");
+  if (note) {
+    // ライブリージョンは常にツリーに置き、中身だけ変える (出し入れと同時に
+    // 中身を入れると読み上げられない組み合わせがある)。空なら高さは 0。
+    note.textContent = ui.note ?? "";
+    // 2 行で切るので、全文はマウスを載せれば読めるようにする
+    note.title = ui.note ?? "";
+    note.classList.toggle("is-error", ui.noteIsError);
+  }
+  // 畳んだレールでは文字が見えないので、ロゴの角の点で知らせる (CSS)
+  const brand = document.querySelector<HTMLElement>(".brand");
+  if (brand) {
+    brand.dataset.update = updateView.state;
+    brand.title =
+      updateView.state === "ready" ? `新しい版 v${updateView.version} を入れられます` : "";
+  }
+}
+
+/**
+ * 断られた理由を、新しい状態でも出し続けるか。新しい情報 (確認の開始・結末、
+ * 別の版の準備) が来たら古い理由は当てはまらないので消す。`idle` は残す —
+ * 「入れられる更新がありません」は idle への切り替えと同時に届く。
+ */
+function keepsRefusal(prev: UpdateView, next: UpdateView): boolean {
+  if (next.state === "idle") return true;
+  if (next.state === "ready") return prev.state === "ready" && prev.version === next.version;
+  return false;
+}
+
+function setUpdateView(view: UpdateView) {
+  if (!keepsRefusal(updateView, view)) updateRefusal = null;
+  updateView = view;
+  renderUpdate();
+}
+
+async function onUpdateButton() {
+  if (updateView.state === "checking") return;
+  updateRefusal = null;
+  if (updateView.state === "ready") {
+    renderUpdate();
+    try {
+      // 成功すればアプリが終了して、ここへは戻らない
+      await invoke("install_update");
+    } catch (e) {
+      updateRefusal = String(e);
+      renderUpdate();
+    }
+    return;
+  }
+  // 結果を待たずに「確認中」にする (押したのに無反応に見せない)。
+  // 本当の状態は nox://update で上書きされる。
+  setUpdateView({ state: "checking" });
+  try {
+    await invoke("check_update");
+    // 確認が始まらなかった場合 (状態を読めない等) は emit が来ないので、
+    // ここで実際の状態を読み直して「確認中」のまま止まらないようにする。
+    setUpdateView(await invoke<UpdateView>("get_update_state"));
+  } catch (e) {
+    setUpdateView({ state: "failed", reason: String(e) });
+  }
+}
+
 async function copyText(kind: "formatted" | "raw", button: HTMLButtonElement) {
   if (!lastResult) return;
   const text = kind === "formatted" ? lastResult.text : lastResult.raw_text;
@@ -2881,8 +3025,8 @@ async function previewSound(kind: "start" | "cancel") {
 
 window.addEventListener("DOMContentLoaded", async () => {
   setupNav();
-  const version = el("app-version");
-  if (version) version.textContent = `v${__APP_VERSION__}`;
+  renderUpdate();
+  el("update-button")?.addEventListener("click", () => void onUpdateButton());
 
   document.querySelectorAll<HTMLButtonElement>("button.copy").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -3038,6 +3182,14 @@ window.addEventListener("DOMContentLoaded", async () => {
     void loadDashboardStats();
   });
   await listen<number>("nox://level", (event) => renderLevel(event.payload));
+
+  // 更新の状態。トレイから確かめても、定期の確認でも、ここへ届く。
+  await listen<UpdateView>("nox://update", (event) => setUpdateView(event.payload));
+  try {
+    setUpdateView(await invoke<UpdateView>("get_update_state"));
+  } catch {
+    // 読めなくても「更新を確認」は押せる (押せば状態が届く)
+  }
 
   // 自動学習が語を覚えた。**通知は出さない** — 成功は静かに、が原則
   // (design.md 2026-08-30)。設定画面が開いているときだけ、一覧へ行を足す。
