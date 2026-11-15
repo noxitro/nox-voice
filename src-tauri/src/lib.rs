@@ -363,6 +363,25 @@ fn get_status(state: tauri::State<'_, AppState>) -> Status {
     state.status.lock().map(|s| *s).unwrap_or(Status::Idle)
 }
 
+/// 更新の状態 (画面の版表示の横のボタン)。以後の変化は `nox://update` で届く。
+#[tauri::command]
+fn get_update_state(app: AppHandle) -> updater::UpdateView {
+    updater::current_view(&app)
+}
+
+/// 画面の「更新を確認」。すぐ戻り、結果は `nox://update` で届く。
+#[tauri::command]
+fn check_update(app: AppHandle) {
+    updater::check_from_window(&app);
+}
+
+/// 画面の「更新して再起動」。成功すればアプリが終了して戻らない。
+/// 断った (録音中など) か失敗したときは、その理由を返す。
+#[tauri::command]
+fn install_update(app: AppHandle) -> Result<(), String> {
+    updater::install(&app)
+}
+
 /// 直近の録音結果の要約を返す (WAV 本体は含まない)。
 #[tauri::command]
 fn get_last_session(state: tauri::State<'_, AppState>) -> Option<SessionSummary> {
@@ -1316,6 +1335,9 @@ pub fn run() {
         )
         .invoke_handler(tauri::generate_handler![
             get_status,
+            get_update_state,
+            check_update,
+            install_update,
             get_last_session,
             get_last_result,
             get_config,

@@ -95,7 +95,13 @@
           </span>
           <span class="brand-text">
             <span class="brand-name">nox-voice</span>
-            <span class="brand-version" id="app-version">v0.1.0</span>
+            <!-- 版と更新。状態はトレイの「更新を確認」「更新して再起動」と共有する
+                 (updater.rs の UpdateView)。結果はボタンのすぐ下に出し、トーストは出さない。 -->
+            <span class="brand-meta">
+              <span class="brand-version" id="app-version">v0.1.0</span>
+              <button type="button" class="brand-update" id="update-button">更新を確認</button>
+            </span>
+            <span class="brand-update-note" id="update-note" role="status"></span>
           </span>
         </div>
 
