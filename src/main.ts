@@ -157,14 +157,19 @@ interface DictionaryStatus {
 /** 提案から作る行の初期指示。空のまま保存すると Rust 側で落とされる。 */
 const SUGGESTED_INSTRUCTION = "言いよどみと言い直しを取り除き、読みやすく整える";
 
+/** Rust 側 `config::KeySource`。優先順は dotenv > env > config。 */
+type KeySource = "dotenv" | "env" | "config" | "none";
+
 /** Rust 側 `config::ConfigView` と対応。**キーの実体は含まれない。** */
 interface ConfigView {
   groq_key_set: boolean;
-  groq_key_source: "env" | "config" | "none";
+  groq_key_source: KeySource;
   groq_key_preview: string;
   gemini_key_set: boolean;
-  gemini_key_source: "env" | "config" | "none";
+  gemini_key_source: KeySource;
   gemini_key_preview: string;
+  /** キーを書ける `.env` の場所。起動時に決まらなかったときは空。 */
+  dotenv_path: string;
   language: string;
   dictionary: DictionaryEntry[];
   dictionary_status: DictionaryStatus;
@@ -573,6 +578,7 @@ function keyStateLabel(view: ConfigView, which: "groq" | "gemini"): string {
   const preview =
     which === "groq" ? view.groq_key_preview : view.gemini_key_preview;
   if (!set) return " — 未設定";
+  if (source === "dotenv") return ` — .env から (${preview})`;
   if (source === "env") return ` — 環境変数から (${preview})`;
   return ` — 設定済み (${preview})`;
 }
@@ -993,6 +999,8 @@ function renderConfig(view: ConfigView) {
   if (groqState) groqState.textContent = keyStateLabel(view, "groq");
   const geminiState = el("gemini-state");
   if (geminiState) geminiState.textContent = keyStateLabel(view, "gemini");
+  const dotenvPath = el("dotenv-path");
+  if (dotenvPath) dotenvPath.textContent = view.dotenv_path || "(設定ファイルと同じフォルダの .env)";
 }
 
 /* --- 自動起動 (PC 起動時の立ち上げ) ----------------------------------------

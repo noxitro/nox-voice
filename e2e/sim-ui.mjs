@@ -2279,6 +2279,33 @@ async function main() {
     };
   });
 
+  await check("U25 .env から来たキーは「.env から」と出て、置き場所のパスが案内に出る", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      const m = window.__NOX_MOCK__;
+      document.querySelector('.nav-item[data-section="transcribe"]').click();
+      // 保存の応答 (= 更新後の ConfigView) で描き直される経路を通す。
+      m.config.groq_key_source = "dotenv";
+      document.getElementById("settings-form").requestSubmit();
+      await new Promise((r) => setTimeout(r, 250));
+      return {
+        groqState: document.getElementById("groq-state").textContent,
+        geminiState: document.getElementById("gemini-state").textContent,
+        path: document.getElementById("dotenv-path").textContent,
+        expectedPath: m.config.dotenv_path,
+      };
+    `);
+    return {
+      ok:
+        r.groqState.includes(".env から") &&
+        r.groqState.includes("…9f2a") &&
+        r.geminiState.includes("未設定") &&
+        r.path === r.expectedPath &&
+        r.path.endsWith("\\.env"),
+      detail: JSON.stringify(r),
+    };
+  });
+
   const failed = results.filter((r) => r.verdict === "FAIL");
   console.log(`\n=== PASS ${results.length - failed.length} / FAIL ${failed.length} (全 ${results.length}) ===`);
   console.log("疑似テストなので、緑でも実機 E2E (e2e/hotkey.mjs) の代わりにはならない。");

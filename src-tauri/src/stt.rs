@@ -53,7 +53,7 @@ impl fmt::Display for SttError {
         match self {
             SttError::MissingApiKey => write!(
                 f,
-                "Groq の API キーが設定されていません (設定画面または環境変数 GROQ_API_KEY)"
+                "Groq の API キーが設定されていません (.env・環境変数 GROQ_API_KEY・設定画面のいずれか)"
             ),
             SttError::Unauthorized(b) => {
                 write!(f, "Groq の認証に失敗しました。API キーを確認してください: {b}")

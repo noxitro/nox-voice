@@ -1354,6 +1354,11 @@ pub fn run() {
             // 設定と退避先のパスは AppHandle が無いと決まらないので、
             // 状態の登録は builder ではなく setup で行う。
             let (config_path, failed_dir) = resolve_paths(&handle);
+            // API キーの `.env` は config.json の隣。テストはここを通らないので、
+            // 開発機の `.env` を単体テストが拾うことはない。
+            if let Some(dir) = config_path.parent() {
+                config::set_dotenv_path(dir.join(config::DOTENV_FILE_NAME));
+            }
             let db_path = resolve_db_path(&handle);
             let models_dir = db_path
                 .parent()
@@ -2358,7 +2363,7 @@ fn finalize_one(job: FinalizeJob) -> Result<FinalizedRecording, String> {
 /// 組み立てがずれると、**片方だけ控えが効かない**という追いにくい差になる
 /// (STT の経路で実際にやった過ちと同じ形。design.md 2026-08-31)。
 ///
-/// キーは [`config::Config::groq_key`] — 環境変数優先で、STT と同じ経路。
+/// キーは [`config::Config::groq_key`] — `.env` > 環境変数 > 設定で、STT と同じ経路。
 fn build_fallback_formatter(
     cfg: &config::Config,
     client: &reqwest::blocking::Client,

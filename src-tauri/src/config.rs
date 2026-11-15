@@ -16,7 +16,7 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -285,6 +285,25 @@ pub const MAX_RESTORE_DELAY_MS: u64 = 5_000;
 
 const ENV_GROQ_KEY: &str = "GROQ_API_KEY";
 const ENV_GEMINI_KEY: &str = "GEMINI_API_KEY";
+
+/// キーを書く `.env` のファイル名。`config.json` と同じフォルダに置く。
+pub const DOTENV_FILE_NAME: &str = ".env";
+
+/// 本番で読む `.env` の場所。**[`set_dotenv_path`] が呼ばれるまでは何も読まない。**
+///
+/// 起動時 (lib.rs の setup) にだけ設定する。単体テストからは設定しないので、
+/// 開発機に本物の `.env` があってもテストの結果は変わらない。
+static DOTENV_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// `.env` の場所を決める。2 回目以降の呼び出しは無視する (起動時に 1 回だけ)。
+pub fn set_dotenv_path(path: PathBuf) {
+    let _ = DOTENV_PATH.set(path);
+}
+
+/// 設定済みの `.env` の場所 (未設定なら `None`)。
+pub fn dotenv_path() -> Option<&'static Path> {
+    DOTENV_PATH.get().map(PathBuf::as_path)
+}
 
 /// 秘密文字列。表示系はすべて伏字になる。
 ///
@@ -668,6 +687,11 @@ impl LocalSttMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeySource {
+    /// `config.json` と同じフォルダの `.env` から。**いちばん優先される。**
+    ///
+    /// 同じ名前の環境変数 (`GROQ_API_KEY` など) を他のアプリも使っていて、
+    /// nox-voice だけ別のキーにしたい場合のための層。
+    DotEnv,
     /// 環境変数から。設定ファイルより優先される。
     Env,
     /// 設定ファイルから。
@@ -676,7 +700,7 @@ pub enum KeySource {
     None,
 }
 
-/// 解決済みのキー (環境変数 > 設定ファイル)。
+/// 解決済みのキー (`.env` > 環境変数 > 設定ファイル)。
 #[derive(Debug, Clone)]
 pub struct ResolvedKey {
     pub secret: Option<Secret>,
@@ -690,14 +714,25 @@ impl ResolvedKey {
 }
 
 impl Config {
-    /// Groq の API キーを解決する (環境変数優先)。
+    /// Groq の API キーを解決する (`.env` > 環境変数 > 設定ファイル)。
+    ///
+    /// `.env` は呼ぶたびに読み直す。書き換えればアプリを再起動しなくても
+    /// 次の録音から効く (環境変数は起動時の値のままなので再起動が要る)。
     pub fn groq_key(&self) -> ResolvedKey {
-        resolve_key(env_value(ENV_GROQ_KEY), &self.groq_api_key)
+        resolve_key_layers(
+            dotenv_value(ENV_GROQ_KEY),
+            env_value(ENV_GROQ_KEY),
+            &self.groq_api_key,
+        )
     }
 
-    /// Gemini の API キーを解決する (環境変数優先)。
+    /// Gemini の API キーを解決する (`.env` > 環境変数 > 設定ファイル)。
     pub fn gemini_key(&self) -> ResolvedKey {
-        resolve_key(env_value(ENV_GEMINI_KEY), &self.gemini_api_key)
+        resolve_key_layers(
+            dotenv_value(ENV_GEMINI_KEY),
+            env_value(ENV_GEMINI_KEY),
+            &self.gemini_api_key,
+        )
     }
 
     /// 辞書の全語。**正規化済み** ([`Config::normalize`] が空の表記を落とす)。
@@ -861,6 +896,108 @@ fn env_value(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// 設定済みの `.env` から `name` の値を読む。ファイルが無ければ `None`。
+///
+/// **プロセスの環境変数には書き込まない** (`dotenv()` 系の読み込みはしない)。
+/// 書き込むと子プロセスにキーが渡り、他の箇所の `std::env::var` の結果も変わる。
+fn dotenv_value(name: &str) -> Option<String> {
+    let path = dotenv_path()?;
+    match fs::read(path) {
+        Ok(bytes) => parse_dotenv_value(&decode_dotenv(&bytes), name),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            // 中身はキーなので出さない。場所と原因だけ書く。
+            log::warn!(".env を読めません ({}): {e}", path.display());
+            None
+        }
+    }
+}
+
+/// `.env` のバイト列を文字列にする。
+///
+/// Windows で作られうる形をどれも受ける: UTF-8 (BOM 付き = メモ帳の旧既定) と、
+/// UTF-16 LE (BOM 付き = Windows PowerShell 5.1 の `>` / `Out-File` の既定)。
+/// それ以外は UTF-8 として読み、壊れたバイトは置き換える (キーは ASCII なので
+/// 他の行に変な文字があっても目的の行は読める)。
+fn decode_dotenv(bytes: &[u8]) -> String {
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = rest
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| u16::from_le_bytes(pair))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    let rest = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    String::from_utf8_lossy(rest).into_owned()
+}
+
+/// `.env` の本文から `name` の値を取り出す。空の値は「書いていない」と同じ扱い。
+///
+/// 書式: `NAME=値` を 1 行に 1 つ。`#` で始まる行は注釈。行頭の `export` (後ろに
+/// 空白) は無視する。値は前後の空白を落とし、引用符 (`"` か `'`) で始まれば
+/// 閉じる引用符までを値にする (後ろの注釈は捨てる)。囲まれていない値は、
+/// **空白の直後の `#`** から先を注釈として捨てる (`K= # 後で入れる` は空値)。
+/// 同じ名前が複数あれば**後の行が勝つ** (シェルで `source` したときと同じ)。
+fn parse_dotenv_value(text: &str, name: &str) -> Option<String> {
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line
+            .strip_prefix("export")
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+            .map(str::trim_start)
+            .unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != name {
+            continue;
+        }
+        // trim する前の値を渡す。`=` の直後の空白も「注釈の前の空白」に数えたい。
+        found = Some(unquote_dotenv_value(value));
+    }
+    found.filter(|v| !v.is_empty())
+}
+
+fn unquote_dotenv_value(raw: &str) -> String {
+    let value = raw.trim();
+    if let Some(quote) = value.chars().next().filter(|c| matches!(c, '"' | '\'')) {
+        // 引用符は 1 バイトなので、[1..] と [1..1 + end] は常に文字境界。
+        if let Some(end) = value[1..].find(quote) {
+            return value[1..1 + end].trim().to_string();
+        }
+    }
+    // 空白 (スペース・タブ) の直後の `#` から先は注釈。`a#b` の `#` は値の一部。
+    let comment = raw
+        .char_indices()
+        .find(|&(i, c)| c == '#' && raw[..i].ends_with(char::is_whitespace))
+        .map(|(i, _)| i);
+    match comment {
+        Some(i) => raw[..i].trim().to_string(),
+        None => value.to_string(),
+    }
+}
+
+/// `.env` > 環境変数 > 設定ファイル > 未設定 の優先順で解決する。
+fn resolve_key_layers(
+    from_dotenv: Option<String>,
+    from_env: Option<String>,
+    configured: &Secret,
+) -> ResolvedKey {
+    if let Some(v) = from_dotenv {
+        return ResolvedKey {
+            secret: Some(Secret::new(v.trim())),
+            source: KeySource::DotEnv,
+        };
+    }
+    resolve_key(from_env, configured)
+}
+
 /// 環境変数 > 設定ファイル > 未設定 の優先順で解決する。
 fn resolve_key(from_env: Option<String>, configured: &Secret) -> ResolvedKey {
     if let Some(v) = from_env {
@@ -890,6 +1027,8 @@ pub struct ConfigView {
     pub gemini_key_set: bool,
     pub gemini_key_source: KeySource,
     pub gemini_key_preview: String,
+    /// キーを書ける `.env` の場所 (設定画面の案内に出す)。未設定なら空。
+    pub dotenv_path: String,
     pub language: String,
     pub dictionary: Vec<DictionaryEntry>,
     /// 辞書の何語が実際に `prompt` へ載っているか (行と 1 対 1 に対応)。
@@ -993,6 +1132,9 @@ impl ConfigView {
                 .secret
                 .as_ref()
                 .map(Secret::preview)
+                .unwrap_or_default(),
+            dotenv_path: dotenv_path()
+                .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             language: c.language.clone(),
             dictionary: c.dictionary.clone(),
@@ -2263,6 +2405,103 @@ mod tests {
         // env_value 側で空白は弾かれる想定なので None が渡る。
         let resolved = resolve_key(None, &Secret::new("from-config"));
         assert_eq!(resolved.source, KeySource::Config);
+    }
+
+    #[test]
+    fn dotenv_takes_precedence_over_env_var_and_config() {
+        // 他のアプリと共有している環境変数より、nox-voice 専用の .env が勝つ。
+        let resolved = resolve_key_layers(
+            Some("from-dotenv".to_string()),
+            Some("from-env".to_string()),
+            &Secret::new("from-config"),
+        );
+        assert_eq!(resolved.source, KeySource::DotEnv);
+        assert_eq!(resolved.secret.expect("鍵がある").expose(), "from-dotenv");
+    }
+
+    #[test]
+    fn missing_dotenv_falls_back_to_env_then_config() {
+        let resolved = resolve_key_layers(
+            None,
+            Some("from-env".to_string()),
+            &Secret::new("from-config"),
+        );
+        assert_eq!(resolved.source, KeySource::Env);
+        let resolved = resolve_key_layers(None, None, &Secret::new("from-config"));
+        assert_eq!(resolved.source, KeySource::Config);
+    }
+
+    #[test]
+    fn dotenv_parses_plain_quoted_exported_and_commented_lines() {
+        let text = "# nox-voice 専用\r\n\
+                    GROQ_API_KEY=gsk_plain\r\n\
+                    export GEMINI_API_KEY = \"AIza quoted\" \r\n\
+                    OTHER=1 # 無関係\r\n";
+        assert_eq!(
+            parse_dotenv_value(text, "GROQ_API_KEY").as_deref(),
+            Some("gsk_plain")
+        );
+        assert_eq!(
+            parse_dotenv_value(text, "GEMINI_API_KEY").as_deref(),
+            Some("AIza quoted")
+        );
+        assert_eq!(parse_dotenv_value("K='single'", "K").as_deref(), Some("single"));
+        assert_eq!(parse_dotenv_value("K=abc # 注釈", "K").as_deref(), Some("abc"));
+        assert_eq!(parse_dotenv_value("K=a#b", "K").as_deref(), Some("a#b"));
+        assert_eq!(parse_dotenv_value("#K=commented", "K"), None);
+        assert_eq!(parse_dotenv_value("NOT_K=x", "K"), None);
+    }
+
+    #[test]
+    fn dotenv_comment_only_value_is_blank_and_quoted_value_drops_trailing_comment() {
+        // 注釈だけの値が「キー」として最上位の層に居座らないこと (レビュー指摘)。
+        assert_eq!(parse_dotenv_value("GROQ_API_KEY= # 後で入れる", "GROQ_API_KEY"), None);
+        assert_eq!(parse_dotenv_value("K=\t# tab", "K"), None);
+        assert_eq!(parse_dotenv_value("K=abc\t# tab", "K").as_deref(), Some("abc"));
+        assert_eq!(parse_dotenv_value("K=#abc", "K").as_deref(), Some("#abc"));
+        assert_eq!(parse_dotenv_value("K=\"abc\" # c", "K").as_deref(), Some("abc"));
+        assert_eq!(parse_dotenv_value("K='a #b' #c", "K").as_deref(), Some("a #b"));
+        assert_eq!(parse_dotenv_value("K=a=b==", "K").as_deref(), Some("a=b=="));
+        // 閉じない引用符はそのまま値 (panic しない)。
+        assert_eq!(parse_dotenv_value("K=\"", "K").as_deref(), Some("\""));
+        assert_eq!(parse_dotenv_value("K=\"あ", "K").as_deref(), Some("\"あ"));
+        // `export` の後はタブでもよい。`exportK` は別の名前。
+        assert_eq!(parse_dotenv_value("export\tK=v", "K").as_deref(), Some("v"));
+        assert_eq!(parse_dotenv_value("exportK=v", "K"), None);
+    }
+
+    #[test]
+    fn dotenv_later_line_wins_and_blank_value_is_absent() {
+        assert_eq!(parse_dotenv_value("K=old\nK=new", "K").as_deref(), Some("new"));
+        // 空の値は「書いていない」扱い。環境変数へ素通しする。
+        assert_eq!(parse_dotenv_value("K=", "K"), None);
+        assert_eq!(parse_dotenv_value("K=\"\"", "K"), None);
+        assert_eq!(parse_dotenv_value("K=   ", "K"), None);
+    }
+
+    #[test]
+    fn dotenv_decodes_utf8_bom_and_utf16le() {
+        let mut utf8 = vec![0xEF, 0xBB, 0xBF];
+        utf8.extend_from_slice(b"GROQ_API_KEY=gsk_bom\r\n");
+        assert_eq!(
+            parse_dotenv_value(&decode_dotenv(&utf8), "GROQ_API_KEY").as_deref(),
+            Some("gsk_bom")
+        );
+        // Windows PowerShell 5.1 の `"..." > .env` は UTF-16 LE (BOM 付き) で書く。
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in "GROQ_API_KEY=gsk_utf16\r\n".encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(
+            parse_dotenv_value(&decode_dotenv(&utf16), "GROQ_API_KEY").as_deref(),
+            Some("gsk_utf16")
+        );
+    }
+
+    #[test]
+    fn dotenv_source_serializes_as_dotenv() {
+        let json = serde_json::to_string(&KeySource::DotEnv).expect("シリアライズできる");
+        assert_eq!(json, "\"dotenv\"");
     }
 
     #[test]
