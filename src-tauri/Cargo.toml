@@ -90,7 +90,7 @@ windows = { version = "0.62", features = [
 ] }
 reqwest = { version = "0.13", features = ["blocking", "json", "multipart"] }
 tauri-plugin-notification = "2.3.3"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.42", features = ["bundled"] }
 whisper-rs = { version = "0.16", default-features = false, optional = true }
 sha2 = "0.11.0"
 # 画面質問モードのスクリーンショット。
@@ -118,4 +118,7 @@ tauri-plugin-single-instance = "2.4.3"
 # `tauri ^2.12` を要求するため。上げると tauri 本体が 2.12 へ上がり、JS 側
 # (@tauri-apps/api・cli は 2.11) と major.minor が食い違って tauri build が落ちる
 # (.github/dependabot.yml の注記と同じ事情)。Tauri を揃えて上げるときに一緒に外す。
-tauri-plugin-updater = "~2.12"
+# 既定機能の `zip` は外す。zip で包んだ更新 (Tauri v1 互換の形式) を展開するための
+# もので、このアプリは setup.exe / msi をそのまま配る (scripts/updater-manifest.mjs) ので
+# 使わない。入れたままだと zip 4.x の脆弱性勧告 (RUSTSEC-2026-0367 ほか) で cargo deny が落ちる。
+tauri-plugin-updater = { version = "~2.12", default-features = false, features = ["rustls-tls", "system-proxy"] }
