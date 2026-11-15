@@ -433,9 +433,16 @@ impl IUIAutomationEventHandler_Impl for CountingHandler_Impl {
     ) -> windows::core::Result<()> {
         EVENTS.fetch_add(1, Ordering::SeqCst);
         let elapsed = now_ms().saturating_sub(SUBSCRIBED_AT_MS.load(Ordering::SeqCst));
-        let _ = FIRST_EVENT_MS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-            (current == u64::MAX).then_some(elapsed)
-        });
+        // 最初の 1 回だけ記録する (まだ未記録 = u64::MAX のときだけ書く)。
+        // `fetch_update` は CI の stable (2026-11 時点。手元の 1.98 では出ない) で
+        // `try_update` への改名として非推奨になり、clippy (-D warnings) を落とした。
+        // どの版でも同じ意味の CAS で書く。
+        let _ = FIRST_EVENT_MS.compare_exchange(
+            u64::MAX,
+            elapsed,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
         Ok(())
     }
 }
