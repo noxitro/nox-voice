@@ -98,18 +98,24 @@ impl<'a> PipelineInput<'a> {
     }
 }
 
+/// 控えの 1 段: 提供元の名前 (理由文とログに使う) と整形器。
+///
+/// 名前を整形器から聞かずに対で渡すのは、テストの二重体にも名前を
+/// 付けられるようにするため (理由文の書式を、実物の整形器なしで固定したい)。
+pub type FallbackRung<'a> = (&'static str, &'a dyn TextFormatter);
+
 /// WAV を転写し、必要なら整形する。
 ///
 /// `formatter` が `None` (整形無効・キー未設定) なら生転写を採用する。
-/// `fallback` は主が落ちたときだけ使う控えの整形器
-/// ([`format_with_fallback`])。`None` なら段は 1 つのまま。
+/// `fallbacks` は主が落ちたときだけ**優先順に**使う控えの列
+/// ([`format_with_fallback`])。空なら段は 1 つのまま。
 /// 整形が失敗しても [`Err`] にはせず、[`FormatOutcome::RawFallback`] で返す。
 /// [`Err`] になるのは STT が失敗したときだけ。
 pub fn run(
     input: &PipelineInput<'_>,
     stt: &dyn SpeechToText,
     formatter: Option<&dyn TextFormatter>,
-    fallback: Option<&dyn TextFormatter>,
+    fallbacks: &[FallbackRung<'_>],
 ) -> Result<PipelineResult, SttError> {
     // 辞書と画面コンテキストを STT のバイアスにも使う。
     // 誤変換を後から直すより、そもそも起こさせない方が確実。
@@ -141,7 +147,7 @@ pub fn run(
         context: input.context,
         rules: input.rules,
     };
-    let (text, outcome) = format_with_fallback(formatter, fallback, &request, &raw_text);
+    let (text, outcome) = format_with_fallback(formatter, fallbacks, &request, &raw_text);
     let format_ms = format_started.elapsed().as_millis() as u64;
 
     Ok(PipelineResult {
@@ -153,19 +159,24 @@ pub fn run(
     })
 }
 
-/// 主 → 副 → 生転写、の連鎖 (純関数)。
+/// 主 → 控え (優先順に) → 生転写、の連鎖 (純関数)。
 ///
 /// 段が増えたぶんだけ「なぜこうなったか」が複雑になるので、
-/// 分岐を [`run`] の中に散らさず 1 か所に閉じ込める。
+/// 分岐を [`run`] の中に散らさず 1 か所に閉じ込める。順序は今は
+/// Gemini → Groq → OpenRouter (lib.rs の `build_fallback_formatters`)。
 ///
-/// - 主が成功 → [`FormatOutcome::Formatted`]。**副は呼ばない**
-/// - 主が失敗 + 副が成功 → [`FormatOutcome::FormattedByFallback`] (劣化ではない)
-/// - 両方失敗 → [`FormatOutcome::RawFallback`]。理由は**両方**書く。
-///   片方しか書かないと、次に同じことが起きたときどちらが原因か追えない
-/// - 副が無い (無効・キー未設定) → 従来どおり主の理由だけの `RawFallback`
+/// - 主が成功 → [`FormatOutcome::Formatted`]。**控えは 1 つも呼ばない**
+/// - 主が失敗 + どれかの控えが成功 → [`FormatOutcome::FormattedByFallback`]
+///   (劣化ではない)。`reason` は主の理由を先頭に、それより前に失敗した
+///   控えがあれば `。控えの{提供元}も失敗: {理由}` を後ろに足す
+/// - 全部失敗 → [`FormatOutcome::RawFallback`]。理由は**優先順に全部**書く。
+///   1 つしか書かないと、次に同じことが起きたときどれが原因か追えない
+/// - 控えが無い (無効・キー未設定) → 従来どおり主の理由だけの `RawFallback`
+///
+/// 控えが Groq だけのときの文字列は、段を足す前と 1 文字も変わらない。
 pub fn format_with_fallback(
     primary: &dyn TextFormatter,
-    fallback: Option<&dyn TextFormatter>,
+    fallbacks: &[FallbackRung<'_>],
     request: &FormatRequest<'_>,
     raw_text: &str,
 ) -> (String, FormatOutcome) {
@@ -175,7 +186,7 @@ pub fn format_with_fallback(
     };
     let primary_reason = degradation_reason(&primary_error, PRIMARY);
 
-    let Some(fallback) = fallback else {
+    if fallbacks.is_empty() {
         // R2: ここで失敗を握り潰さず、理由つきで生転写へ落とす。
         log::warn!("整形に失敗したため生転写を採用します (劣化モード): {primary_error}");
         return (
@@ -184,47 +195,41 @@ pub fn format_with_fallback(
                 reason: primary_reason,
             },
         );
-    };
+    }
 
-    match fallback.format(request) {
-        Ok(formatted) => {
-            // 出力は良好なので小窓は静かなままだが、**ログには残す**。
-            // 主が落ち続けていることに誰も気づかない状態を作らない。
-            log::warn!("主の整形が落ちたため控えで整形しました: {primary_reason}");
-            (
-                formatted,
-                FormatOutcome::FormattedByFallback {
-                    reason: primary_reason,
-                },
-            )
-        }
-        Err(fallback_error) => {
-            // `FormatError::Display` は文面に「Gemini」を焼き込んでいるので、
-            // 控えの失敗をそのまま `{fallback_error}` で出すと嘘になる。
-            // ログにも provider 名を付け替えた文を使う。
-            let fallback_reason = degradation_reason(&fallback_error, FALLBACK);
-            log::warn!(
-                "主も控えも整形に失敗したため生転写を採用します (劣化モード): \
-                 主={primary_reason} / 控え={fallback_reason}"
-            );
-            // 主の理由を**先頭**に置き、その後ろにだけ「:」を出す。
-            // 小窓は最初の「:」で切って 1 行に収める (design.md 2026-09-05)
-            // ので、順序を変えると表示が「主」だけになる。
-            (
-                raw_text.to_string(),
-                FormatOutcome::RawFallback {
-                    reason: format!("{primary_reason}。控えの{FALLBACK}も失敗: {fallback_reason}"),
-                },
-            )
+    // 主の理由を**先頭**に置き、その後ろにだけ「:」を出す。
+    // 小窓は最初の「:」で切って 1 行に収める (design.md 2026-09-05)
+    // ので、順序を変えると表示が「主」だけになる。
+    let mut reason = primary_reason;
+    for &(provider, fallback) in fallbacks {
+        match fallback.format(request) {
+            Ok(formatted) => {
+                // 出力は良好なので小窓は静かなままだが、**ログには残す**。
+                // 主が落ち続けていることに誰も気づかない状態を作らない。
+                // どの控えが拾ったかは提供元名で残す (本文は出さない)。
+                log::warn!("主の整形が落ちたため控えの{provider}で整形しました: {reason}");
+                return (formatted, FormatOutcome::FormattedByFallback { reason });
+            }
+            Err(fallback_error) => {
+                // `FormatError::Display` は文面に「Gemini」を焼き込んでいるので、
+                // 控えの失敗をそのまま `{fallback_error}` で出すと嘘になる。
+                // ログにも provider 名を付け替えた文を使う。
+                let fallback_reason = degradation_reason(&fallback_error, provider);
+                log::warn!("控えの{provider}も整形に失敗しました: {fallback_reason}");
+                reason.push_str(&format!("。控えの{provider}も失敗: {fallback_reason}"));
+            }
         }
     }
+    log::warn!("主も控えもすべて整形に失敗したため生転写を採用します (劣化モード): {reason}");
+    (raw_text.to_string(), FormatOutcome::RawFallback { reason })
 }
 
 /// 理由文に出す提供元の名前。**対応表は [`crate::format::provider_reason`]
-/// に置いてある** — 控え ([`crate::format_groq`]) のログも同じ文言を使うので、
+/// に置いてある** — 控え ([`crate::format_openai_compat`]) のログも同じ文言を使うので、
 /// エラーから文への対応は `FormatError` の隣に 1 つだけ持つ。
-use crate::format::{provider_reason as degradation_reason, PROVIDER_GEMINI as PRIMARY,
-    PROVIDER_GROQ as FALLBACK};
+use crate::format::{provider_reason as degradation_reason, PROVIDER_GEMINI as PRIMARY};
+#[cfg(test)]
+use crate::format::{PROVIDER_GROQ as FALLBACK, PROVIDER_OPENROUTER as SECOND_FALLBACK};
 
 #[cfg(test)]
 mod tests {
@@ -313,7 +318,7 @@ mod tests {
     fn happy_path_uses_the_formatted_text() {
         let stt = FixedStt(Ok("えーと こんにちは"));
         let formatter = FixedFormatter::ok("こんにちは。");
-        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), None).expect("成功する");
+        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), &[]).expect("成功する");
 
         assert_eq!(result.raw_text, "えーと こんにちは");
         assert_eq!(result.text, "こんにちは。");
@@ -325,7 +330,7 @@ mod tests {
     fn raw_transcript_is_always_kept_for_r5() {
         let stt = FixedStt(Ok("生の転写"));
         let formatter = FixedFormatter::ok("整形後のテキスト");
-        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), None).expect("成功する");
+        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), &[]).expect("成功する");
         // 整形後を採用しても、生転写は照合用に残る (R5)。
         assert_eq!(result.raw_text, "生の転写");
         assert_ne!(result.raw_text, result.text);
@@ -336,7 +341,7 @@ mod tests {
         let stt = FixedStt(Ok("のっくすぼいす"));
         let formatter = FixedFormatter::ok("nox-voice");
         let dictionary = crate::dictionary::parse_entries(&["nox-voice".to_string()]);
-        run(&PipelineInput { wav: b"wav", language: "ja", dictionary: &dictionary, ..Default::default() }, &stt, Some(&formatter), None).expect("成功する");
+        run(&PipelineInput { wav: b"wav", language: "ja", dictionary: &dictionary, ..Default::default() }, &stt, Some(&formatter), &[]).expect("成功する");
         assert_eq!(
             *formatter.last_dictionary.lock().expect("ロック"),
             dictionary
@@ -349,7 +354,7 @@ mod tests {
     fn format_failure_falls_back_to_the_raw_transcript() {
         let stt = FixedStt(Ok("生転写のテキスト"));
         let formatter = FixedFormatter::err(FormatError::RateLimited("quota".to_string()));
-        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), None).expect("STT は成功している");
+        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), &[]).expect("STT は成功している");
 
         assert_eq!(result.text, "生転写のテキスト", "生転写へ落ちていない");
         assert_eq!(result.raw_text, "生転写のテキスト");
@@ -380,7 +385,7 @@ mod tests {
         for error in errors {
             let stt = FixedStt(Ok("生転写"));
             let formatter = FixedFormatter::err(error.clone());
-            let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), None)
+            let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), &[])
                 .unwrap_or_else(|e| panic!("{error:?} で Err になった: {e}"));
             assert_eq!(result.text, "生転写", "{error:?} で生転写に落ちていない");
             assert!(result.outcome.is_degraded(), "{error:?}");
@@ -399,7 +404,7 @@ mod tests {
         let formatter = FixedFormatter::err(FormatError::Incomplete {
             reason: "MAX_TOKENS".to_string(),
         });
-        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), None).expect("STT は成功");
+        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), &[]).expect("STT は成功");
 
         assert_eq!(
             result.text, "長い発話の生転写がここに入る",
@@ -418,7 +423,7 @@ mod tests {
     #[test]
     fn formatting_disabled_skips_the_formatter_entirely() {
         let stt = FixedStt(Ok("生転写のみ"));
-        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, None, None).expect("成功する");
+        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, None, &[]).expect("成功する");
         assert_eq!(result.text, "生転写のみ");
         assert_eq!(result.outcome, FormatOutcome::Disabled);
         assert!(!result.outcome.is_degraded(), "無効化は劣化ではない");
@@ -429,7 +434,7 @@ mod tests {
     fn missing_gemini_key_degrades_with_an_actionable_reason() {
         let stt = FixedStt(Ok("生転写"));
         let formatter = FixedFormatter::err(FormatError::MissingApiKey);
-        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), None).expect("STT は成功");
+        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), &[]).expect("STT は成功");
         match result.outcome {
             FormatOutcome::RawFallback { reason } => {
                 assert!(reason.contains("API キー"), "{reason}");
@@ -460,7 +465,7 @@ mod tests {
             &PipelineInput::new(b"wav", "ja"),
             &stt,
             Some(&primary),
-            Some(&NeverCalledFormatter),
+            &[(FALLBACK, &NeverCalledFormatter)],
         )
         .expect("成功する");
         assert_eq!(result.text, "こんにちは。");
@@ -479,7 +484,7 @@ mod tests {
             &PipelineInput::new(b"wav", "ja"),
             &stt,
             Some(&primary),
-            Some(&fallback),
+            &[(FALLBACK, &fallback)],
         )
         .expect("成功する");
 
@@ -516,7 +521,7 @@ mod tests {
             &PipelineInput::new(b"wav", "ja"),
             &stt,
             Some(&primary),
-            Some(&fallback),
+            &[(FALLBACK, &fallback)],
         )
         .expect("STT は成功している");
 
@@ -541,7 +546,7 @@ mod tests {
     fn without_a_fallback_the_behaviour_is_unchanged() {
         let stt = FixedStt(Ok("生転写のテキスト"));
         let primary = FixedFormatter::err(FormatError::RateLimited("quota".into()));
-        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&primary), None)
+        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&primary), &[])
             .expect("STT は成功している");
         assert_eq!(result.text, "生転写のテキスト");
         match result.outcome {
@@ -560,6 +565,163 @@ mod tests {
             degradation_reason(&FormatError::Timeout, FALLBACK),
             "Groq の応答がタイムアウトしました"
         );
+        assert_eq!(
+            degradation_reason(&FormatError::Timeout, SECOND_FALLBACK),
+            "OpenRouter の応答がタイムアウトしました"
+        );
+    }
+
+    // --- 第 2 の控え (OpenRouter) ---
+
+    fn server_error() -> FormatError {
+        FormatError::Server {
+            status: 503,
+            body: "overloaded".into(),
+        }
+    }
+
+    #[test]
+    fn the_second_fallback_formats_when_the_primary_and_groq_fail() {
+        let stt = FixedStt(Ok("えーと こんにちは"));
+        let primary = FixedFormatter::err(server_error());
+        let groq = FixedFormatter::err(FormatError::Incomplete {
+            reason: "length".into(),
+        });
+        let openrouter = FixedFormatter::ok("こんにちは。");
+        let result = run(
+            &PipelineInput::new(b"wav", "ja"),
+            &stt,
+            Some(&primary),
+            &[(FALLBACK, &groq), (SECOND_FALLBACK, &openrouter)],
+        )
+        .expect("成功する");
+
+        assert_eq!(result.text, "こんにちは。", "第 2 の控えの出力が採用されていない");
+        assert_eq!((primary.calls(), groq.calls(), openrouter.calls()), (1, 1, 1));
+        assert!(!result.outcome.is_degraded());
+        match result.outcome {
+            FormatOutcome::FormattedByFallback { reason } => {
+                // 主の理由が先頭、先に落ちた Groq の理由が後ろ。採用した段の名前は
+                // 理由に書かない (失敗していないので)。
+                assert_eq!(
+                    reason,
+                    "Gemini のサーバエラー (503)。控えのGroqも失敗: \
+                     Groq の生成が途中で終わりました (length)"
+                );
+                assert!(!reason.contains("OpenRouter"), "{reason}");
+            }
+            other => panic!("控えでの整形になっていない: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_three_failing_reports_every_reason_in_priority_order() {
+        let stt = FixedStt(Ok("生転写のテキスト"));
+        let primary = FixedFormatter::err(FormatError::Timeout);
+        let groq = FixedFormatter::err(FormatError::Empty);
+        let openrouter = FixedFormatter::err(FormatError::RateLimited("free".into()));
+        let result = run(
+            &PipelineInput::new(b"wav", "ja"),
+            &stt,
+            Some(&primary),
+            &[(FALLBACK, &groq), (SECOND_FALLBACK, &openrouter)],
+        )
+        .expect("STT は成功している");
+
+        assert_eq!(result.text, "生転写のテキスト", "生転写へ落ちていない");
+        assert!(result.outcome.is_degraded());
+        match result.outcome {
+            FormatOutcome::RawFallback { reason } => {
+                assert_eq!(
+                    reason,
+                    "Gemini の応答がタイムアウトしました。控えのGroqも失敗: Groq の応答が空でした。\
+                     控えのOpenRouterも失敗: OpenRouter のレート制限に達しました"
+                );
+                // 小窓は最初の「:」で切る。先頭は必ず主の理由。
+                let first_line = reason.split(':').next().unwrap_or_default();
+                assert!(first_line.starts_with("Gemini"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Groq の控えをオフにしても、OpenRouter のキーがあれば Gemini → OpenRouter。
+    #[test]
+    fn openrouter_alone_backs_up_the_primary() {
+        let stt = FixedStt(Ok("生転写"));
+        let primary = FixedFormatter::err(FormatError::Unauthorized("bad".into()));
+        let openrouter = FixedFormatter::ok("整形後");
+        let result = run(
+            &PipelineInput::new(b"wav", "ja"),
+            &stt,
+            Some(&primary),
+            &[(SECOND_FALLBACK, &openrouter)],
+        )
+        .expect("成功する");
+        assert_eq!(result.text, "整形後");
+        assert_eq!(
+            result.outcome,
+            FormatOutcome::FormattedByFallback {
+                reason: "Gemini の認証に失敗しました".to_string()
+            }
+        );
+
+        // OpenRouter だけで落ちたときも、名前は OpenRouter で書く。
+        let failing = FixedFormatter::err(FormatError::Timeout);
+        let result = run(
+            &PipelineInput::new(b"wav", "ja"),
+            &stt,
+            Some(&primary),
+            &[(SECOND_FALLBACK, &failing)],
+        )
+        .expect("STT は成功している");
+        match result.outcome {
+            FormatOutcome::RawFallback { reason } => {
+                assert_eq!(
+                    reason,
+                    "Gemini の認証に失敗しました。控えのOpenRouterも失敗: \
+                     OpenRouter の応答がタイムアウトしました"
+                );
+                assert!(!reason.contains("Groq"), "Groq が居ないのに言及している: {reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_fallback_is_called_when_the_primary_succeeds_even_with_two() {
+        let stt = FixedStt(Ok("えーと こんにちは"));
+        let primary = FixedFormatter::ok("こんにちは。");
+        let result = run(
+            &PipelineInput::new(b"wav", "ja"),
+            &stt,
+            Some(&primary),
+            &[(FALLBACK, &NeverCalledFormatter), (SECOND_FALLBACK, &NeverCalledFormatter)],
+        )
+        .expect("成功する");
+        assert_eq!(result.outcome, FormatOutcome::Formatted);
+    }
+
+    /// Groq が拾えば、後ろの OpenRouter は呼ばない (送信先を増やさない)。
+    #[test]
+    fn a_later_fallback_is_not_called_once_an_earlier_one_succeeds() {
+        let stt = FixedStt(Ok("生転写"));
+        let primary = FixedFormatter::err(server_error());
+        let groq = FixedFormatter::ok("整形後");
+        let result = run(
+            &PipelineInput::new(b"wav", "ja"),
+            &stt,
+            Some(&primary),
+            &[(FALLBACK, &groq), (SECOND_FALLBACK, &NeverCalledFormatter)],
+        )
+        .expect("成功する");
+        assert_eq!(result.text, "整形後");
+        assert_eq!(
+            result.outcome,
+            FormatOutcome::FormattedByFallback {
+                reason: "Gemini のサーバエラー (503)".to_string()
+            }
+        );
     }
 
     // --- STT の失敗は劣化できない ---
@@ -568,7 +730,7 @@ mod tests {
     fn stt_failure_propagates_and_skips_formatting() {
         let stt = FixedStt(Err(SttError::MissingApiKey));
         let formatter = FixedFormatter::ok("呼ばれないはず");
-        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), None);
+        let result = run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), &[]);
         assert_eq!(result, Err(SttError::MissingApiKey));
         assert_eq!(formatter.calls(), 0, "STT 失敗後に整形を呼んでいる");
     }
@@ -576,7 +738,7 @@ mod tests {
     #[test]
     fn stt_timeout_propagates() {
         let stt = FixedStt(Err(SttError::Timeout));
-        assert_eq!(run(&PipelineInput::new(b"wav", "ja"), &stt, None, None), Err(SttError::Timeout));
+        assert_eq!(run(&PipelineInput::new(b"wav", "ja"), &stt, None, &[]), Err(SttError::Timeout));
     }
 
     #[test]
@@ -584,7 +746,7 @@ mod tests {
         let stt = FixedStt(Err(SttError::Empty));
         let formatter = FixedFormatter::ok("呼ばれないはず");
         assert_eq!(
-            run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), None),
+            run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), &[]),
             Err(SttError::Empty)
         );
         assert_eq!(formatter.calls(), 0);
@@ -636,7 +798,7 @@ mod tests {
         };
         let wav = crate::stt::japanese_sample_wav();
 
-        let result = run(&PipelineInput::new(&wav, "ja"), &stt, Some(&formatter), None)
+        let result = run(&PipelineInput::new(&wav, "ja"), &stt, Some(&formatter), &[])
             .expect("通しで成功する");
         println!("生転写: {:?}", result.raw_text);
         println!("整形後: {:?}", result.text);
@@ -688,7 +850,7 @@ mod tests {
             },
             &stt,
             Some(&formatter),
-            None,
+            &[],
         )
         .expect("通しで成功する");
 
@@ -740,7 +902,7 @@ mod tests {
             },
             &stt,
             Some(&formatter),
-            None,
+            &[],
         )
         .expect("通しで成功する");
 
@@ -793,7 +955,7 @@ mod tests {
             },
             &stt,
             Some(&formatter),
-            None,
+            &[],
         )
         .expect("通しで成功する");
 
@@ -829,7 +991,7 @@ mod tests {
         };
         let wav = crate::stt::japanese_sample_wav();
 
-        let result = run(&PipelineInput::new(&wav, "ja"), &stt, Some(&formatter), None)
+        let result = run(&PipelineInput::new(&wav, "ja"), &stt, Some(&formatter), &[])
             .expect("STT は成功する");
         println!("生転写: {:?}", result.raw_text);
         println!("採用  : {:?}", result.text);
@@ -870,7 +1032,7 @@ mod tests {
             },
             &spy,
             None,
-            None,
+            &[],
         )
         .expect("成功する");
 
@@ -886,7 +1048,7 @@ mod tests {
         let spy = PromptSpy {
             prompt: std::sync::Mutex::new(None),
         };
-        run(&PipelineInput::new(b"wav", "ja"), &spy, None, None).expect("成功する");
+        run(&PipelineInput::new(b"wav", "ja"), &spy, None, &[]).expect("成功する");
         assert_eq!(*spy.prompt.lock().expect("ロック"), None);
     }
 
@@ -905,7 +1067,7 @@ mod tests {
             },
             &stt,
             Some(&formatter),
-            None,
+            &[],
         )
         .expect("成功する");
 

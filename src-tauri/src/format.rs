@@ -24,7 +24,7 @@ use crate::dictionary::DictionaryEntry;
 
 /// 再試行前の待ち時間。
 ///
-/// 副の整形器 ([`crate::format_groq`]) も同じ間合いを使う。「何秒待って
+/// 副の整形器 ([`crate::format_openai_compat`]) も同じ間合いを使う。「何秒待って
 /// 1 回だけ試し直す」は整形という工程の性質から来る判断であって、
 /// 提供元ごとに違う理由が無い。
 pub(crate) const RETRY_BACKOFF: Duration = Duration::from_millis(500);
@@ -35,7 +35,7 @@ const MAX_ERROR_BODY: usize = 400;
 /// **控えが無いときの値**。落ちたら生転写しか無いので、粘る価値がある。
 pub const FORMAT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// 控え ([`crate::format_groq`]) が使えるときの、主の見切り。
+/// 控え ([`crate::format_openai_compat`]) が使えるときの、主の見切り。
 ///
 /// # なぜ 20 秒から縮めたか (実測 2026-09-06)
 ///
@@ -274,6 +274,7 @@ impl TextFormatter for GeminiFormatter {
 /// 表記ゆれ (`Groq` / `groq`) が理由文に出る。
 pub(crate) const PROVIDER_GEMINI: &str = "Gemini";
 pub(crate) const PROVIDER_GROQ: &str = "Groq";
+pub(crate) const PROVIDER_OPENROUTER: &str = "OpenRouter";
 
 /// 失敗を**利用者向けの短い文**にする。「何が起きたか」より
 /// 「どうすればよいか」が伝わる粒度にする。
@@ -281,7 +282,7 @@ pub(crate) const PROVIDER_GROQ: &str = "Groq";
 /// # なぜ `Display` と別に持つか
 ///
 /// [`FormatError`] の `Display` は文面に「Gemini」を焼き込んでいる。
-/// 整形器が主 (Gemini) と副 ([`crate::format_groq`]) の 2 つになった以上、
+/// 整形器が主 (Gemini) と副 ([`crate::format_openai_compat`]) の 2 つになった以上、
 /// **`Display` をそのままログや UI へ出すと、控えの失敗が「Gemini の…」と
 /// 表示されて端的に嘘になる**。提供元を引数に取るこちらを使うこと。
 ///
@@ -521,7 +522,7 @@ pub fn build_request(request: &FormatRequest<'_>) -> Value {
 /// 見出しを付けて無害化まで済ませた形が「整形対象のテキスト」の正しい姿。
 /// [`system_prompt`] の【データ部の読み方】はこの形を前提に書かれているので、
 /// **素の `raw` を送る経路を作ってはいけない** — 見出し偽装への耐性が
-/// その経路でだけ静かに落ちる。主 (Gemini) と副 ([`crate::format_groq`]) で
+/// その経路でだけ静かに落ちる。主 (Gemini) と副 ([`crate::format_openai_compat`]) で
 /// 同じものを通すために切り出してある。
 pub(crate) fn user_message(request: &FormatRequest<'_>) -> String {
     format!("{SECTION_BODY}\n{}", sanitize_data(request.raw))
@@ -912,7 +913,7 @@ pub(crate) fn strip_wrapping(text: &str) -> String {
 
 /// HTTP ステータスを [`FormatError`] へ落とす。
 ///
-/// 主 (Gemini) と副 ([`crate::format_groq`]) で共有する。どちらも
+/// 主 (Gemini) と副 ([`crate::format_openai_compat`]) で共有する。どちらも
 /// OpenAI/Google 系の慣習どおり 401/403 が認証、429 がレート制限、
 /// 5xx がサーバ側の不調なので、判断を 2 度書く理由が無い。
 pub(crate) fn classify_status(status: u16, body: &str) -> FormatError {
@@ -936,7 +937,7 @@ pub(crate) fn classify_transport_error(error: reqwest::Error) -> FormatError {
 
 /// 試行用の共通の生転写サンプル。
 ///
-/// 主 (Gemini) と副 ([`crate::format_groq`]) を**同じ文**で測るために
+/// 主 (Gemini) と副 ([`crate::format_openai_compat`]) を**同じ文**で測るために
 /// ここに置く。別々の文で測ると、出力の差がモデルの差なのか入力の差なのか
 /// 分からなくなる。フィラー 2 種と言い直しが 1 つずつ入っている。
 ///
@@ -2389,9 +2390,9 @@ fn main() {}
         let backoff = RETRY_BACKOFF;
         // 主: 再試行しない (with_retry(false))。控え: 1 回だけ試し直す。
         let worst = FORMAT_TIMEOUT_WITH_FALLBACK
-            + crate::format_groq::GROQ_FORMAT_TIMEOUT
+            + crate::format_openai_compat::GROQ_FORMAT_TIMEOUT
             + backoff
-            + crate::format_groq::GROQ_FORMAT_TIMEOUT;
+            + crate::format_openai_compat::GROQ_FORMAT_TIMEOUT;
         // 段を増やす前の上限: 20s + 0.5s + 20s。
         let before = FORMAT_TIMEOUT + backoff + FORMAT_TIMEOUT;
         assert!(
@@ -2399,6 +2400,24 @@ fn main() {}
             "最悪待ち時間が悪化している: {worst:?} >= {before:?}"
         );
         assert!(worst <= Duration::from_millis(22_500), "{worst:?}");
+    }
+
+    /// 3 段目 (OpenRouter、キーを入れたときだけ) を足したときの最悪待ち時間。
+    ///
+    /// OpenRouter は再試行しないので、増えるのは 8 秒 1 回分だけ (22.5 → 30.5 秒)。
+    /// 再試行を足すと 39 秒になり、段を増やす前 (40.5 秒) とほぼ並ぶ。
+    /// 上の 2 段の値はそのまま残し、3 段の値はここで別に縛る。
+    #[test]
+    fn a_third_rung_adds_only_one_openrouter_timeout() {
+        let backoff = RETRY_BACKOFF;
+        let two_rungs = FORMAT_TIMEOUT_WITH_FALLBACK
+            + crate::format_openai_compat::GROQ_FORMAT_TIMEOUT
+            + backoff
+            + crate::format_openai_compat::GROQ_FORMAT_TIMEOUT;
+        let worst = two_rungs + crate::format_openai_compat::OPENROUTER_FORMAT_TIMEOUT;
+        assert_eq!(worst, Duration::from_millis(30_500), "{worst:?}");
+        let before = FORMAT_TIMEOUT + backoff + FORMAT_TIMEOUT;
+        assert!(worst < before, "最悪待ち時間が段を増やす前より悪い: {worst:?}");
     }
 
     /// **タイムアウトと再試行の値を決めるための実測** (2026-09-06)。
@@ -2465,7 +2484,7 @@ fn main() {}
                 formatters.push((
                     format!("Groq {model}"),
                     Box::new(
-                        crate::format_groq::GroqFormatter::new(
+                        crate::format_openai_compat::OpenAiCompatFormatter::groq(
                             client.clone(),
                             &cfg.groq_chat_endpoint,
                             model,

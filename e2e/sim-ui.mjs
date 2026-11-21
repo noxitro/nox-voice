@@ -2014,7 +2014,11 @@ async function main() {
       const rules = document.getElementById("format-rules");
       const model = document.getElementById("format-model");
       const groq = document.getElementById("groq-format-model");
+      const openrouter = document.getElementById("openrouter-format-model");
       return {
+        openrouterValue: openrouter.value,
+        openrouterPlaceholder: openrouter.placeholder,
+        openrouterList: [...openrouter.list.options].map((o) => [o.value, o.label]),
         storedEmpty: m.format_rules === "",
         rulesShowsDefault: rules.value === m.default_format_rules,
         badgeHidden: document.getElementById("format-rules-modified").hidden,
@@ -2046,7 +2050,17 @@ async function main() {
         r.geminiList[0][1] === "既定・最速 (模擬)" &&
         r.groqList.length === 3 &&
         r.groqList[2] === "qwen/qwen3.8-27b" &&
-        JSON.stringify(r.defaultCodes) === JSON.stringify(["gemini-flash-lite-latest", "openai/gpt-oss-20b"]) &&
+        r.openrouterValue === "google/gemma-4-26b-a4b-it:free" &&
+        r.openrouterPlaceholder === "google/gemma-4-31b-it:free" &&
+        r.openrouterList.length === 1 &&
+        r.openrouterList[0][0] === "google/gemma-4-31b-it:free" &&
+        r.openrouterList[0][1] === "既定・未実測 (模擬)" &&
+        JSON.stringify(r.defaultCodes) ===
+          JSON.stringify([
+            "gemini-flash-lite-latest",
+            "openai/gpt-oss-20b",
+            "google/gemma-4-31b-it:free",
+          ]) &&
         r.r1WarningBeforeToggle,
       detail: JSON.stringify(r),
     };
@@ -2161,7 +2175,12 @@ async function main() {
       document.getElementById("format-model-test").click();
       await new Promise((r) => setTimeout(r, 60));
       const box = document.getElementById("format-model-result");
-      const ids = ["format-model-test", "groq-format-model-test", "format-rules-test"];
+      const ids = [
+        "format-model-test",
+        "groq-format-model-test",
+        "openrouter-format-model-test",
+        "format-rules-test",
+      ];
       const busy = {
         disabled: ids.map((id) => document.getElementById(id).disabled),
         state: box.dataset.state,
@@ -2231,6 +2250,111 @@ async function main() {
     };
   });
 
+  await check("U22b 「試す」(第2の控え): OpenRouter の名前で送り、結果は OpenRouter の欄に出る。空欄なら既定で試す", async () => {
+    const r = await cdp.run(`
+      const m = window.__NOX_MOCK__;
+      const input = document.getElementById("openrouter-format-model");
+      const box = document.getElementById("openrouter-format-model-result");
+      input.value = "vendor/bad-model:free";
+      document.getElementById("openrouter-format-model-test").click();
+      await new Promise((r) => setTimeout(r, 150));
+      const fail = {
+        args: m.lastArgs("test_format_model"),
+        state: box.dataset.state,
+        head: box.querySelector(".model-test-head")?.textContent,
+        body: box.querySelector(".model-test-body")?.textContent,
+      };
+      input.value = "";
+      document.getElementById("openrouter-format-model-test").click();
+      await new Promise((r) => setTimeout(r, 150));
+      return {
+        fail,
+        ok: {
+          args: m.lastArgs("test_format_model"),
+          state: box.dataset.state,
+          head: box.querySelector(".model-test-head")?.textContent,
+        },
+        groqBoxUntouched: document.getElementById("groq-format-model-result").textContent.includes("openai/bad-model"),
+      };
+    `);
+    return {
+      ok:
+        r.fail.args.provider === "openrouter" &&
+        r.fail.args.model === "vendor/bad-model:free" &&
+        r.fail.state === "fail" &&
+        r.fail.body === "OpenRouter がエラーを返しました (404)" &&
+        r.ok.args.provider === "openrouter" &&
+        r.ok.args.model === "" &&
+        r.ok.state === "ok" &&
+        r.ok.head === "成功: 所要 812 ms(google/gemma-4-31b-it:free)" &&
+        r.groqBoxUntouched,
+      detail: JSON.stringify(r),
+    };
+  });
+
+  await check("U22c OpenRouter のキー: 入力して保存すると送られて欄は空に戻り、状態が「.env から」になる。空欄なら送らない", async () => {
+    const r = await cdp.run(`
+      const m = window.__NOX_MOCK__;
+      const key = document.getElementById("openrouter-key");
+      const state = document.getElementById("openrouter-state");
+      const before = state.textContent;
+      key.value = "sk-or-v1-sim-7c3e";
+      document.getElementById("settings-form").requestSubmit();
+      await new Promise((r) => setTimeout(r, 250));
+      const saved = {
+        sent: m.lastPatch.openrouter_api_key,
+        model: m.lastPatch.openrouter_format_model,
+        shownModel: document.getElementById("openrouter-format-model").value,
+        fieldCleared: key.value === "",
+        state: state.textContent,
+        leaked: JSON.stringify(m.config).includes("sk-or-v1-sim"),
+      };
+      document.getElementById("settings-form").requestSubmit();
+      await new Promise((r) => setTimeout(r, 250));
+      const secondSent = "openrouter_api_key" in m.lastPatch;
+      // 空欄で保存しても消えない。外す手段は「キーを消す」だけ。
+      const clear = document.getElementById("openrouter-key-clear");
+      const stillSet = state.textContent;
+      const clearEnabled = clear.disabled === false;
+      // 未保存の入力が、キーを消す操作で巻き戻らないこと。
+      const lang = document.getElementById("language");
+      const langBefore = lang.value;
+      lang.value = "en";
+      clear.click();
+      await new Promise((r) => setTimeout(r, 250));
+      const cleared = {
+        patch: JSON.stringify(m.lastPatch),
+        state: state.textContent,
+        disabled: clear.disabled,
+        note: document.getElementById("openrouter-key-note").textContent,
+        langKept: lang.value === "en",
+      };
+      lang.value = langBefore;
+      return { before, saved, secondSent, stillSet, clearEnabled, cleared };
+    `);
+    return {
+      ok:
+        r.before.includes("未設定") &&
+        r.saved.sent === "sk-or-v1-sim-7c3e" &&
+        // U22b で空欄にしたまま保存する = 空を送り、Rust (模擬) が既定へ倒す。
+        r.saved.model === "" &&
+        r.saved.shownModel === "google/gemma-4-31b-it:free" &&
+        r.saved.fieldCleared &&
+        r.saved.state.includes(".env から") &&
+        r.saved.state.includes("…7c3e") &&
+        r.saved.leaked === false &&
+        r.secondSent === false &&
+        r.stillSet.includes("…7c3e") &&
+        r.clearEnabled &&
+        r.cleared.patch === JSON.stringify({ openrouter_api_key: "" }) &&
+        r.cleared.state.includes("未設定") &&
+        r.cleared.disabled === true &&
+        r.cleared.note.includes("消しました") &&
+        r.cleared.langKept,
+      detail: JSON.stringify(r),
+    };
+  });
+
   await check("U23 「この指示で試す」: IPC が失敗しても理由を出し、ボタンが戻る", async () => {
     await load(cdp, "?fail=test_format_model");
     const r = await cdp.run(`
@@ -2291,6 +2415,8 @@ async function main() {
       return {
         groqState: document.getElementById("groq-state").textContent,
         geminiState: document.getElementById("gemini-state").textContent,
+        openrouterState: document.getElementById("openrouter-state").textContent,
+        envHint: document.getElementById("dotenv-path").closest("p").textContent,
         path: document.getElementById("dotenv-path").textContent,
         expectedPath: m.config.dotenv_path,
       };
@@ -2300,6 +2426,8 @@ async function main() {
         r.groqState.includes(".env から") &&
         r.groqState.includes("…9f2a") &&
         r.geminiState.includes("未設定") &&
+        r.openrouterState.includes("未設定") &&
+        r.envHint.includes("NOX_OPENROUTER_API_KEY") &&
         r.path === r.expectedPath &&
         r.path.endsWith("\\.env"),
       detail: JSON.stringify(r),

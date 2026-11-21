@@ -371,10 +371,34 @@
                     placeholder="変更するときだけ入力"
                   />
                 </label>
+                <!-- OpenRouter には専用のオン・オフが無く、キーの有無が参加条件になる。
+                     だから「外す」手段をここに置く (空欄で保存 = 変更しない、なので
+                     空欄では消せない)。 -->
+                <div class="field">
+                  <label class="field-label" for="openrouter-key"
+                    >OpenRouter API キー(任意)<em id="openrouter-state"></em></label
+                  >
+                  <div class="model-row">
+                    <input
+                      type="password"
+                      id="openrouter-key"
+                      autocomplete="off"
+                      placeholder="変更するときだけ入力"
+                      aria-describedby="openrouter-key-note"
+                    />
+                    <button type="button" id="openrouter-key-clear" disabled>キーを消す</button>
+                  </div>
+                  <small class="field-note" id="openrouter-key-note" aria-live="polite"
+                    >入れたときだけ、整形の第2の控えとして OpenRouter を使います。「キーを消す」で外れます。</small
+                  >
+                </div>
                 <p class="hint">
                   ここで保存したキーは <code id="dotenv-path"></code> に書かれ、
-                  同じ名前の環境変数(<code>GROQ_API_KEY</code> / <code>GEMINI_API_KEY</code>)より
+                  同じ名前の環境変数(<code>GROQ_API_KEY</code> / <code>GEMINI_API_KEY</code> /
+                  <code>NOX_OPENROUTER_API_KEY</code>)より
                   優先されます。他のアプリと環境変数を共有していても、nox-voice はここのキーを使います。
+                  OpenRouter だけ名前に <code>NOX_</code> が付くのは、ほかの道具が使う
+                  <code>OPENROUTER_API_KEY</code> を読んで別のアカウントのキーを拾わないためです。
                   キーは平文で保存されます。メモ帳で直接書き換えてもよく、次の録音から効きます(再起動は不要)。
                 </p>
                 <label class="field">
@@ -469,6 +493,43 @@
                     >)に戻ります。推論モデルなので、変更したら「試す」で所要時間を確かめてください。</small
                   >
                   <p class="model-test" id="groq-format-model-result" aria-live="polite" hidden></p>
+                </div>
+                <!-- 第 2 の控え (OpenRouter)。専用のトグルは無く、キーを入れたときだけ
+                     参加する。候補と既定名は ConfigView (OPENROUTER_FORMAT_MODEL_CANDIDATES)。 -->
+                <p class="hint">
+                  <strong>OpenRouter の API キーを入れると</strong>、Gemini(と上の Groq)が使えなかった
+                  録音で、整形の指示一式(生転写・辞書・文体指示、画面コンテキストがオンなら
+                  <strong>画面のテキスト</strong>)が <strong>OpenRouter と、その先のモデル提供元へ送られます</strong>。
+                  無料モデルでは、提供元が送信内容を記録して製品の改善に使う場合があります。
+                  キーが空なら OpenRouter には何も送りません。
+                </p>
+                <div class="field">
+                  <label class="field-label" for="openrouter-format-model"
+                    >第2の控えの整形モデル(OpenRouter)</label
+                  >
+                  <div class="model-row">
+                    <input
+                      type="text"
+                      id="openrouter-format-model"
+                      list="openrouter-format-model-candidates"
+                      autocomplete="off"
+                      spellcheck="false"
+                      aria-describedby="openrouter-format-model-note openrouter-format-model-result"
+                    />
+                    <button type="button" id="openrouter-format-model-test" data-provider="openrouter">
+                      試す
+                    </button>
+                  </div>
+                  <datalist id="openrouter-format-model-candidates"></datalist>
+                  <small class="field-note" id="openrouter-format-model-note"
+                    >OpenRouter のキーがあるとき、Gemini と Groq の両方が使えなかった録音の整形にだけ
+                    使います(Groq の控えをオフにしていれば Gemini の次)。空にすると既定(<code
+                      data-default-model="openrouter"
+                    ></code
+                    >)に戻ります。無料(<code>:free</code>)のモデルはよく入れ替わるので、
+                    変更したら「試す」で動くことを確かめてください。</small
+                  >
+                  <p class="model-test" id="openrouter-format-model-result" aria-live="polite" hidden></p>
                 </div>
                 <!--
                   整形の共通ルール。編集できるのは「どう整えるか」の部分だけで、

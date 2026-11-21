@@ -168,6 +168,10 @@ interface ConfigView {
   gemini_key_set: boolean;
   gemini_key_source: KeySource;
   gemini_key_preview: string;
+  /** OpenRouter (第 2 の控え)。キーがあるときだけ整形に参加する。 */
+  openrouter_key_set: boolean;
+  openrouter_key_source: KeySource;
+  openrouter_key_preview: string;
   /** キーを書ける `.env` の場所。起動時に決まらなかったときは空。 */
   dotenv_path: string;
   language: string;
@@ -228,6 +232,8 @@ interface ConfigView {
   /** 主が落ちたとき控え (Groq) で整形し直すか。 */
   format_fallback_enabled: boolean;
   groq_format_model: string;
+  /** 第 2 の控え (OpenRouter) の整形モデル。 */
+  openrouter_format_model: string;
   /** 保存されている整形の共通ルール。**空なら同梱の既定を使っている**。 */
   format_rules: string;
   /**
@@ -239,9 +245,11 @@ interface ConfigView {
   format_rules_max_chars: number;
   default_format_model: string;
   default_groq_format_model: string;
+  default_openrouter_format_model: string;
   /** 候補リスト (Rust の `config::GEMINI_FORMAT_MODEL_CANDIDATES` 等)。 */
   format_model_candidates: ModelCandidate[];
   groq_format_model_candidates: ModelCandidate[];
+  openrouter_format_model_candidates: ModelCandidate[];
 }
 
 /** Rust 側 `config::ModelCandidate` と対応。 */
@@ -251,7 +259,7 @@ interface ModelCandidate {
 }
 
 /** Rust 側 `config::FormatProvider` と対応。 */
-type FormatProvider = "gemini" | "groq";
+type FormatProvider = "gemini" | "groq" | "openrouter";
 
 /** Rust 側 `lib::FormatModelTest` と対応。失敗も `ok: false` の正常な答えで返る。 */
 interface FormatModelTest {
@@ -716,11 +724,86 @@ async function copyText(kind: "formatted" | "raw", button: HTMLButtonElement) {
   }, 1500);
 }
 
-function keyStateLabel(view: ConfigView, which: "groq" | "gemini"): string {
-  const set = which === "groq" ? view.groq_key_set : view.gemini_key_set;
-  const source = which === "groq" ? view.groq_key_source : view.gemini_key_source;
-  const preview =
-    which === "groq" ? view.groq_key_preview : view.gemini_key_preview;
+/** キーの状態 (ConfigView の `{提供元}_key_*`) を提供元ごとに引く。 */
+function keyState(
+  view: ConfigView,
+  which: FormatProvider,
+): { set: boolean; source: KeySource; preview: string } {
+  switch (which) {
+    case "groq":
+      return { set: view.groq_key_set, source: view.groq_key_source, preview: view.groq_key_preview };
+    case "gemini":
+      return {
+        set: view.gemini_key_set,
+        source: view.gemini_key_source,
+        preview: view.gemini_key_preview,
+      };
+    case "openrouter":
+      return {
+        set: view.openrouter_key_set,
+        source: view.openrouter_key_source,
+        preview: view.openrouter_key_preview,
+      };
+  }
+}
+
+const OPENROUTER_KEY_NOTE =
+  "入れたときだけ、整形の第2の控えとして OpenRouter を使います。「キーを消す」で外れます。";
+
+/**
+ * 「キーを消す」を、消せるキーがあるときだけ押せるようにする。
+ *
+ * 環境変数から来たキーはアプリからは消せない (起動時の値で、`.env` にも
+ * 設定ファイルにも無い)。押せるままにすると「消したのに残る」になるので、
+ * 押せなくして理由を書く。
+ */
+function renderOpenRouterKeyClear(view: ConfigView, note = OPENROUTER_KEY_NOTE): void {
+  const button = el<HTMLButtonElement>("openrouter-key-clear");
+  if (button) {
+    button.disabled = !view.openrouter_key_set || view.openrouter_key_source === "env";
+  }
+  const noteEl = el("openrouter-key-note");
+  if (noteEl) {
+    noteEl.textContent =
+      view.openrouter_key_source === "env"
+        ? "環境変数 NOX_OPENROUTER_API_KEY のキーを使っています。外すには、その環境変数を消してアプリを再起動してください。"
+        : note;
+  }
+}
+
+/**
+ * OpenRouter のキーを消す (= OpenRouter を整形から外す)。
+ *
+ * 専用のオン・オフが無いので、これが唯一の「外す」操作になる。キーだけの
+ * パッチを送り、**フォームの他の欄は描き直さない** — `renderConfig` を通すと、
+ * まだ保存していない入力が保存済みの値で上書きされる。
+ */
+async function clearOpenRouterKey(): Promise<void> {
+  const button = el<HTMLButtonElement>("openrouter-key-clear");
+  if (button) button.disabled = true;
+  try {
+    const view = await invoke<ConfigView>("set_config", { patch: { openrouter_api_key: "" } });
+    const input = el<HTMLInputElement>("openrouter-key");
+    if (input) input.value = "";
+    const state = el("openrouter-state");
+    if (state) state.textContent = keyStateLabel(view, "openrouter");
+    // `.env` の行を消しても、同じ名前の環境変数があればそちらが使われる。
+    // 「消しました」とだけ言うと嘘になるので、残っているときはそう言う。
+    renderOpenRouterKeyClear(
+      view,
+      view.openrouter_key_set
+        ? OPENROUTER_KEY_NOTE
+        : "キーを消しました。OpenRouter には何も送りません。",
+    );
+  } catch (e) {
+    if (button) button.disabled = false;
+    const noteEl = el("openrouter-key-note");
+    if (noteEl) noteEl.textContent = `キーを消せませんでした: ${e}`;
+  }
+}
+
+function keyStateLabel(view: ConfigView, which: FormatProvider): string {
+  const { set, source, preview } = keyState(view, which);
   if (!set) return " — 未設定";
   if (source === "dotenv") return ` — .env から (${preview})`;
   if (source === "env") return ` — 環境変数から (${preview})`;
@@ -940,7 +1023,12 @@ function resetFormatRules() {
 }
 
 /** 「試す」ボタン。1 本ずつしか走らせない (同時に投げると無料枠を食い合う)。 */
-const MODEL_TEST_BUTTONS = ["format-model-test", "groq-format-model-test", "format-rules-test"];
+const MODEL_TEST_BUTTONS = [
+  "format-model-test",
+  "groq-format-model-test",
+  "openrouter-format-model-test",
+  "format-rules-test",
+];
 let modelTestRunning = false;
 
 function renderModelTest(
@@ -1035,6 +1123,11 @@ function renderConfig(view: ConfigView) {
     groqFormatModel.value = view.groq_format_model;
     groqFormatModel.placeholder = view.default_groq_format_model;
   }
+  const openrouterFormatModel = el<HTMLInputElement>("openrouter-format-model");
+  if (openrouterFormatModel) {
+    openrouterFormatModel.value = view.openrouter_format_model;
+    openrouterFormatModel.placeholder = view.default_openrouter_format_model;
+  }
   const formatModel = el<HTMLInputElement>("format-model");
   if (formatModel) {
     formatModel.value = view.format_model;
@@ -1042,11 +1135,17 @@ function renderConfig(view: ConfigView) {
   }
   renderModelCandidates("format-model-candidates", view.format_model_candidates);
   renderModelCandidates("groq-format-model-candidates", view.groq_format_model_candidates);
+  renderModelCandidates(
+    "openrouter-format-model-candidates",
+    view.openrouter_format_model_candidates,
+  );
+  const defaultModels: Record<string, string> = {
+    gemini: view.default_format_model,
+    groq: view.default_groq_format_model,
+    openrouter: view.default_openrouter_format_model,
+  };
   for (const code of document.querySelectorAll<HTMLElement>("[data-default-model]")) {
-    code.textContent =
-      code.dataset.defaultModel === "groq"
-        ? view.default_groq_format_model
-        : view.default_format_model;
+    code.textContent = defaultModels[code.dataset.defaultModel ?? "gemini"] ?? view.default_format_model;
   }
   renderFormatRules(view);
   const injection = el<HTMLInputElement>("injection-enabled");
@@ -1143,6 +1242,9 @@ function renderConfig(view: ConfigView) {
   if (groqState) groqState.textContent = keyStateLabel(view, "groq");
   const geminiState = el("gemini-state");
   if (geminiState) geminiState.textContent = keyStateLabel(view, "gemini");
+  const openrouterState = el("openrouter-state");
+  if (openrouterState) openrouterState.textContent = keyStateLabel(view, "openrouter");
+  renderOpenRouterKeyClear(view);
   const dotenvPath = el("dotenv-path");
   if (dotenvPath) dotenvPath.textContent = view.dotenv_path || "(設定ファイルと同じフォルダの .env)";
 }
@@ -1650,6 +1752,7 @@ async function saveSettings(event: Event) {
   const note = el("settings-note");
   const groq = el<HTMLInputElement>("groq-key");
   const gemini = el<HTMLInputElement>("gemini-key");
+  const openrouter = el<HTMLInputElement>("openrouter-key");
   const language = el<HTMLInputElement>("language");
   const formatting = el<HTMLInputElement>("formatting-enabled");
   const injection = el<HTMLInputElement>("injection-enabled");
@@ -1660,6 +1763,7 @@ async function saveSettings(event: Event) {
   const autoLearn = el<HTMLInputElement>("auto-learn");
   const formatFallback = el<HTMLInputElement>("format-fallback-enabled");
   const groqFormatModel = el<HTMLInputElement>("groq-format-model");
+  const openrouterFormatModel = el<HTMLInputElement>("openrouter-format-model");
   const formatModel = el<HTMLInputElement>("format-model");
   const formatRules = el<HTMLTextAreaElement>("format-rules");
   // 既定文を読めているか。保存の応答で renderConfig が走ると変わるので、
@@ -1695,6 +1799,7 @@ async function saveSettings(event: Event) {
     // 空文字は Rust 側 (`non_empty_or`) が既定へ倒す。入力欄が無いときだけ
     // 未指定にして、現在値を据え置く。
     ...(groqFormatModel ? { groq_format_model: groqFormatModel.value } : {}),
+    ...(openrouterFormatModel ? { openrouter_format_model: openrouterFormatModel.value } : {}),
     ...(formatModel ? { format_model: formatModel.value } : {}),
     // 既定と同じ文なら Rust 側が空 (= 既定) で保存する。既定文をまだ読めて
     // いない (get_config 前) なら送らない — 空の入力欄を送ると、利用者の
@@ -1748,6 +1853,7 @@ async function saveSettings(event: Event) {
   if (Number.isFinite(delay) && delay > 0) patch.restore_delay_ms = delay;
   if (groq?.value) patch.groq_api_key = groq.value;
   if (gemini?.value) patch.gemini_api_key = gemini.value;
+  if (openrouter?.value) patch.openrouter_api_key = openrouter.value;
 
   try {
     const view = await invoke<ConfigView>("set_config", { patch });
@@ -1759,6 +1865,7 @@ async function saveSettings(event: Event) {
     // 入力欄には残さない (画面に平文で残る時間を最小にする)。
     if (groq) groq.value = "";
     if (gemini) gemini.value = "";
+    if (openrouter) openrouter.value = "";
     if (note) {
       // 送らなかったものは黙って落とさず、その場で言う
       // (「保存しました」とだけ出して音だけ変わっていない、が一番たちが悪い)。
@@ -3105,6 +3212,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   el("groq-format-model-test")?.addEventListener(
     "click",
     () => void runModelTest("groq", "groq-format-model", "groq-format-model-result"),
+  );
+  el("openrouter-key-clear")?.addEventListener("click", () => void clearOpenRouterKey());
+  el("openrouter-format-model-test")?.addEventListener(
+    "click",
+    () =>
+      void runModelTest("openrouter", "openrouter-format-model", "openrouter-format-model-result"),
   );
   // 共通ルールを試すときは主 (Gemini) の入力中のモデルで試す。結果は
   // ルールの欄の下に出す (押した場所の近くで答える)。

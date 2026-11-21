@@ -33,7 +33,7 @@ mod dictionary;
 mod focus_probe;
 mod foreground;
 mod format;
-mod format_groq;
+mod format_openai_compat;
 mod history;
 mod hotkey;
 mod inject;
@@ -73,7 +73,7 @@ use tauri_plugin_autostart::ManagerExt;
 use audio::Recorder;
 use config::{ConfigPatch, ConfigStore, ConfigView};
 use format::{GeminiFormatter, ScreenAnswerer};
-use format_groq::GroqFormatter;
+use format_openai_compat::OpenAiCompatFormatter;
 use history::{DashboardStats, HistoryStore, SessionDraft, SessionRow};
 use hotkey::{
     HookHandle, HotkeyAction, HotkeyMode, KeyTarget, PttInterpreter, HOTKEY_SLOTS, TAP_THRESHOLD,
@@ -2383,35 +2383,60 @@ fn finalize_one(job: FinalizeJob) -> Result<FinalizedRecording, String> {
     })
 }
 
-/// 整形の**控え** (Groq) を組み立てる。無効・キー未設定なら `None`。
+/// 整形の**控え**を優先順に組み立てる (Groq → OpenRouter)。無ければ空。
 ///
-/// 主と副の対を 2 か所で書かないためのヘルパ。新規録音と再転写で
+/// 主と副の組を 2 か所で書かないためのヘルパ。新規録音と再転写で
 /// 組み立てがずれると、**片方だけ控えが効かない**という追いにくい差になる
 /// (STT の経路で実際にやった過ちと同じ形。design.md 2026-08-31)。
 ///
-/// キーは [`config::Config::groq_key`] — `.env` > 環境変数 > 設定で、STT と同じ経路。
-fn build_fallback_formatter(
+/// - Groq: [`config::Config::format_fallback_enabled`] が有効で、キー
+///   ([`config::Config::groq_key`]、STT と同じ経路) があるとき
+/// - OpenRouter: キー ([`config::Config::openrouter_key`]) があるとき。
+///   専用のトグルは無い (設計 §6「空なら参加しない」)。Groq の控えを
+///   オフにしても、キーがあれば Gemini → OpenRouter になる
+fn build_fallback_formatters(
     cfg: &config::Config,
     client: &reqwest::blocking::Client,
-) -> Option<GroqFormatter> {
-    if !cfg.format_fallback_enabled {
-        return None;
-    }
+) -> Vec<OpenAiCompatFormatter> {
+    let mut rungs = Vec::new();
     // 主と違い、キーが無いなら**作らない**。主は「キー未設定」を
     // RawFallback の理由として見せたいが、控えの不在は理由ではない
     // (主が成功していれば控えは呼ばれもしない)。
-    let key = cfg.groq_key().secret?;
-    Some(
-        GroqFormatter::new(
-            client.clone(),
-            &cfg.groq_chat_endpoint,
-            &cfg.groq_format_model,
-            key,
-        )
-        // 主の 20 秒を待った後にさらに 20 秒待たせない。主の側と同じく、
-        // 見切りの長さは呼び出し側に見えるところへ書く。
-        .with_timeout(format_groq::GROQ_FORMAT_TIMEOUT),
-    )
+    if cfg.format_fallback_enabled {
+        if let Some(key) = cfg.groq_key().secret {
+            rungs.push(
+                OpenAiCompatFormatter::groq(
+                    client.clone(),
+                    &cfg.groq_chat_endpoint,
+                    &cfg.groq_format_model,
+                    key,
+                )
+                // 主の 20 秒を待った後にさらに 20 秒待たせない。主の側と同じく、
+                // 見切りの長さは呼び出し側に見えるところへ書く。
+                .with_timeout(format_openai_compat::GROQ_FORMAT_TIMEOUT),
+            );
+        }
+    }
+    if let Some(key) = cfg.openrouter_key().secret {
+        rungs.push(
+            OpenAiCompatFormatter::openrouter(
+                client.clone(),
+                &cfg.openrouter_chat_endpoint,
+                &cfg.openrouter_format_model,
+                key,
+            )
+            .with_timeout(format_openai_compat::OPENROUTER_FORMAT_TIMEOUT),
+        );
+    }
+    rungs
+}
+
+/// [`build_fallback_formatters`] の結果を [`pipeline::run`] に渡す形にする。
+fn fallback_rungs(formatters: &[OpenAiCompatFormatter]) -> Vec<pipeline::FallbackRung<'_>> {
+    formatters
+        .iter()
+        .map(|f| (f.provider(), f as &dyn format::TextFormatter))
+        .collect()
 }
 
 /// 設定画面の「試す」の結果。
@@ -2481,7 +2506,8 @@ async fn test_format_model(
 /// - Gemini は再試行なし・控えが無いときの見切り ([`format::FORMAT_TIMEOUT`])。
 ///   試行で 1 回粘ると、駄目なモデルの判定に倍の時間がかかる
 /// - Groq は控えの有効/無効に関わらず試す (有効にするか決める前に試したい)。
-///   キーが無ければ [`format::FormatError::MissingApiKey`] として理由を返す
+///   キーが無ければ [`format::FormatError::MissingApiKey`] として理由を返す。
+///   OpenRouter も同じ (再試行なし・思考なしで、本番と同じ組み立て)
 /// - 理由文は [`format::provider_reason`]。`Display` は「Gemini」を焼き込んで
 ///   いるので、Groq の失敗に使うと嘘になる
 /// - ログには提供元・モデル名・文字数・所要時間だけを出す (キーも本文も出さない)
@@ -2529,16 +2555,28 @@ fn run_format_model_test(
             (format::PROVIDER_GEMINI, result, started.elapsed())
         }
         config::FormatProvider::Groq => {
-            let formatter = GroqFormatter::new(
+            let formatter = OpenAiCompatFormatter::groq(
                 http.clone(),
                 &cfg.groq_chat_endpoint,
                 &model,
                 cfg.groq_key().secret.unwrap_or_default(),
             )
-            .with_timeout(format_groq::GROQ_FORMAT_TIMEOUT);
+            .with_timeout(format_openai_compat::GROQ_FORMAT_TIMEOUT);
             let started = Instant::now();
             let result = format::TextFormatter::format(&formatter, &request);
-            (format::PROVIDER_GROQ, result, started.elapsed())
+            (formatter.provider(), result, started.elapsed())
+        }
+        config::FormatProvider::OpenRouter => {
+            let formatter = OpenAiCompatFormatter::openrouter(
+                http.clone(),
+                &cfg.openrouter_chat_endpoint,
+                &model,
+                cfg.openrouter_key().secret.unwrap_or_default(),
+            )
+            .with_timeout(format_openai_compat::OPENROUTER_FORMAT_TIMEOUT);
+            let started = Instant::now();
+            let result = format::TextFormatter::format(&formatter, &request);
+            (formatter.provider(), result, started.elapsed())
         }
     };
     let elapsed_ms = elapsed.as_millis() as u64;
@@ -2590,11 +2628,12 @@ fn transcribe_and_format(
     // そうすることで「キー未設定」が Disabled ではなく
     // RawFallback(理由つき) として UI に出る。
     // 控えを先に決める。主の見切り方が**控えの有無で変わる**ため。
-    let fallback = cfg
-        .formatting_enabled
-        .then(|| build_fallback_formatter(&cfg, &http))
-        .flatten();
-    let has_fallback = fallback.is_some();
+    let fallbacks = if cfg.formatting_enabled {
+        build_fallback_formatters(&cfg, &http)
+    } else {
+        Vec::new()
+    };
+    let has_fallback = !fallbacks.is_empty();
     let formatter = cfg.formatting_enabled.then(|| {
         GeminiFormatter::new(
             http.clone(),
@@ -2654,9 +2693,9 @@ fn transcribe_and_format(
         rules: cfg.format_rules_for_prompt(),
     };
     let formatter_ref = formatter.as_ref().map(|f| f as &dyn format::TextFormatter);
-    let fallback_ref = fallback.as_ref().map(|f| f as &dyn format::TextFormatter);
+    let fallback_refs = fallback_rungs(&fallbacks);
 
-    let outcome = run_stt_pipeline(app, &cfg, &input, formatter_ref, fallback_ref);
+    let outcome = run_stt_pipeline(app, &cfg, &input, formatter_ref, &fallback_refs);
 
     match outcome {
         Ok(result) => {
@@ -2856,7 +2895,7 @@ fn answer_screen_question(
     };
     // 整形器を渡さないので控えも要らない (画面質問モードでは、発話は
     // 整形せず「質問」として asker へ渡す)。
-    let transcript = match run_stt_pipeline(app, &cfg, &input, None, None) {
+    let transcript = match run_stt_pipeline(app, &cfg, &input, None, &[]) {
         Ok(result) => result,
         Err(e) => {
             let msg = format!("質問を聞き取れませんでした: {e}");
@@ -3142,14 +3181,14 @@ fn run_stt_pipeline(
     cfg: &config::Config,
     input: &pipeline::PipelineInput<'_>,
     formatter: Option<&dyn format::TextFormatter>,
-    fallback: Option<&dyn format::TextFormatter>,
+    fallbacks: &[pipeline::FallbackRung<'_>],
 ) -> Result<pipeline::PipelineResult, stt::SttError> {
     let plan = local_stt::EnginePlan::from_mode(cfg.local_stt_mode);
 
     if !plan.use_cloud {
         // ローカルのみ: クラウドのクライアントを**作りもしない**。
         log::info!("ローカルのみモードのため、音声はクラウドへ送りません");
-        return run_with_local_stt(app, input, formatter, fallback, None);
+        return run_with_local_stt(app, input, formatter, fallbacks, None);
     }
 
     let Some(http) = app.state::<AppState>().http.clone() else {
@@ -3165,7 +3204,7 @@ fn run_stt_pipeline(
         cfg.groq_key().secret.unwrap_or_default(),
     );
 
-    match pipeline::run(input, &stt_client, formatter, fallback) {
+    match pipeline::run(input, &stt_client, formatter, fallbacks) {
         Err(e) if plan.use_local && local_stt::should_fall_back(&e) => {
             log::warn!("Groq が使えないためローカル認識へ切り替えます: {e}");
             notify(
@@ -3173,7 +3212,7 @@ fn run_stt_pipeline(
                 Notice::Informational,
                 "クラウド認識が使えないため、ローカルで認識します (時間がかかります)",
             );
-            run_with_local_stt(app, input, formatter, fallback, Some(&e))
+            run_with_local_stt(app, input, formatter, fallbacks, Some(&e))
         }
         other => other,
     }
@@ -3189,7 +3228,7 @@ fn run_with_local_stt(
     app: &AppHandle,
     input: &pipeline::PipelineInput<'_>,
     formatter: Option<&dyn format::TextFormatter>,
-    fallback: Option<&dyn format::TextFormatter>,
+    fallbacks: &[pipeline::FallbackRung<'_>],
     cloud_error: Option<&stt::SttError>,
 ) -> Result<pipeline::PipelineResult, stt::SttError> {
     let models_dir = app.state::<AppState>().models_dir.clone();
@@ -3206,7 +3245,7 @@ fn run_with_local_stt(
     }
 
     let local = LocalStt { models_dir };
-    pipeline::run(input, &local, formatter, fallback)
+    pipeline::run(input, &local, formatter, fallbacks)
 }
 
 /// [`local_stt`] を [`stt::SpeechToText`] として使うためのラッパ。
@@ -3800,7 +3839,7 @@ fn retranscribe(app: &AppHandle, id: i64) {
     let cfg = state.config.snapshot();
     // 整形はクラウドのみ。ローカルのみモードでも整形は使う
     // (テキストの送信は R1 で受容済み。**音声**を出さないことが要点)。
-    let (formatter, fallback) = match (cfg.formatting_enabled, state.http.clone()) {
+    let (formatter, fallbacks) = match (cfg.formatting_enabled, state.http.clone()) {
         (true, Some(http)) => (
             Some(
                 GeminiFormatter::new(
@@ -3812,10 +3851,11 @@ fn retranscribe(app: &AppHandle, id: i64) {
             ),
             // 新規録音と同じヘルパで組む。ここを別に書くと、
             // 再転写でだけ控えが効かない差が黙って生まれる。
-            build_fallback_formatter(&cfg, &http),
+            build_fallback_formatters(&cfg, &http),
         ),
-        _ => (None, None),
+        _ => (None, Vec::new()),
     };
+    let fallback_refs = fallback_rungs(&fallbacks);
 
     // 再転写では画面コンテキストを使わない。録音時の画面はもう無く、
     // 今の画面を混ぜると当時と違う文脈で整形してしまう。
@@ -3830,7 +3870,7 @@ fn retranscribe(app: &AppHandle, id: i64) {
         &cfg,
         &input,
         formatter.as_ref().map(|f| f as &dyn format::TextFormatter),
-        fallback.as_ref().map(|f| f as &dyn format::TextFormatter),
+        &fallback_refs,
     ) {
         Ok(result) => {
             let (outcome, reason) = match &result.outcome {
@@ -4209,8 +4249,10 @@ mod tests {
             config::Config {
                 gemini_endpoint: server.url(),
                 groq_chat_endpoint: format!("{}/chat/completions", server.url()),
+                openrouter_chat_endpoint: format!("{}/api/v1/chat/completions", server.url()),
                 gemini_api_key: config::Secret::new("test-gemini-key"),
                 groq_api_key: config::Secret::new("test-groq-key"),
+                openrouter_api_key: config::Secret::new("test-openrouter-key"),
                 ..config::Config::default()
             }
         }
@@ -4361,6 +4403,133 @@ mod tests {
             assert_eq!(body["model"], "qwen/qwen3.8-27b");
         }
 
+        /// 控えの順序と参加条件。新規録音と再転写が同じこのヘルパを通る。
+        #[test]
+        fn fallbacks_are_groq_then_openrouter_and_openrouter_needs_only_a_key() {
+            let http = client();
+            let names = |c: &config::Config| -> Vec<&'static str> {
+                build_fallback_formatters(c, &http)
+                    .iter()
+                    .map(OpenAiCompatFormatter::provider)
+                    .collect()
+            };
+            let base = config::Config {
+                groq_api_key: config::Secret::new("gsk_x"),
+                openrouter_api_key: config::Secret::new("sk-or-x"),
+                ..config::Config::default()
+            };
+            assert_eq!(names(&base), vec!["Groq", "OpenRouter"]);
+            // Groq の控えをオフにしても、OpenRouter はキーだけで参加する。
+            let groq_off = config::Config {
+                format_fallback_enabled: false,
+                ..base.clone()
+            };
+            assert_eq!(names(&groq_off), vec!["OpenRouter"]);
+            // キーが無ければ参加しない (開発機に NOX_ の環境変数があれば解決されるので飛ばす)。
+            if std::env::var("NOX_OPENROUTER_API_KEY").is_err() {
+                let none = config::Config {
+                    openrouter_api_key: config::Secret::default(),
+                    ..groq_off
+                };
+                assert!(names(&none).is_empty());
+            }
+            let refs = fallback_rungs(&build_fallback_formatters(&base, &http))
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>();
+            assert_eq!(refs, vec!["Groq", "OpenRouter"]);
+        }
+
+        #[test]
+        fn openrouter_success_sends_reasoning_off_once() {
+            let server = TestServer::start(vec![CannedResponse::ok(groq_ok("整形済み"))]);
+            let http = client();
+            let result = run_format_model_test(
+                &cfg(&server),
+                Some(&http),
+                config::FormatProvider::OpenRouter,
+                " google/gemma-4-26b-a4b-it:free ",
+                None,
+            );
+            assert!(result.ok, "{result:?}");
+            assert_eq!(result.model, "google/gemma-4-26b-a4b-it:free");
+            assert_eq!(result.output.as_deref(), Some("整形済み"));
+            let requests = server.requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].path, "/api/v1/chat/completions");
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests[0].body).expect("JSON");
+            assert_eq!(body["model"], "google/gemma-4-26b-a4b-it:free");
+            assert_eq!(body["reasoning"]["enabled"], serde_json::json!(false));
+        }
+
+        #[test]
+        fn an_openrouter_failure_names_openrouter_and_is_not_retried() {
+            let server = TestServer::start(vec![
+                CannedResponse::status(503, r#"{"error":{"message":"overloaded"}}"#),
+                CannedResponse::ok(groq_ok("呼ばれないはず")),
+            ]);
+            let http = client();
+            let result = run_format_model_test(
+                &cfg(&server),
+                Some(&http),
+                config::FormatProvider::OpenRouter,
+                "",
+                None,
+            );
+            assert!(!result.ok);
+            assert_eq!(result.model, config::DEFAULT_OPENROUTER_FORMAT_MODEL);
+            let reason = result.reason.expect("理由");
+            assert_eq!(reason, "OpenRouter のサーバエラー (503)");
+            assert!(!reason.contains("Gemini") && !reason.contains("Groq"), "{reason}");
+            assert_eq!(server.request_count(), 1);
+        }
+
+        #[test]
+        fn an_openrouter_name_with_whitespace_is_rejected_before_any_request() {
+            let server = TestServer::start(vec![CannedResponse::ok(groq_ok("呼ばれないはず"))]);
+            let http = client();
+            let result = run_format_model_test(
+                &cfg(&server),
+                Some(&http),
+                config::FormatProvider::OpenRouter,
+                "google/gemma 4",
+                None,
+            );
+            assert!(!result.ok);
+            assert!(result.reason.expect("理由").contains("第2の控えの整形モデル"));
+            assert_eq!(server.request_count(), 0);
+        }
+
+        /// キーが無ければ送らずに、OpenRouter の名前で「未設定」と答える。
+        ///
+        /// 開発機に `NOX_OPENROUTER_API_KEY` が置かれていると、解決されたキーで
+        /// テストサーバへ送ってしまう (外へは出ない) ので、そのときは飛ばす。
+        #[test]
+        fn a_missing_openrouter_key_is_a_reason_named_openrouter() {
+            if std::env::var("NOX_OPENROUTER_API_KEY").is_ok_and(|v| !v.trim().is_empty()) {
+                println!("NOX_OPENROUTER_API_KEY があるので飛ばします");
+                return;
+            }
+            let server = TestServer::start(vec![CannedResponse::ok(groq_ok("呼ばれないはず"))]);
+            let http = client();
+            let mut config = cfg(&server);
+            config.openrouter_api_key = config::Secret::default();
+            let result = run_format_model_test(
+                &config,
+                Some(&http),
+                config::FormatProvider::OpenRouter,
+                "",
+                None,
+            );
+            assert!(!result.ok);
+            assert_eq!(
+                result.reason.as_deref(),
+                Some("OpenRouter の API キーが未設定です")
+            );
+            assert_eq!(server.request_count(), 0, "キーが無いのに送っている");
+        }
+
         #[test]
         fn a_url_breaking_name_is_rejected_before_any_request() {
             let server = TestServer::start(vec![CannedResponse::ok(gemini_ok("呼ばれないはず"))]);
@@ -4426,6 +4595,11 @@ mod tests {
                     "models/gemini-3.5-flash-lite",
                 ),
                 (config::FormatProvider::Groq, cfg.groq_key().is_set(), ""),
+                (
+                    config::FormatProvider::OpenRouter,
+                    cfg.openrouter_key().is_set(),
+                    "",
+                ),
             ];
             for (provider, has_key, model) in cases {
                 if !has_key {
