@@ -49,8 +49,38 @@ pub const DEFAULT_GROQ_CHAT_ENDPOINT: &str = "https://api.groq.com/openai/v1/cha
 /// 控えに求めるのは「主と同じ文体で、待たせずに返る」ことなので、
 /// 最速の qwen ではなく**最も原文に忠実**だった 20b を既定にする。
 /// いずれも推論モデルで、`max_tokens` に思考分を見込む必要がある
-/// ([`crate::format_groq`] のモジュール doc)。設定で差し替え可能。
+/// ([`crate::format_openai_compat`] のモジュール doc)。設定で差し替え可能。
 pub const DEFAULT_GROQ_FORMAT_MODEL: &str = "openai/gpt-oss-20b";
+
+/// 整形の第 2 の控え (OpenRouter) の既定エンドポイント。**完全な URL**。
+pub const DEFAULT_OPENROUTER_CHAT_ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
+
+/// 整形の第 2 の控え (OpenRouter) の既定モデル。
+///
+/// # ⚠️ 未実測 (2026-11-21)
+///
+/// 設計案の既定 `nvidia/nemotron-3-super-120b-a12b:free` は、2026-11-21 時点で
+/// 公開のモデル一覧 (`GET /api/v1/models`) から消えていた (`:free` はよく
+/// 入れ替わる。設計 §6)。差し替え候補として、一覧で思考が「必須でない」
+/// ことを確かめた 3 つを測るつもりだったが、**開発機のキーが 401
+/// (API key expired) を返し、1 回も整形できなかった**:
+///
+/// | モデル | 一覧の `reasoning` | 実測 |
+/// |---|---|---|
+/// | `google/gemma-4-31b-it:free` | `mandatory: false` / `default_enabled: false` | 測れなかった (401) |
+/// | `google/gemma-4-26b-a4b-it:free` | `mandatory: false` / `default_enabled: false` | 測れなかった (呼ばず) |
+/// | `nvidia/nemotron-3.5-lightning:free` | `mandatory: false` | 測れなかった (呼ばず) |
+///
+/// 思考が必須のモデル (`liquid/lfm-3-1.7b:free` など) は
+/// `reasoning.enabled = false` と相性が悪いはずなので候補にしていない。
+///
+/// 既定は、思考が既定で無効と明記されていて大きい方の
+/// `google/gemma-4-31b-it:free` を**仮に**置く。有効なキーで
+/// `live_openrouter_formatting` (`NOX_OPENROUTER_MODEL` / `NOX_REPS`) を回し、
+/// Groq の表と同じ観点 (フィラー除去・言い直しの解決・原文への忠実さ・所要)
+/// で測ってから、この表と [`OPENROUTER_FORMAT_MODEL_CANDIDATES`] を確定すること。
+/// 消えたり壊れたりしても、OpenRouter が毎回失敗するだけで前の段には響かない。
+pub const DEFAULT_OPENROUTER_FORMAT_MODEL: &str = "google/gemma-4-31b-it:free";
 
 /// 整形モデルの既定。
 ///
@@ -124,6 +154,14 @@ pub const GROQ_FORMAT_MODEL_CANDIDATES: &[ModelCandidate] = &[
     },
 ];
 
+/// 第 2 の控え (OpenRouter) の整形モデルの候補。先頭が既定
+/// ([`DEFAULT_OPENROUTER_FORMAT_MODEL`])。**実測で良好だったものだけ**を載せる
+/// 約束なので、まだ測れていない今は既定 1 つだけにする (既定の doc)。
+pub const OPENROUTER_FORMAT_MODEL_CANDIDATES: &[ModelCandidate] = &[ModelCandidate {
+    name: DEFAULT_OPENROUTER_FORMAT_MODEL,
+    note: "既定・未実測 (思考は既定で無効)",
+}];
+
 /// 整形の共通ルールの上限 (文字数)。
 ///
 /// 既定の文は 400 字弱。上限は「指示を書き足す」には十分広く、
@@ -141,6 +179,12 @@ pub enum FormatProvider {
     Gemini,
     /// 控え。モデル名は JSON 本文へ入る。
     Groq,
+    /// 第 2 の控え。モデル名は JSON 本文へ入る (Groq と同じ規則)。
+    ///
+    /// `rename_all = "snake_case"` のままだと `open_router` になる。フロントと
+    /// 設定画面のコマンドは `openrouter` で送るので、明示する。
+    #[serde(rename = "openrouter")]
+    OpenRouter,
 }
 
 impl FormatProvider {
@@ -149,6 +193,7 @@ impl FormatProvider {
         match self {
             FormatProvider::Gemini => "主の整形モデル",
             FormatProvider::Groq => "控えの整形モデル",
+            FormatProvider::OpenRouter => "第2の控えの整形モデル",
         }
     }
 
@@ -157,6 +202,7 @@ impl FormatProvider {
         match self {
             FormatProvider::Gemini => DEFAULT_FORMAT_MODEL,
             FormatProvider::Groq => DEFAULT_GROQ_FORMAT_MODEL,
+            FormatProvider::OpenRouter => DEFAULT_OPENROUTER_FORMAT_MODEL,
         }
     }
 }
@@ -175,7 +221,7 @@ pub fn canonical_model_name(provider: FormatProvider, raw: &str) -> String {
             .unwrap_or(trimmed)
             .trim()
             .to_string(),
-        FormatProvider::Groq => trimmed.to_string(),
+        FormatProvider::Groq | FormatProvider::OpenRouter => trimmed.to_string(),
     }
 }
 
@@ -187,8 +233,9 @@ pub fn canonical_model_name(provider: FormatProvider, raw: &str) -> String {
 ///   そのまま入る ([`Config::gemini_url_for`])。`/` `?` `#` `%` や空白が入ると
 ///   別のパスやクエリになり、黙って別物を叩く。実在するモデル名は英数字と
 ///   `.` `_` `-` だけでできているので、**それ以外を全部断る** (許可リスト)
-/// - **Groq**: 名前は JSON 本文の `model` に入るだけで、`openai/gpt-oss-20b`
-///   のように `/` を正当に含む。断るのは空白と制御文字だけ
+/// - **Groq / OpenRouter**: 名前は JSON 本文の `model` に入るだけで、
+///   `openai/gpt-oss-20b` や `google/gemma-4-31b-it:free` のように `/` と `:` を
+///   正当に含む。断るのは空白と制御文字だけ
 ///
 /// 保存 ([`ConfigPatch::validate`]) と「試す」(`test_format_model`) が
 /// **同じこの関数**を通る。別々に書くと、試せたのに保存できない
@@ -209,12 +256,13 @@ pub fn validate_model_name(provider: FormatProvider, raw: &str) -> Result<String
                 ));
             }
         }
-        FormatProvider::Groq => {
+        FormatProvider::Groq | FormatProvider::OpenRouter => {
             if let Some(c) = name.chars().find(|c| c.is_whitespace() || c.is_control()) {
                 return Err(format!(
                     "{label}「{name}」に使えない文字「{}」が含まれています。\
-                     モデル名に空白や制御文字は入りません (例: {DEFAULT_GROQ_FORMAT_MODEL})",
-                    describe_char(c)
+                     モデル名に空白や制御文字は入りません (例: {})",
+                    describe_char(c),
+                    provider.default_model()
                 ));
             }
         }
@@ -285,6 +333,12 @@ pub const MAX_RESTORE_DELAY_MS: u64 = 5_000;
 
 const ENV_GROQ_KEY: &str = "GROQ_API_KEY";
 const ENV_GEMINI_KEY: &str = "GEMINI_API_KEY";
+/// OpenRouter のキーの名前 (`.env` でも環境変数でも同じ)。
+///
+/// **素の `OPENROUTER_API_KEY` は読まない。** 開発機などでは他の道具がその名前に
+/// 別のアカウントのキーを入れていることがあり、環境変数は設定ファイルより
+/// 優先されるので、設定画面で入れたキーに黙って勝ってしまう (設計 §6)。
+const ENV_OPENROUTER_KEY: &str = "NOX_OPENROUTER_API_KEY";
 
 /// キーを書く `.env` のファイル名。`config.json` と同じフォルダに置く。
 pub const DOTENV_FILE_NAME: &str = ".env";
@@ -383,6 +437,11 @@ impl<'de> Deserialize<'de> for Secret {
 pub struct Config {
     pub groq_api_key: Secret,
     pub gemini_api_key: Secret,
+    /// OpenRouter のキー (第 2 の控え)。**空なら OpenRouter は整形に参加しない**。
+    ///
+    /// 旧い設定ファイルには無いので、フィールド単位で既定 (空) を付ける。
+    #[serde(default)]
+    pub openrouter_api_key: Secret,
     /// STT の言語ヒント (ISO-639-1)。空なら自動判定に任せる。
     pub language: String,
     /// 用語リスト (固有名詞・専門用語の表記ゆれ対策)。
@@ -584,6 +643,16 @@ pub struct Config {
     /// 控えの chat/completions エンドポイント (**完全な URL**)。
     #[serde(default = "default_groq_chat_endpoint")]
     pub groq_chat_endpoint: String,
+    /// 第 2 の控え (OpenRouter) の整形モデル ([`DEFAULT_OPENROUTER_FORMAT_MODEL`])。
+    ///
+    /// OpenRouter は [`Self::openrouter_api_key`] (か `.env` / 環境変数の
+    /// `NOX_OPENROUTER_API_KEY`) があるときだけ参加する。専用のトグルは無い。
+    /// [`Self::format_fallback_enabled`] は Groq の参加だけを決める。
+    #[serde(default = "default_openrouter_format_model")]
+    pub openrouter_format_model: String,
+    /// 第 2 の控えの chat/completions エンドポイント (**完全な URL**)。
+    #[serde(default = "default_openrouter_chat_endpoint")]
+    pub openrouter_chat_endpoint: String,
     /// 整形の共通ルール (設定画面で編集できる部分)。**空 = 同梱の既定**
     /// ([`crate::format::DEFAULT_FORMAT_RULES`])。
     ///
@@ -603,6 +672,7 @@ impl Default for Config {
         Self {
             groq_api_key: Secret::default(),
             gemini_api_key: Secret::default(),
+            openrouter_api_key: Secret::default(),
             language: DEFAULT_LANGUAGE.to_string(),
             dictionary: Vec::new(),
             formatting_enabled: true,
@@ -655,6 +725,8 @@ impl Default for Config {
             format_fallback_enabled: true,
             groq_format_model: DEFAULT_GROQ_FORMAT_MODEL.to_string(),
             groq_chat_endpoint: DEFAULT_GROQ_CHAT_ENDPOINT.to_string(),
+            openrouter_format_model: DEFAULT_OPENROUTER_FORMAT_MODEL.to_string(),
+            openrouter_chat_endpoint: DEFAULT_OPENROUTER_CHAT_ENDPOINT.to_string(),
             // 空 = 同梱の既定 (フィールドの doc)。
             format_rules: String::new(),
         }
@@ -726,14 +798,29 @@ impl Config {
         )
     }
 
-    /// `.env` での名前 (`GROQ_API_KEY` / `GEMINI_API_KEY`) から、config.json 側の欄を引く。
+    /// `.env` での名前 (`GROQ_API_KEY` / `GEMINI_API_KEY` / `NOX_OPENROUTER_API_KEY`)
+    /// から、config.json 側の欄を引く。
     fn api_key_field(&mut self, name: &str) -> &mut Secret {
-        if name == ENV_GROQ_KEY {
-            &mut self.groq_api_key
-        } else {
-            debug_assert_eq!(name, ENV_GEMINI_KEY);
-            &mut self.gemini_api_key
+        match name {
+            ENV_GROQ_KEY => &mut self.groq_api_key,
+            ENV_OPENROUTER_KEY => &mut self.openrouter_api_key,
+            _ => {
+                debug_assert_eq!(name, ENV_GEMINI_KEY);
+                &mut self.gemini_api_key
+            }
         }
+    }
+
+    /// OpenRouter の API キーを解決する (`.env` > 環境変数 > 設定ファイル)。
+    ///
+    /// 名前は `.env` でも環境変数でも `NOX_OPENROUTER_API_KEY`。素の
+    /// `OPENROUTER_API_KEY` は読まない ([`ENV_OPENROUTER_KEY`] の doc)。
+    pub fn openrouter_key(&self) -> ResolvedKey {
+        resolve_key_layers(
+            dotenv_value(ENV_OPENROUTER_KEY),
+            env_value(ENV_OPENROUTER_KEY),
+            &self.openrouter_api_key,
+        )
     }
 
     /// Gemini の API キーを解決する (`.env` > 環境変数 > 設定ファイル)。
@@ -883,6 +970,14 @@ fn default_groq_format_model() -> String {
 
 fn default_groq_chat_endpoint() -> String {
     DEFAULT_GROQ_CHAT_ENDPOINT.to_string()
+}
+
+fn default_openrouter_format_model() -> String {
+    DEFAULT_OPENROUTER_FORMAT_MODEL.to_string()
+}
+
+fn default_openrouter_chat_endpoint() -> String {
+    DEFAULT_OPENROUTER_CHAT_ENDPOINT.to_string()
 }
 
 /// キャンセル音の既定。開始音と**別の音**にする (聞き分けが要る)。
@@ -1149,6 +1244,10 @@ pub struct ConfigView {
     pub gemini_key_set: bool,
     pub gemini_key_source: KeySource,
     pub gemini_key_preview: String,
+    /// OpenRouter (第 2 の控え)。キーがあるときだけ整形に参加する。
+    pub openrouter_key_set: bool,
+    pub openrouter_key_source: KeySource,
+    pub openrouter_key_preview: String,
     /// キーを書ける `.env` の場所 (設定画面の案内に出す)。未設定なら空。
     pub dotenv_path: String,
     pub language: String,
@@ -1218,6 +1317,8 @@ pub struct ConfigView {
     /// 主が落ちたときに控え (Groq) で整形し直すか。
     pub format_fallback_enabled: bool,
     pub groq_format_model: String,
+    /// 第 2 の控え (OpenRouter) の整形モデル。
+    pub openrouter_format_model: String,
     /// 保存されている共通ルール。**空なら既定を使っている**。
     pub format_rules: String,
     /// 同梱の既定ルール。画面の「既定に戻す」と、空のときの表示に使う。
@@ -1228,9 +1329,11 @@ pub struct ConfigView {
     /// 主 / 控えの既定モデル (入力欄の placeholder と説明に使う)。
     pub default_format_model: &'static str,
     pub default_groq_format_model: &'static str,
+    pub default_openrouter_format_model: &'static str,
     /// 候補リスト (実測で良好だったもの)。
     pub format_model_candidates: &'static [ModelCandidate],
     pub groq_format_model_candidates: &'static [ModelCandidate],
+    pub openrouter_format_model_candidates: &'static [ModelCandidate],
 }
 
 impl ConfigView {
@@ -1239,7 +1342,12 @@ impl ConfigView {
     /// 環境変数を読む [`From<&Config>`] と分けてあるのは、テストを
     /// 実行環境の環境変数に依存させないため (開発機に本物のキーが
     /// 入っていると、素朴なテストは通ったり落ちたりする)。
-    pub fn build(c: &Config, groq: ResolvedKey, gemini: ResolvedKey) -> Self {
+    pub fn build(
+        c: &Config,
+        groq: ResolvedKey,
+        gemini: ResolvedKey,
+        openrouter: ResolvedKey,
+    ) -> Self {
         Self {
             groq_key_set: groq.is_set(),
             groq_key_source: groq.source,
@@ -1251,6 +1359,13 @@ impl ConfigView {
             gemini_key_set: gemini.is_set(),
             gemini_key_source: gemini.source,
             gemini_key_preview: gemini
+                .secret
+                .as_ref()
+                .map(Secret::preview)
+                .unwrap_or_default(),
+            openrouter_key_set: openrouter.is_set(),
+            openrouter_key_source: openrouter.source,
+            openrouter_key_preview: openrouter
                 .secret
                 .as_ref()
                 .map(Secret::preview)
@@ -1314,20 +1429,23 @@ impl ConfigView {
             format_model: c.format_model.clone(),
             format_fallback_enabled: c.format_fallback_enabled,
             groq_format_model: c.groq_format_model.clone(),
+            openrouter_format_model: c.openrouter_format_model.clone(),
             format_rules: c.format_rules.clone(),
             default_format_rules: crate::format::DEFAULT_FORMAT_RULES,
             format_rules_max_chars: MAX_FORMAT_RULES_CHARS,
             default_format_model: DEFAULT_FORMAT_MODEL,
             default_groq_format_model: DEFAULT_GROQ_FORMAT_MODEL,
+            default_openrouter_format_model: DEFAULT_OPENROUTER_FORMAT_MODEL,
             format_model_candidates: GEMINI_FORMAT_MODEL_CANDIDATES,
             groq_format_model_candidates: GROQ_FORMAT_MODEL_CANDIDATES,
+            openrouter_format_model_candidates: OPENROUTER_FORMAT_MODEL_CANDIDATES,
         }
     }
 }
 
 impl From<&Config> for ConfigView {
     fn from(c: &Config) -> Self {
-        ConfigView::build(c, c.groq_key(), c.gemini_key())
+        ConfigView::build(c, c.groq_key(), c.gemini_key(), c.openrouter_key())
     }
 }
 
@@ -1342,6 +1460,7 @@ pub struct ConfigPatch {
     // 手書きの Debug で伏せる (下の impl を参照)。
     pub groq_api_key: Option<String>,
     pub gemini_api_key: Option<String>,
+    pub openrouter_api_key: Option<String>,
     pub language: Option<String>,
     /// 辞書の全置換。**旧形式の文字列配列も受ける** (フィールドの doc)。
     pub dictionary: Option<Vec<DictionaryEntry>>,
@@ -1385,6 +1504,8 @@ pub struct ConfigPatch {
     pub format_fallback_enabled: Option<bool>,
     pub groq_format_model: Option<String>,
     pub groq_chat_endpoint: Option<String>,
+    pub openrouter_format_model: Option<String>,
+    pub openrouter_chat_endpoint: Option<String>,
     /// 整形の共通ルール。空文字・既定と同じ文は「既定を使う」(空) として保存する。
     pub format_rules: Option<String>,
 }
@@ -1407,6 +1528,10 @@ impl fmt::Debug for ConfigPatch {
             .field(
                 "gemini_api_key",
                 &format_args!("{}", presence(&self.gemini_api_key)),
+            )
+            .field(
+                "openrouter_api_key",
+                &format_args!("{}", presence(&self.openrouter_api_key)),
             )
             .field("language", &self.language)
             .field("dictionary", &self.dictionary.as_ref().map(Vec::len))
@@ -1459,6 +1584,8 @@ impl fmt::Debug for ConfigPatch {
             .field("format_fallback_enabled", &self.format_fallback_enabled)
             .field("groq_format_model", &self.groq_format_model)
             .field("groq_chat_endpoint", &self.groq_chat_endpoint)
+            .field("openrouter_format_model", &self.openrouter_format_model)
+            .field("openrouter_chat_endpoint", &self.openrouter_chat_endpoint)
             // 本文は長くなりうるので文字数だけ。
             .field(
                 "format_rules",
@@ -1484,11 +1611,17 @@ impl ConfigPatch {
         if let Some(key) = &self.gemini_api_key {
             validate_api_key("Gemini API キー", key)?;
         }
+        if let Some(key) = &self.openrouter_api_key {
+            validate_api_key("OpenRouter API キー", key)?;
+        }
         if let Some(model) = &self.format_model {
             validate_model_name(FormatProvider::Gemini, model)?;
         }
         if let Some(model) = &self.groq_format_model {
             validate_model_name(FormatProvider::Groq, model)?;
+        }
+        if let Some(model) = &self.openrouter_format_model {
+            validate_model_name(FormatProvider::OpenRouter, model)?;
         }
         if let Some(rules) = &self.format_rules {
             validate_format_rules(rules)?;
@@ -1671,6 +1804,8 @@ impl Config {
         self.format_model = normalized_model(FormatProvider::Gemini, &self.format_model);
         self.groq_format_model =
             normalized_model(FormatProvider::Groq, &self.groq_format_model);
+        self.openrouter_format_model =
+            normalized_model(FormatProvider::OpenRouter, &self.openrouter_format_model);
         // 共通ルール。改行の統一と「既定と同じなら空」はここで揃える。
         // **上限超えは読み込み時には断らない** — 手で書いた長文を黙って
         // 捨てる (または切り詰める) より、そのまま使い、画面から保存する
@@ -1832,6 +1967,9 @@ impl Config {
         if let Some(v) = patch.gemini_api_key {
             self.gemini_api_key = Secret::new(v.trim());
         }
+        if let Some(v) = patch.openrouter_api_key {
+            self.openrouter_api_key = Secret::new(v.trim());
+        }
         if let Some(v) = patch.language {
             self.language = v.trim().to_string();
         }
@@ -1950,6 +2088,12 @@ impl Config {
         }
         if let Some(v) = patch.groq_chat_endpoint {
             self.groq_chat_endpoint = non_empty_or(v, DEFAULT_GROQ_CHAT_ENDPOINT);
+        }
+        if let Some(v) = patch.openrouter_format_model {
+            self.openrouter_format_model = non_empty_or(v, DEFAULT_OPENROUTER_FORMAT_MODEL);
+        }
+        if let Some(v) = patch.openrouter_chat_endpoint {
+            self.openrouter_chat_endpoint = non_empty_or(v, DEFAULT_OPENROUTER_CHAT_ENDPOINT);
         }
         if let Some(v) = patch.typing_speed_chars_per_min {
             self.typing_speed_chars_per_min = v;
@@ -2159,6 +2303,7 @@ impl ConfigStore {
                 let writes: Vec<(&str, Option<String>)> = [
                     (ENV_GROQ_KEY, patch.groq_api_key.take()),
                     (ENV_GEMINI_KEY, patch.gemini_api_key.take()),
+                    (ENV_OPENROUTER_KEY, patch.openrouter_api_key.take()),
                 ]
                 .into_iter()
                 .filter_map(|(name, value)| {
@@ -2217,7 +2362,7 @@ fn migrate_keys_to_dotenv(
     let mut writes: Vec<(&str, Option<String>)> = Vec::new();
     // `.env` に同じ値が既にある = 写しは不要。消すだけで書き込みは要らない。
     let mut duplicates: Vec<&str> = Vec::new();
-    for name in [ENV_GROQ_KEY, ENV_GEMINI_KEY] {
+    for name in [ENV_GROQ_KEY, ENV_GEMINI_KEY, ENV_OPENROUTER_KEY] {
         let key = config.api_key_field(name).expose().trim().to_string();
         if key.is_empty() {
             continue;
@@ -2516,6 +2661,7 @@ mod tests {
             &cfg,
             resolve_key(None, &cfg.groq_api_key),
             resolve_key(None, &cfg.gemini_api_key),
+            resolve_key(None, &cfg.openrouter_api_key),
         );
         assert!(!view.screen_ask_enabled);
         assert_eq!(view.screen_ask_hotkey_vk, 0x7C);
@@ -2975,6 +3121,7 @@ mod tests {
             &cfg,
             resolve_key(None, &cfg.groq_api_key),
             resolve_key(None, &cfg.gemini_api_key),
+            resolve_key(None, &cfg.openrouter_api_key),
         );
         let json = serde_json::to_string(&view).expect("シリアライズできる");
         assert!(!json.contains("gsk_abcdefgh"), "{json}");
@@ -2991,6 +3138,7 @@ mod tests {
             &cfg,
             resolve_key(Some("gsk_from_env_9876".to_string()), &cfg.groq_api_key),
             resolve_key(None, &cfg.gemini_api_key),
+            resolve_key(None, &cfg.openrouter_api_key),
         );
         assert!(view.groq_key_set);
         assert_eq!(view.groq_key_source, KeySource::Env);
@@ -3122,6 +3270,7 @@ mod tests {
             &cfg,
             resolve_key(None, &cfg.groq_api_key),
             resolve_key(None, &cfg.gemini_api_key),
+            resolve_key(None, &cfg.openrouter_api_key),
         );
         assert_eq!(view.dictionary.len(), 60);
         assert_eq!(view.dictionary_status.in_prompt.len(), 60);
@@ -3300,6 +3449,7 @@ mod tests {
             &reloaded,
             resolve_key(None, &reloaded.groq_api_key),
             resolve_key(None, &reloaded.gemini_api_key),
+            resolve_key(None, &reloaded.openrouter_api_key),
         );
         assert_eq!(view.format_rules, "句読点だけ打つ。\n言い換えない。");
         assert_eq!(view.default_format_rules, crate::format::DEFAULT_FORMAT_RULES);
@@ -3455,6 +3605,7 @@ mod tests {
             &cfg,
             resolve_key(None, &cfg.groq_api_key),
             resolve_key(None, &cfg.gemini_api_key),
+            resolve_key(None, &cfg.openrouter_api_key),
         );
         assert_eq!(view.format_model_candidates.len(), 3);
         assert_eq!(view.groq_format_model_candidates.len(), 3);
@@ -4553,5 +4704,261 @@ mod tests {
         assert!(format!("{cleared:?}").contains("groq_api_key: Some(<empty>)"));
         let absent = ConfigPatch::default();
         assert!(format!("{absent:?}").contains("groq_api_key: None"));
+    }
+
+    // --- 第 2 の控え (OpenRouter、2026-11-21) ---
+
+    #[test]
+    fn an_older_config_file_gets_the_openrouter_defaults_and_no_key() {
+        // 項目が無い設定ファイル (この機能より前に書かれたもの)。
+        let cfg: Config = serde_json::from_str(
+            r#"{"language":"ja","groq_api_key":"","gemini_api_key":"","format_fallback_enabled":false}"#,
+        )
+        .expect("旧形式を読める");
+        assert!(cfg.openrouter_api_key.is_empty());
+        assert_eq!(cfg.openrouter_format_model, DEFAULT_OPENROUTER_FORMAT_MODEL);
+        assert_eq!(cfg.openrouter_chat_endpoint, DEFAULT_OPENROUTER_CHAT_ENDPOINT);
+        assert_eq!(
+            DEFAULT_OPENROUTER_CHAT_ENDPOINT,
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+        // 既存の項目は今までどおり読める。
+        assert!(!cfg.format_fallback_enabled);
+    }
+
+    #[test]
+    fn the_openrouter_model_and_endpoint_fall_back_to_defaults_when_blanked() {
+        let mut cfg = Config {
+            openrouter_format_model: "x/y:free".to_string(),
+            openrouter_chat_endpoint: "https://example.invalid/c".to_string(),
+            ..Config::default()
+        };
+        cfg.apply(ConfigPatch {
+            openrouter_format_model: Some("  ".to_string()),
+            openrouter_chat_endpoint: Some(String::new()),
+            ..ConfigPatch::default()
+        });
+        assert_eq!(cfg.openrouter_format_model, DEFAULT_OPENROUTER_FORMAT_MODEL);
+        assert_eq!(cfg.openrouter_chat_endpoint, DEFAULT_OPENROUTER_CHAT_ENDPOINT);
+    }
+
+    #[test]
+    fn openrouter_model_names_follow_the_groq_rules() {
+        for good in ["google/gemma-4-31b-it:free", "nvidia/nemotron-3.5-lightning:free"] {
+            assert_eq!(
+                validate_model_name(FormatProvider::OpenRouter, good).as_deref(),
+                Ok(good)
+            );
+        }
+        for bad in ["google/gemma 4", "a\nb", "a\u{7}b"] {
+            let err = validate_model_name(FormatProvider::OpenRouter, bad)
+                .expect_err(&format!("{bad:?} を通した"));
+            // 「控えの整形モデル」(Groq) と区別のつく名前で断る。
+            assert!(err.contains("第2の控えの整形モデル"), "{err}");
+        }
+        // 手で書いた不正な名前は読み込み時に既定へ戻る。
+        let mut cfg: Config =
+            serde_json::from_str(r#"{"openrouter_format_model":"a b"}"#).expect("読める");
+        cfg.normalize();
+        assert_eq!(cfg.openrouter_format_model, DEFAULT_OPENROUTER_FORMAT_MODEL);
+        // 保存の経路でも断る。
+        let patch = ConfigPatch {
+            openrouter_format_model: Some("a b".to_string()),
+            ..ConfigPatch::default()
+        };
+        assert!(patch.validate().is_err());
+    }
+
+    #[test]
+    fn the_openrouter_provider_serializes_as_openrouter() {
+        assert_eq!(
+            serde_json::to_string(&FormatProvider::OpenRouter).expect("JSON"),
+            "\"openrouter\""
+        );
+        let p: FormatProvider = serde_json::from_str("\"openrouter\"").expect("読める");
+        assert_eq!(p, FormatProvider::OpenRouter);
+        assert!(serde_json::from_str::<FormatProvider>("\"open_router\"").is_err());
+    }
+
+    #[test]
+    fn the_openrouter_candidates_lead_with_the_default_and_pass_validation() {
+        assert_eq!(
+            OPENROUTER_FORMAT_MODEL_CANDIDATES[0].name,
+            DEFAULT_OPENROUTER_FORMAT_MODEL
+        );
+        for c in OPENROUTER_FORMAT_MODEL_CANDIDATES {
+            assert_eq!(
+                validate_model_name(FormatProvider::OpenRouter, c.name).as_deref(),
+                Ok(c.name)
+            );
+            assert!(!c.note.is_empty());
+        }
+    }
+
+    #[test]
+    fn config_patch_debug_redacts_the_openrouter_key() {
+        let patch = ConfigPatch {
+            openrouter_api_key: Some("sk-or-must-not-leak".to_string()),
+            ..ConfigPatch::default()
+        };
+        let dumped = format!("{patch:?}");
+        assert!(!dumped.contains("sk-or-must-not-leak"), "{dumped}");
+        // 出ていて、伏せてあること (足し忘れて黙って消えていないこと)。
+        assert!(
+            dumped.contains("openrouter_api_key: Some(<redacted>)"),
+            "{dumped}"
+        );
+        let cleared = ConfigPatch {
+            openrouter_api_key: Some(String::new()),
+            ..ConfigPatch::default()
+        };
+        assert!(format!("{cleared:?}").contains("openrouter_api_key: Some(<empty>)"));
+    }
+
+    #[test]
+    fn the_openrouter_key_is_validated_like_the_others() {
+        let patch = ConfigPatch {
+            openrouter_api_key: Some("sk-or-a\nOTHER=1".to_string()),
+            ..ConfigPatch::default()
+        };
+        let err = patch.validate().expect_err("改行入りのキーは断る");
+        assert!(err.contains("OpenRouter API キー"), "{err}");
+    }
+
+    #[test]
+    fn the_openrouter_key_is_read_only_under_the_nox_name() {
+        // 素の OPENROUTER_API_KEY は他の道具のキーでありうる (設計 §6)。
+        assert_eq!(ENV_OPENROUTER_KEY, "NOX_OPENROUTER_API_KEY");
+        // 3 社とも .env / config.json の欄が引ける (debug_assert に当たらない)。
+        let mut cfg = Config::default();
+        *cfg.api_key_field(ENV_OPENROUTER_KEY) = Secret::new("sk-or-x");
+        assert_eq!(cfg.openrouter_api_key.expose(), "sk-or-x");
+        assert!(cfg.groq_api_key.is_empty() && cfg.gemini_api_key.is_empty());
+    }
+
+    #[test]
+    fn saving_the_openrouter_key_writes_dotenv_and_reads_back() {
+        let dir = fresh_dir("openrouter-save");
+        let (path, dotenv) = (dir.join("config.json"), dir.join(DOTENV_FILE_NAME));
+        fs::write(&dotenv, "GROQ_API_KEY=gsk_hand\r\n").unwrap();
+        let store = ConfigStore::load_with_dotenv(path.clone(), Some(dotenv.clone()));
+        let updated = store
+            .update(ConfigPatch {
+                openrouter_api_key: Some(" sk-or-screen ".to_string()),
+                openrouter_format_model: Some("google/gemma-4-26b-a4b-it:free".to_string()),
+                ..ConfigPatch::default()
+            })
+            .expect("保存できる");
+
+        let env_text = fs::read_to_string(&dotenv).unwrap();
+        assert_eq!(
+            parse_dotenv_value(&env_text, ENV_OPENROUTER_KEY).as_deref(),
+            Some("sk-or-screen")
+        );
+        assert_eq!(parse_dotenv_value(&env_text, ENV_GROQ_KEY).as_deref(), Some("gsk_hand"));
+        assert!(env_text.contains("NOX_OPENROUTER_API_KEY=sk-or-screen"), "{env_text}");
+        let json = fs::read_to_string(&path).unwrap();
+        assert!(!json.contains("sk-or-screen"), "config.json にキーを書かない: {json}");
+        assert!(updated.openrouter_api_key.is_empty());
+        // モデルは config.json 側。読み戻しても残る。
+        let reloaded = ConfigStore::load(path.clone()).snapshot();
+        assert_eq!(reloaded.openrouter_format_model, "google/gemma-4-26b-a4b-it:free");
+
+        // 空文字 = 消去。.env からも行が消え、他のキーは残る。
+        store
+            .update(ConfigPatch {
+                openrouter_api_key: Some(String::new()),
+                ..ConfigPatch::default()
+            })
+            .expect("消去できる");
+        let env_text = fs::read_to_string(&dotenv).unwrap();
+        assert_eq!(parse_dotenv_value(&env_text, ENV_OPENROUTER_KEY), None);
+        assert_eq!(parse_dotenv_value(&env_text, ENV_GROQ_KEY).as_deref(), Some("gsk_hand"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 移行の判定が聞く環境変数も `NOX_OPENROUTER_API_KEY` だけ。素の
+    /// `OPENROUTER_API_KEY` があっても「環境変数にもある」とはみなさず、
+    /// config.json のキーを .env へ移す (= その名前は読んでいない)。
+    #[test]
+    fn migration_ignores_the_bare_openrouter_env_var() {
+        let dir = fresh_dir("openrouter-migrate");
+        let (path, dotenv) = (dir.join("config.json"), dir.join(DOTENV_FILE_NAME));
+        let old = Config {
+            openrouter_api_key: Secret::new("sk-or-from-json"),
+            ..Config::default()
+        };
+        save(&path, &old).unwrap();
+        let bare_env =
+            |name: &str| (name == "OPENROUTER_API_KEY").then(|| "sk-or-other-account".to_string());
+
+        let store = ConfigStore::load_inner(path.clone(), Some(dotenv.clone()), &bare_env);
+        let env_text = fs::read_to_string(&dotenv).unwrap();
+        assert_eq!(
+            parse_dotenv_value(&env_text, ENV_OPENROUTER_KEY).as_deref(),
+            Some("sk-or-from-json")
+        );
+        assert!(!env_text.contains("sk-or-other-account"), "{env_text}");
+        assert!(store.snapshot().openrouter_api_key.is_empty());
+        drop(store);
+
+        // NOX_ の名前が環境変数にあれば、使われるキーを変えないので移さない。
+        let dir2 = fresh_dir("openrouter-migrate-nox");
+        let (path2, dotenv2) = (dir2.join("config.json"), dir2.join(DOTENV_FILE_NAME));
+        save(&path2, &old).unwrap();
+        let nox_env = |name: &str| (name == ENV_OPENROUTER_KEY).then(|| "sk-or-live".to_string());
+        let store = ConfigStore::load_inner(path2.clone(), Some(dotenv2.clone()), &nox_env);
+        let text2 = fs::read_to_string(&dotenv2).unwrap_or_default();
+        assert_eq!(parse_dotenv_value(&text2, ENV_OPENROUTER_KEY), None, "{text2}");
+        assert_eq!(store.snapshot().openrouter_api_key.expose(), "sk-or-from-json");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn config_view_reports_the_openrouter_key_and_candidates() {
+        let cfg = Config {
+            openrouter_api_key: Secret::new("sk-or-v1-abcdef5678"),
+            ..Config::default()
+        };
+        let view = ConfigView::build(
+            &cfg,
+            resolve_key(None, &cfg.groq_api_key),
+            resolve_key(None, &cfg.gemini_api_key),
+            resolve_key(None, &cfg.openrouter_api_key),
+        );
+        assert!(view.openrouter_key_set);
+        assert_eq!(view.openrouter_key_source, KeySource::Config);
+        assert_eq!(view.openrouter_key_preview, "…5678");
+        assert_eq!(view.openrouter_format_model, DEFAULT_OPENROUTER_FORMAT_MODEL);
+        assert_eq!(view.default_openrouter_format_model, DEFAULT_OPENROUTER_FORMAT_MODEL);
+        assert_eq!(
+            view.openrouter_format_model_candidates.len(),
+            OPENROUTER_FORMAT_MODEL_CANDIDATES.len()
+        );
+        let json = serde_json::to_value(&view).expect("JSON にできる");
+        assert!(!json.to_string().contains("sk-or-v1-abcdef"), "{json}");
+        assert_eq!(json["openrouter_key_source"], "config");
+        assert_eq!(
+            json["openrouter_format_model_candidates"][0]["name"],
+            DEFAULT_OPENROUTER_FORMAT_MODEL
+        );
+
+        let env_view = ConfigView::build(
+            &Config::default(),
+            resolve_key(None, &Secret::default()),
+            resolve_key(None, &Secret::default()),
+            resolve_key(Some("sk-or-env-9999".to_string()), &Secret::default()),
+        );
+        assert_eq!(env_view.openrouter_key_source, KeySource::Env);
+        let unset = ConfigView::build(
+            &Config::default(),
+            resolve_key(None, &Secret::default()),
+            resolve_key(None, &Secret::default()),
+            resolve_key(None, &Secret::default()),
+        );
+        assert!(!unset.openrouter_key_set);
+        assert_eq!(unset.openrouter_key_source, KeySource::None);
+        assert_eq!(unset.openrouter_key_preview, "");
     }
 }

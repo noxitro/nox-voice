@@ -1,6 +1,7 @@
 # 設計案: 整形を3社同時に走らせる(2026-10-18、未実装)
 
 > 状態: **設計案**。実装したら要点を `design.md` の先頭側へ節として移し、このファイルは消す。
+> **§11 手順1 は実装済み(2026-11-21)**: `OpenAiCompatFormatter` への一般化と、OpenRouter の設定・キー・「試す」。順序は直列のまま、Groq の後ろの第3段として動く(`design.md`「整形の第3段に OpenRouter を置く」)。手順2以降は未着手。
 > 決定者: ユーザー(2026-10-18)。画面テキストが3社へ毎回送られることは承知の上で、同時方式を選んだ。
 
 ## 1. 何を変えるか
@@ -116,9 +117,9 @@
 |---|---|---|
 | `format_strategy` | `"parallel"` | `"sequential"` で今の直列に戻せる。旧設定ファイルには無いので、フィールド単位で `serde(default)` を付ける |
 | `format_fallback_enabled` | true(既存) | 「Groq を整形に参加させるか」の意味に読み替える |
-| `openrouter_api_key` | 空 | 空なら OpenRouter は参加しない |
-| `openrouter_format_model` | `nvidia/nemotron-3-super-120b-a12b:free` | 候補つき入力欄 +「試す」(既存の `test_format_model` を拡張) |
-| `openrouter_chat_endpoint` | `https://openrouter.ai/api/v1/chat/completions` | 完全な URL |
+| `openrouter_api_key` | 空 | 空なら OpenRouter は参加しない(実装済み)。`.env` / 環境変数の名前は `NOX_OPENROUTER_API_KEY` |
+| `openrouter_format_model` | `google/gemma-4-31b-it:free`(**未実測の仮の既定**) | 候補つき入力欄 +「試す」(実装済み)。当初の既定 `nvidia/nemotron-3-super-120b-a12b:free` は 2026-11-21 時点で一覧から消えていたので差し替えた。開発機のキーが 401(期限切れ)で測れず、候補は既定1つだけ |
+| `openrouter_chat_endpoint` | `https://openrouter.ai/api/v1/chat/completions` | 完全な URL(実装済み) |
 
 - **キーを読む環境変数の名前に注意。** Groq・Gemini は「環境変数 > 設定」の順でキーを解決している。今の `OPENROUTER_API_KEY` には**課金していない方のアカウントのキーが入っている**(1日50回の枠、2026-10-18 確認)。同じ名前を採ると、設定画面に課金済みのキーを入れても環境変数が勝つ。**環境変数名は `NOX_OPENROUTER_API_KEY` にする**か、環境変数を読まない。
 - `:free` モデルはよく入れ替わる(2026-10-18 の一覧16個のうち、作成2日目のものや agentic harness 専用で 403 になるものがあった)。既定のモデルが消えても、OpenRouter が毎回 `Err` で決着するだけで、ほかの2社には影響しない。消えたことはログと履歴の失敗理由で追える。
@@ -140,7 +141,7 @@
 - 設定画面の、控えのトグル直下にある警告文を3社版に書き換える。`format_strategy` の切り替えの隣にも同じ警告を出す。
 - 枠(1日の最多は53件、2026-09-26):
   - Gemini は今も毎回呼んでいるので、増えない。
-  - Groq は整形の呼び出しが毎回になり、STT と合わせて約2倍。gpt-oss-20b の無料枠は毎分 8,000 トークン(format_groq.rs の doc)。連続で録音したときの 429 は、ほかの2社が埋める。
+  - Groq は整形の呼び出しが毎回になり、STT と合わせて約2倍。gpt-oss-20b の無料枠は毎分 8,000 トークン(format_openai_compat.rs の doc)。連続で録音したときの 429 は、ほかの2社が埋める。
   - OpenRouter は1日 53 回で、課金済みアカウントの枠(1,000回/日、毎分20回)に十分収まる。課金していない方の50回/日でも、多い日は足りなくなる。
 - 画面質問モードは変えない(画像を送るので、テキスト専用の控えは使えない)。
 
@@ -167,7 +168,7 @@
 
 ## 11. 実装の順序
 
-1. `OpenAiCompatFormatter` への一般化と、OpenRouter の設定・キー・「試す」(順序は今の直列のまま、第3段として動く状態)
+1. `OpenAiCompatFormatter` への一般化と、OpenRouter の設定・キー・「試す」(順序は今の直列のまま、第3段として動く状態) — **実装済み(2026-11-21)**
 2. 採用規則の純関数、並列の実行部、`format_provider` 列、`format_strategy`
 3. 設定画面の警告文と、履歴バッジの採用社表示
 4. 候補記録(§7)
@@ -179,4 +180,5 @@
 - `T_pref` は 2.0s とした。代わりに、**録音の約4%は何も失敗していないのに Groq の結果が採られ、履歴に「控えで整形」と残る**(`format_skip_kind = slow` で区別はできる)。
 - 既定モデルの無料エンドポイント(NVIDIA)は、利用を記録して製品改善に使うと明記している(§8)。これを受け入れるか。
 - 候補記録(§7)で、3社の出力本文をローカルの DB に残してよいか。
-- OpenRouter のキーを環境変数から読むなら、名前は `NOX_OPENROUTER_API_KEY` にする(§6)。
+- ~~OpenRouter のキーを環境変数から読むなら、名前は `NOX_OPENROUTER_API_KEY` にする(§6)。~~ **決定・実装済み(2026-11-21)**: `.env` でも環境変数でも `NOX_OPENROUTER_API_KEY`。素の `OPENROUTER_API_KEY` は読まない(`#[ignore]` の実 API テスト `live_openrouter_formatting` だけが、`NOX_` が無いときの代わりに読む)。
+- 既定モデルを実測で決め直す(§6 の表。`live_openrouter_formatting` に `NOX_OPENROUTER_MODEL` / `NOX_REPS` を渡して回す)。

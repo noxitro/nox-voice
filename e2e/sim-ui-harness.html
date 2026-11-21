@@ -49,6 +49,10 @@
           gemini_key_set: false,
           gemini_key_source: "none",
           gemini_key_preview: "",
+          // 第 2 の控え (OpenRouter)。既定ではキーが空 = 参加しない。
+          openrouter_key_set: false,
+          openrouter_key_source: "none",
+          openrouter_key_preview: "",
           dotenv_path: String.raw`D:\sim-config\com.noxitro.nox-voice\.env`,
           language: "ja",
           // 辞書は 2026-08-30 から構造化 (表記 / よみ / ★ / 追加日時 / 出所)。
@@ -158,6 +162,8 @@
           // 「既定 ON」の検査ができなくなる (自動学習と同じ理由)。
           format_fallback_enabled: true,
           groq_format_model: "openai/gpt-oss-20b",
+          // 保存値は既定と違うものにしておく (入力欄が保存値を出していることを見る)。
+          openrouter_format_model: "google/gemma-4-26b-a4b-it:free",
           // 整形の共通ルール (2026-10-10)。**保存値は空 = 既定を使っている**
           // 状態を初期値にする。画面は空欄ではなく既定の文を出さねばならない。
           format_rules: "",
@@ -168,6 +174,7 @@
           format_rules_max_chars: 8000,
           default_format_model: "gemini-flash-lite-latest",
           default_groq_format_model: "openai/gpt-oss-20b",
+          default_openrouter_format_model: "google/gemma-4-31b-it:free",
           format_model_candidates: [
             { name: "gemini-flash-lite-latest", note: "既定・最速 (模擬)" },
             { name: "gemini-3.5-flash-lite", note: "良好 (模擬)" },
@@ -177,6 +184,9 @@
             { name: "openai/gpt-oss-20b", note: "既定 (模擬)" },
             { name: "openai/gpt-oss-120b", note: "良好 (模擬)" },
             { name: "qwen/qwen3.8-27b", note: "最速 (模擬)" },
+          ],
+          openrouter_format_model_candidates: [
+            { name: "google/gemma-4-31b-it:free", note: "既定・未実測 (模擬)" },
           ],
         };
 
@@ -429,6 +439,19 @@
                 const m = String(args.patch.format_model).trim().replace(/^models\//, "").trim();
                 mock.config.format_model = m || mock.config.default_format_model;
               }
+              if ("openrouter_format_model" in args.patch) {
+                const m = String(args.patch.openrouter_format_model).trim();
+                mock.config.openrouter_format_model = m || mock.config.default_openrouter_format_model;
+              }
+              // Rust の ConfigView はキーの実体を返さない。有無・取得元・末尾 4 文字だけ。
+              // 空文字 = 消去 (ConfigPatch の約束)。
+              if ("openrouter_api_key" in args.patch) {
+                const key = String(args.patch.openrouter_api_key).trim();
+                delete mock.config.openrouter_api_key;
+                mock.config.openrouter_key_set = key !== "";
+                mock.config.openrouter_key_source = key ? "dotenv" : "none";
+                mock.config.openrouter_key_preview = key ? `…${key.slice(-4)}` : "";
+              }
               // Rust は保存のたびに枠を計算し直す。ここで据え置くと、
               // 行が増えても「枠外」が出ないビューが返り、E2E が
               // 溢れの表示を検査できない穴になる。
@@ -577,11 +600,13 @@
             // 名前に "bad" を含むモデルは API が断った体にする (失敗の経路)。
             // IPC 自体の失敗は `?fail=test_format_model` で見る。
             case "test_format_model": {
-              const provider = args.provider === "groq" ? "Groq" : "Gemini";
+              const provider =
+                { groq: "Groq", openrouter: "OpenRouter" }[args.provider] ?? "Gemini";
               const fallbackModel =
-                args.provider === "groq"
-                  ? mock.config.default_groq_format_model
-                  : mock.config.default_format_model;
+                {
+                  groq: mock.config.default_groq_format_model,
+                  openrouter: mock.config.default_openrouter_format_model,
+                }[args.provider] ?? mock.config.default_format_model;
               const model = String(args.model ?? "").trim() || fallbackModel;
               if (model.includes("bad")) {
                 return Promise.resolve({
