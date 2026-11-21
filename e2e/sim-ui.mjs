@@ -2377,6 +2377,65 @@ async function main() {
     return { ok, detail: JSON.stringify(r) };
   });
 
+  await check("U26c 更新ボタン: 入れる返事待ちは二度送らない / 録音が終わると断られた理由が消える / 古い get_update_state で結末を上書きしない", async () => {
+    await load(cdp);
+    const r = await cdp.run(`
+      const m = window.__NOX_MOCK__;
+      const button = document.getElementById("update-button");
+      const note = document.getElementById("update-note");
+      const wait = (ms = 50) => new Promise((r) => setTimeout(r, ms));
+      const snap = () => ({
+        button: button.textContent,
+        disabled: button.getAttribute("aria-disabled") === "true",
+        note: note.textContent || null,
+      });
+
+      // 1) 返事待ちの間は 2 本目を送らない
+      m.emit("nox://update", { state: "ready", version: "9.9.9" });
+      await wait();
+      m.delays.install_update = 200;
+      m.installRefusal = "録音中のため更新できません。録音が終わってからもう一度選んでください";
+      button.click();
+      await wait();
+      const installing = snap();
+      button.click();
+      await wait(300);
+      const afterRefusal = { ...snap(), installCalls: m.count("install_update") };
+      delete m.delays.install_update;
+
+      // 2) 録音中 → 待機中に戻ると、状態に由来する理由は消える
+      m.emit("nox://status", { status: "recording", message: null, origin: "recording" });
+      await wait();
+      const whileRecording = snap();
+      m.emit("nox://status", { status: "idle", message: null, origin: "recording" });
+      await wait();
+      const afterIdle = snap();
+
+      // 3) get_update_state の返事より先に結末のイベントが届いたら、古い返事で戻さない
+      m.emit("nox://update", { state: "up_to_date" });
+      await wait();
+      m.delays.get_update_state = 200;
+      m.update = { state: "checking" };
+      button.click();
+      await wait(50);
+      // check_update は済み、get_update_state の返事を待っている間に結末が届く
+      m.emit("nox://update", { state: "failed", reason: "offline" });
+      await wait(300);
+      const afterStale = snap();
+      delete m.delays.get_update_state;
+      m.update = { state: "idle" };
+      return { installing, afterRefusal, whileRecording, afterIdle, afterStale };
+    `);
+    const ok =
+      r.installing.button === "更新しています…" && r.installing.disabled &&
+      r.afterRefusal.installCalls === 1 && r.afterRefusal.button === "更新して再起動" &&
+      !r.afterRefusal.disabled && (r.afterRefusal.note ?? "").includes("録音中") &&
+      (r.whileRecording.note ?? "").includes("録音中") &&
+      r.afterIdle.note === null && r.afterIdle.button === "更新して再起動" &&
+      r.afterStale.button === "更新を確認" && r.afterStale.note === "確認できませんでした: offline";
+    return { ok, detail: JSON.stringify(r) };
+  });
+
   await check("U26b 畳んだレール (420px) では更新ボタンを出さず、入れられる版があるとロゴの角に点が出る", async () => {
     await setViewport(cdp, 420, 420);
     await load(cdp);

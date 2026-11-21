@@ -167,6 +167,29 @@ pub fn report_message(
     }
 }
 
+/// 確認の結末を、画面に出す「直近の結末」として残すか。
+///
+/// 定期の確認の失敗は残さない (直前の値を保つ)。定期の失敗はログにしか書かない
+/// 方針で (オフラインの PC で 6 時間ごとにエラーを出さない)、画面に赤字で出し
+/// 続けるとそれが崩れる。`None` (Idle) に戻す案は採らなかった: 直前に画面から
+/// 確かめた「最新です」まで消え、押した結果が勝手に消えたように見える。
+pub fn records_outcome(trigger: Trigger, outcome: &CheckOutcome) -> bool {
+    !matches!(
+        (trigger, outcome),
+        (Trigger::Scheduled, CheckOutcome::Failed { .. })
+    )
+}
+
+/// 画面から確かめた結果を、どこで知らせるか。窓が見えていなければ
+/// (隠した・最小化した)、トレイの手動確認と同じくトーストで知らせる。
+pub fn effective_trigger(trigger: Trigger, window_visible: bool) -> Trigger {
+    if trigger == Trigger::Window && !window_visible {
+        Trigger::Manual
+    } else {
+        trigger
+    }
+}
+
 /// 見つけた版を (定期の確認で) 知らせるべきか。まだ知らせていない版のときだけ真。
 pub fn should_notify(found: &str, notified: Option<&str>) -> bool {
     notified != Some(found)
@@ -475,6 +498,10 @@ fn finish_check(app: &AppHandle, trigger: Trigger, outcome: CheckOutcome) {
     let Some(state) = app.try_state::<UpdaterState>() else {
         return;
     };
+    // 画面から確かめたあと窓を隠す・最小化すると (ダウンロードは最長 10 分)、
+    // 結果を見る場所が無くなる。そのときはトレイの手動確認と同じく知らせる。
+    // ロックの外で決める (窓の状態を聞くのにロックは要らない)。
+    let trigger = effective_trigger(trigger, main_window_visible(app));
     let (already_notified, ready_version) = match state.inner.lock() {
         Ok(mut inner) => {
             inner.running = false;
@@ -483,11 +510,17 @@ fn finish_check(app: &AppHandle, trigger: Trigger, outcome: CheckOutcome) {
                 // ものなので入れさせない (Release を消した・差し戻した場合)。
                 inner.ready = None;
             }
-            inner.last = Some(outcome.clone());
+            if records_outcome(trigger, &outcome) {
+                inner.last = Some(outcome.clone());
+            }
             let already = match &outcome {
                 CheckOutcome::Ready { version } => {
                     let already = !should_notify(version, inner.notified.as_deref());
-                    inner.notified = Some(version.clone());
+                    // 画面に出しただけ (トーストを出さない) のときは「知らせ済み」に
+                    // しない。窓をすぐ閉じた人には、次の定期の確認で 1 回知らせる。
+                    if trigger != Trigger::Window {
+                        inner.notified = Some(version.clone());
+                    }
                     already
                 }
                 _ => false,
@@ -507,23 +540,20 @@ fn finish_check(app: &AppHandle, trigger: Trigger, outcome: CheckOutcome) {
     publish(app);
 
     let current = app.package_info().version.to_string();
-    // 画面から確かめたあと窓を隠すと (ダウンロードは最長 10 分)、結果を見る場所が
-    // 無くなる。その間に準備できたら、トレイの手動確認と同じく知らせる。
-    let trigger = if trigger == Trigger::Window && !main_window_visible(app) {
-        Trigger::Manual
-    } else {
-        trigger
-    };
     if let Some(message) = report_message(trigger, &outcome, &current, already_notified) {
         toast(app, &message);
     }
 }
 
-/// メイン画面が見えているか。取れなければ「見えていない」側に倒す (知らせ損ねない)。
+/// メイン画面が見えているか。最小化していれば見えていない (`is_visible` は
+/// 最小化した窓でも真を返す)。取れなければ「見えていない」側に倒す (知らせ損ねない)。
 fn main_window_visible(app: &AppHandle) -> bool {
-    app.get_webview_window("main")
-        .and_then(|w| w.is_visible().ok())
-        .unwrap_or(false)
+    let Some(window) = app.get_webview_window("main") else {
+        return false;
+    };
+    let visible = window.is_visible().unwrap_or(false);
+    let minimized = window.is_minimized().unwrap_or(true);
+    visible && !minimized
 }
 
 /// トレイの「更新して再起動」。断ったり失敗したりした理由はトーストで言う。
@@ -569,12 +599,19 @@ pub fn install(app: &AppHandle) -> Result<(), String> {
         // フックは畳んでいないので、今の版のまま録音は続けられる (モジュールの doc)。
         log::error!("更新を入れられませんでした: {e}");
         let reason = format!("更新を入れられませんでした: {}", describe_error(&e));
-        // もう一度選べるように戻しておく。
-        let version = ready.update.version.clone();
-        if let Ok(mut inner) = state.inner.lock() {
-            inner.ready = Some(ready);
-        }
-        state.set_ready(Some(&version));
+        // もう一度選べるように戻しておく。ただし入れようとしていた間に別の確認が
+        // 新しく準備したもの (`take` で空いたのを見て落とし直した) があれば、
+        // そちらが新しいので上書きしない。
+        let now_ready = match state.inner.lock() {
+            Ok(mut inner) => {
+                if inner.ready.is_none() {
+                    inner.ready = Some(ready);
+                }
+                inner.ready.as_ref().map(|r| r.update.version.clone())
+            }
+            Err(_) => None,
+        };
+        state.set_ready(now_ready.as_deref());
         publish(app);
         return Err(reason);
     }
@@ -661,7 +698,31 @@ mod tests {
     }
 
     #[test]
-    fn view_prefers_checking_then_ready_then_last_outcome() {
+    fn scheduled_failure_is_not_shown_on_screen() {
+        let failed = CheckOutcome::Failed { reason: "x".into() };
+        let ready = CheckOutcome::Ready {
+            version: "0.8.2".into(),
+        };
+        // 定期の失敗はログだけ (画面の「直近の結末」を上書きしない)
+        assert!(!records_outcome(Trigger::Scheduled, &failed));
+        // それ以外は残す
+        assert!(records_outcome(Trigger::Scheduled, &CheckOutcome::UpToDate));
+        assert!(records_outcome(Trigger::Scheduled, &ready));
+        assert!(records_outcome(Trigger::Manual, &failed));
+        assert!(records_outcome(Trigger::Window, &failed));
+    }
+
+    #[test]
+    fn window_check_falls_back_to_toast_when_window_is_not_visible() {
+        assert_eq!(effective_trigger(Trigger::Window, true), Trigger::Window);
+        assert_eq!(effective_trigger(Trigger::Window, false), Trigger::Manual);
+        // ほかの経路は窓に関係なくそのまま
+        assert_eq!(effective_trigger(Trigger::Scheduled, false), Trigger::Scheduled);
+        assert_eq!(effective_trigger(Trigger::Manual, true), Trigger::Manual);
+    }
+
+    #[test]
+    fn view_prefers_ready_then_checking_then_last_outcome() {
         let failed = CheckOutcome::Failed {
             reason: "offline".into(),
         };
