@@ -128,6 +128,18 @@ pub fn run(
     let stt_ms = stt_started.elapsed().as_millis() as u64;
     let raw_text = transcript.text;
 
+    // 反復ループは API 上は成功だが、中身は意味が無い。整形へ渡すと LLM は
+    // そのまま残し (本文を削らない約束なので)、貼り付けまで進んでしまう。
+    // ここで STT の失敗に変え、上位の WAV 退避と通知へ乗せる。
+    // クラウドとローカルの両方がこの関数を通るので、判定は 1 か所で済む。
+    if let Some((unit_chars, repeats)) = crate::stt::find_repetition_loop(&raw_text) {
+        log::warn!(
+            "転写が反復ループに陥っていたため捨てます: {unit_chars} 文字の単位が {repeats} 回連続 / 全 {} 文字",
+            raw_text.chars().count()
+        );
+        return Err(SttError::Repetitive);
+    }
+
     let Some(formatter) = formatter else {
         return Ok(PipelineResult {
             text: raw_text.clone(),
@@ -750,6 +762,38 @@ mod tests {
             Err(SttError::Empty)
         );
         assert_eq!(formatter.calls(), 0);
+    }
+
+    /// 2026-11-21 に実機で出た転写と同じ形 (22 文字、うち同じ漢字が 13 個)。
+    /// 発話そのものはコミットに残さないので、前半は置き換えてある。
+    /// API はこの形を成功として返していた。
+    const OBSERVED_LOOP: &str = "今日の会議はははは早早早早早早早早早早早早早";
+
+    #[test]
+    fn a_repetition_loop_becomes_an_stt_failure_and_skips_formatting() {
+        let stt = FixedStt(Ok(OBSERVED_LOOP));
+        let formatter = FixedFormatter::ok("呼ばれないはず");
+        assert_eq!(
+            run(&PipelineInput::new(b"wav", "ja"), &stt, Some(&formatter), &[]),
+            Err(SttError::Repetitive)
+        );
+        assert_eq!(formatter.calls(), 0, "ループした転写を整形へ渡している");
+    }
+
+    #[test]
+    fn a_repetition_loop_is_rejected_even_with_formatting_disabled() {
+        let stt = FixedStt(Ok(OBSERVED_LOOP));
+        assert_eq!(
+            run(&PipelineInput::new(b"wav", "ja"), &stt, None, &[]),
+            Err(SttError::Repetitive)
+        );
+    }
+
+    #[test]
+    fn a_repetition_loop_does_not_send_the_recording_to_local_stt() {
+        // クラウドのループをローカルでやり直さない: 同じ音声なら同じように
+        // ループしやすく、CPU で数秒かかる。退避して言い直してもらう方が早い。
+        assert!(!crate::local_stt::should_fall_back(&SttError::Repetitive));
     }
 
     // --- 実 API を使う通しテスト ---

@@ -46,6 +46,12 @@ pub enum SttError {
     Decode(String),
     /// 転写結果が空 (無音など)。
     Empty,
+    /// 転写が同じ文字・語の繰り返しに陥った (Whisper の反復ループ)。
+    ///
+    /// 本文は持たない。中身は意味のない繰り返しで、プロンプト由来の
+    /// 画面テキストが混じりうる (design.md「既知の限界: Whisperのプロンプト・エコー」)
+    /// ので、ログや退避メタへ流さない。判定は [`find_repetition_loop`]。
+    Repetitive,
 }
 
 impl fmt::Display for SttError {
@@ -75,6 +81,10 @@ impl fmt::Display for SttError {
             SttError::Network(e) => write!(f, "Groq へ接続できません: {e}"),
             SttError::Decode(e) => write!(f, "Groq の応答を解釈できません: {e}"),
             SttError::Empty => write!(f, "転写結果が空でした (無音だった可能性があります)"),
+            SttError::Repetitive => write!(
+                f,
+                "音声認識が同じ語の繰り返しに陥ったため、結果を捨てました (Whisper の誤認識)。同じ録音の再転写は同じようにループしやすいので、言い直すのが確実です"
+            ),
         }
     }
 }
@@ -284,6 +294,73 @@ pub fn parse_transcription(body: &str) -> Result<String, SttError> {
     Ok(text.to_string())
 }
 
+/// 反復ループとみなす繰り返し単位の最大長 (文字)。
+///
+/// Whisper のループは 1 文字 (「早早早…」) から 1 文 (「ご視聴ありがとう
+/// ございました。」の連続) まであるので、文 1 つ分まで見る。
+const MAX_LOOP_UNIT_CHARS: usize = 32;
+
+/// 1 文字の単位が、これ以上連続したらループとみなす。
+///
+/// 日本語の口述で同じ字が 8 つ並ぶことはまず無い (笑いの「ははは」、
+/// 伸ばしの「えーー」は数個で止まる)。数字の連続 (「100000000」) は
+/// 単位が文字を含まないので、そもそも数えない。
+const MIN_SINGLE_CHAR_REPEATS: usize = 8;
+/// 2 文字以上の単位が、これ以上連続したらループとみなす。
+const MIN_UNIT_REPEATS: usize = 4;
+/// 2 文字以上の単位のループは、繰り返し部分がこの文字数以上あるときだけ数える。
+///
+/// 「ワンワンワンワン」(2×4=8) や「はい、はい、はい、はい、」(3×4=12) のような、
+/// 実際に口にしうる短い繰り返しを誤って捨てないため。
+const MIN_UNIT_LOOP_CHARS: usize = 16;
+
+/// 転写が Whisper の反復ループに陥っているかを判定する (純関数)。
+///
+/// ループしていれば `(単位の文字数, 連続回数)` を返す (ログ用)。
+/// 単位の中身は返さない — 画面テキスト由来の語でありうるので、ログに出さない。
+///
+/// # なぜ要るか
+///
+/// Whisper は短い・不明瞭な音声で、同じトークンを延々と出し続けることがある
+/// (2026-11-21 に 4 秒の録音で、同じ漢字が 13 個続く転写が出た)。
+/// API はこれを**成功として返す**ので、検出しないと整形を素通りして貼り付けられ、
+/// 小窓には「整形済み」が出る。「失敗は騒がしく」に反する。
+///
+/// 判定は本文だけで行う。`verbose_json` の `compression_ratio` は短い日本語では
+/// 当てにならないうえ応答が重い (このファイル冒頭の `response_format` の注記)。
+pub fn find_repetition_loop(text: &str) -> Option<(usize, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    for start in 0..n {
+        for unit_len in 1..=MAX_LOOP_UNIT_CHARS {
+            if start + unit_len * 2 > n {
+                break;
+            }
+            let unit = &chars[start..start + unit_len];
+            // 文字を含まない単位 (数字・記号・空白だけ) は数えない。
+            // 「100000000」「…………」「!!!!!!!!」はループではない。
+            if !unit.iter().any(|c| c.is_alphabetic()) {
+                continue;
+            }
+            let mut repeats = 1;
+            while start + unit_len * (repeats + 1) <= n
+                && chars[start + unit_len * repeats..start + unit_len * (repeats + 1)] == *unit
+            {
+                repeats += 1;
+            }
+            let looping = if unit_len == 1 {
+                repeats >= MIN_SINGLE_CHAR_REPEATS
+            } else {
+                repeats >= MIN_UNIT_REPEATS && unit_len * repeats >= MIN_UNIT_LOOP_CHARS
+            };
+            if looping {
+                return Some((unit_len, repeats));
+            }
+        }
+    }
+    None
+}
+
 /// STT / 整形で共用する HTTP クライアントを作る。
 ///
 /// # リダイレクトを追わない
@@ -382,6 +459,57 @@ mod tests {
             parse_transcription(body),
             Err(SttError::Decode(_))
         ));
+    }
+
+    // --- 反復ループの判定 (純関数) ---
+
+    #[test]
+    fn the_observed_loop_is_detected() {
+        // 2026-11-21 の実機の転写と同じ形。ログの「STT 完了: 22 文字」と一致させる
+        // (発話そのものは残さないので、前半は置き換えてある)。
+        let observed = "今日の会議はははは早早早早早早早早早早早早早";
+        assert_eq!(observed.chars().count(), 22);
+        assert_eq!(find_repetition_loop(observed), Some((1, 13)));
+    }
+
+    #[test]
+    fn a_looping_sentence_is_detected() {
+        let looped = format!("今日の会議は{}", "ご視聴ありがとうございました。".repeat(4));
+        assert_eq!(find_repetition_loop(&looped), Some((15, 4)));
+    }
+
+    #[test]
+    fn a_looping_short_word_is_detected() {
+        assert!(find_repetition_loop(&"そうですね、".repeat(5)).is_some());
+        assert!(find_repetition_loop(&"あ".repeat(MIN_SINGLE_CHAR_REPEATS)).is_some());
+    }
+
+    #[test]
+    fn ordinary_japanese_with_short_repeats_is_not_a_loop() {
+        for text in [
+            "こんにちは、今日はいい天気ですね。",
+            "ははは、それは面白いですね",
+            "えーーー、ちょっと待ってください",
+            "ワンワンワンワンと犬が鳴いた",
+            "はい、はい、はい、はい、分かりました",
+            "人々は時々ここへ来る",
+        ] {
+            assert_eq!(find_repetition_loop(text), None, "誤検知: {text}");
+        }
+        // 境界: 1 文字の単位は MIN_SINGLE_CHAR_REPEATS 未満なら通す。
+        assert_eq!(find_repetition_loop(&"あ".repeat(MIN_SINGLE_CHAR_REPEATS - 1)), None);
+    }
+
+    #[test]
+    fn digits_and_symbols_are_never_a_loop() {
+        for text in [
+            "予算は100000000円です",
+            "えっと…………そうですね",
+            "すごい!!!!!!!!!!",
+            "",
+        ] {
+            assert_eq!(find_repetition_loop(text), None, "誤検知: {text}");
+        }
     }
 
     #[test]
