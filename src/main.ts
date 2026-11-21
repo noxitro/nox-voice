@@ -590,7 +590,12 @@ interface UpdateUi {
  * そのものは変わらない (準備済みのまま) ことが多いので、状態とは別に持って重ね、
  * 状態の注記より優先して出す。
  */
-function updateUi(view: UpdateView, current: string, refusal: string | null): UpdateUi {
+function updateUi(
+  view: UpdateView,
+  current: string,
+  refusal: string | null,
+  installing: boolean,
+): UpdateUi {
   const base = `v${current}`;
   const withRefusal = (ui: UpdateUi): UpdateUi =>
     refusal === null ? ui : { ...ui, note: refusal, noteIsError: true };
@@ -600,8 +605,9 @@ function updateUi(view: UpdateView, current: string, refusal: string | null): Up
     case "ready":
       return withRefusal({
         version: `${base} → v${view.version}`,
-        button: "更新して再起動",
-        disabled: false,
+        // 返事を待つ間は押しても無視する (二重に入れようとしない)
+        button: installing ? "更新しています…" : "更新して再起動",
+        disabled: installing,
         ready: true,
         note: null,
         noteIsError: false,
@@ -632,9 +638,23 @@ function updateUi(view: UpdateView, current: string, refusal: string | null): Up
 
 let updateView: UpdateView = { state: "idle" };
 let updateRefusal: string | null = null;
+/** `install_update` の返事を待っている間。押しても 2 本目を送らない。 */
+let updateInstalling = false;
+/**
+ * `nox://update` を受け取るたびに増える。`get_update_state` の返事より新しい
+ * イベントが先に届いていたら、古い返事で上書きしないために使う。
+ */
+let updateEventSeq = 0;
+
+/** `get_update_state` を読み、その間にイベントが届いていなければ反映する。 */
+async function refreshUpdateView() {
+  const seq = updateEventSeq;
+  const view = await invoke<UpdateView>("get_update_state");
+  if (seq === updateEventSeq) setUpdateView(view);
+}
 
 function renderUpdate() {
-  const ui = updateUi(updateView, __APP_VERSION__, updateRefusal);
+  const ui = updateUi(updateView, __APP_VERSION__, updateRefusal, updateInstalling);
   const version = el("app-version");
   if (version) version.textContent = ui.version;
   const button = el<HTMLButtonElement>("update-button");
@@ -682,15 +702,18 @@ function setUpdateView(view: UpdateView) {
 }
 
 async function onUpdateButton() {
-  if (updateView.state === "checking") return;
+  if (updateView.state === "checking" || updateInstalling) return;
   updateRefusal = null;
   if (updateView.state === "ready") {
+    updateInstalling = true;
     renderUpdate();
     try {
       // 成功すればアプリが終了して、ここへは戻らない
       await invoke("install_update");
     } catch (e) {
       updateRefusal = String(e);
+    } finally {
+      updateInstalling = false;
       renderUpdate();
     }
     return;
@@ -702,7 +725,8 @@ async function onUpdateButton() {
     await invoke("check_update");
     // 確認が始まらなかった場合 (状態を読めない等) は emit が来ないので、
     // ここで実際の状態を読み直して「確認中」のまま止まらないようにする。
-    setUpdateView(await invoke<UpdateView>("get_update_state"));
+    // 読む間に結末が届いていたら、古い「確認中」で上書きしない。
+    await refreshUpdateView();
   } catch (e) {
     setUpdateView({ state: "failed", reason: String(e) });
   }
@@ -3279,6 +3303,13 @@ window.addEventListener("DOMContentLoaded", async () => {
   await listen<StatusPayload>("nox://status", (event) => {
     if (event.payload.status === "recording") clearError();
     renderStatus(event.payload.status, event.payload.message);
+    // 録音・処理が終わったら「録音中のため更新できません」はもう当てはまらない。
+    // 断られた理由のうち状態に由来するものは ready の間にしか出ないので、ready に
+    // 絞って消す (idle と一緒に届く「入れられる更新がありません」は残す)。
+    if (event.payload.status === "idle" && updateView.state === "ready" && updateRefusal !== null) {
+      updateRefusal = null;
+      renderUpdate();
+    }
   });
   await listen<SessionSummary>("nox://session", (event) =>
     renderSession(event.payload),
@@ -3297,9 +3328,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   await listen<number>("nox://level", (event) => renderLevel(event.payload));
 
   // 更新の状態。トレイから確かめても、定期の確認でも、ここへ届く。
-  await listen<UpdateView>("nox://update", (event) => setUpdateView(event.payload));
+  await listen<UpdateView>("nox://update", (event) => {
+    updateEventSeq++;
+    setUpdateView(event.payload);
+  });
   try {
-    setUpdateView(await invoke<UpdateView>("get_update_state"));
+    await refreshUpdateView();
   } catch {
     // 読めなくても「更新を確認」は押せる (押せば状態が届く)
   }
